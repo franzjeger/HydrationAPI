@@ -165,9 +165,13 @@ Egenskaper, fra kilde og fra måling:
   eller gfs2. De tre som teller for et hjemmeområde er dekket.
 - **Feil kan rapporteres presist.** `FAN_DENY_ERRNO(EIO)` lar deg gi leseren en ekte
   feil når nedlastingen mislykkes, i stedet for stille nuller.
-- **Hydrerte filer kan koste null.** `FAN_MARK_IGNORE_SURV` fjerner hendelser for en
-  fil som allerede er full. Etter hydrering er filen en helt vanlig btrfs-fil — ingen
-  daemon i datastien, native ytelse, ikke engang de 8 % passthrough koster.
+- **Hydrerte filer koster null. Målt.** `FAN_MARK_IGNORE_SURV` fjerner hendelser for en
+  fil som allerede er full. `probes/ignoremark.c` bekrefter alle tre leddene: merket
+  godtas ved siden av mount-merket, neste lesing gir null hendelser, og undertrykkelsen
+  overlever at filen endres — det siste er det `SURV` betyr, og uten det ville en hydrert
+  fil som skrives stille begynt å generere hydreringshendelser igjen. Etter hydrering er
+  filen en helt vanlig btrfs-fil: ingen daemon i datastien, native ytelse, ikke engang de
+  8 % passthrough koster.
 
 **Krever `CAP_SYS_ADMIN`** — målt: `fanotify_init(FAN_CLASS_PRE_CONTENT)` gir `EPERM`
 som uprivilegert bruker. Samme pris som passthrough.
@@ -550,11 +554,31 @@ btrfs-roten ikke montert — verifisert på denne maskinen, der `@`, `@home`, `@
 et `@onedrive`-subvolum montert på `~/OneDrive` ingen annen sti. Det er billig, det passer
 oppsettet som allerede finnes, og det krever ingen egen partisjon.
 
-**Og siden vi ikke kan håndheve det, må vi oppdage det.** `FAN_MNT_ATTACH` og
-`FAN_MNT_DETACH` finnes i denne kjernens fanotify (`0x01000000` / `0x02000000`). Daemonen
-skal abonnere på dem og si fra — høyt, i statusen — hvis en ny montering eksponerer
-synkfilene. Det er samme prinsipp som §6d: vi kan ikke gjøre feilen umulig, men vi nekter
-å la den være stille.
+**Og siden vi ikke kan håndheve det, må vi oppdage det. Målt at vi kan.**
+`probes/mntwatch.c` fanger den nøyaktige omveien over:
+
+```
+[mnt] ATTACH  -> 2 mount(s) now expose loop0
+      …/hsm  (root /)
+      …/hsm2 (root /)      <- omveien
+[mnt] DETACH  -> 1 mount(s) now expose loop0
+```
+
+To ting proben avgjorde, som begge påvirker koden:
+
+- **`FAN_REPORT_MNT` kan ikke kombineres med `FAN_CLASS_PRE_CONTENT`** — kallet gir
+  `EINVAL`. Hydreringsgruppen kan altså ikke også overvåke monteringer; vakten trenger en
+  egen deskriptor med `FAN_CLASS_NOTIF | FAN_REPORT_MNT`, merket med `FAN_MARK_MNTNS` på
+  `/proc/self/ns/mnt`.
+- **Hendelsens `mnt_id` er ikke en sannhetskilde.** Den er den 64-bits unike ID-en, ikke
+  den gjenbrukte i felt 1 av `/proc/self/mountinfo`, og ved `DETACH` er monteringen borte
+  og kan ikke slås opp i det hele tatt. Riktig form er å bruke hendelsen som *trigger til
+  å se etter på nytt* — skann monteringstabellen og tell hvor mange monteringer som nå
+  eksponerer filene. Det er namespace-riktig, tåler at hendelsen kommer før monteringen er
+  synlig, og virker likt for attach og detach.
+
+Det er samme prinsipp som §6d: vi kan ikke gjøre feilen umulig, men vi nekter å la den
+være stille.
 
 **5. Ingen ferdig utkastelsespolicy.** Kjernen sier ikke fra ved diskpress at den vil ha
 plass. Vi må implementere dehydrering (`FALLOC_FL_PUNCH_HOLE` + fjerne ignore-merket)
@@ -640,8 +664,36 @@ prosessgruppa, kjernepanikk. Da er vi tilbake til stille nuller. Forsvar i lag:
    uansett obligatorisk: et katalogmerke leverer ingen hendelser, så eget monteringspunkt
    er den eneste måten å få dekning på. To uavhengige grunner til samme tiltak.
 
-**Konformanstest som må finnes:** `kill -9` arbeideren, les en placeholder, krev `EIO`.
-Og: drep begge, krev at monteringspunktet er borte innen N sekunder.
+**En tredje feilmodus, funnet ved å måle etter.** Vakten dekker arbeiderdød *mellom*
+hendelser. Den dekker ikke en hendelse arbeideren allerede har lest ut av køen:
+
+```
+[worker] HOLDING event unanswered (pid=644293)
+[super]  *** WORKER DIED (signal=9) - taking over, failing closed ***
+   leser: STILL BLOCKED ... rc=124   (drept av timeout, ikke returnert)
+```
+
+Hendelsen forlot køen sammen med arbeideren, så vakten ser den aldri og kan ikke svare.
+Leseren henger ubundet. Filen forble dehydrert, så det er ingen korrupsjon — men en
+uendelig henging er ikke et bedre utfall enn `EIO`.
+
+**Lukkes ved at arbeideren publiserer hva den har i hendene.** Målt: en respons matches på
+fd-nummer innenfor gruppen, ikke mot svarerens fd-tabell. Vakten kan derfor svare på en
+hendelse den aldri selv leste:
+
+```
+[super] answering stranded event fd=4 for the dead worker: accepted
+   leser: rc=1        (EIO, ikke henging)
+```
+
+Arbeideren skriver altså fd-nummeret til en delt plass før den gjør noe som kan henge, og
+vakten svarer `FAN_DENY_ERRNO(EIO)` på alt som står der når arbeideren dør. Det er en
+liten mekanisme, og uten den har fail-closed-designet et hull som ser ut som en hengt
+maskin.
+
+**Konformanstester som må finnes:** `kill -9` arbeideren mellom hendelser, les en
+placeholder, krev `EIO`. `kill -9` arbeideren *mens* den holder en hendelse, krev `EIO` og
+ikke henging. Og: drep begge, krev at monteringspunktet er borte innen N sekunder.
 
 ---
 
@@ -699,17 +751,28 @@ blocks=0
 er en vesentlig innsnevring av problemet: bare verktøy som faktisk leser bytes er i
 faresonen.
 
-**Lag 2 — `chattr +d` (nodump). Virker teknisk, men er en felle. Se §6d.**
+**Lag 2 — `chattr +d` (nodump). Målt i praksis, og laget holder nesten ingenting.**
 
-```
-$ chattr +d hsm/w3.txt && lsattr hsm/w3.txt
-------d--------------- hsm/w3.txt
-```
+Flagget lar seg sette på btrfs (`------d---------------`), men det hjelper bare hvis
+verktøyene leser det. Målt på de installerte, og slått opp for de to vanligste:
 
-Dette er en eksisterende Linux-konvensjon, og den flytter arbeidet fra «vedlikehold en
-liste over alle backupverktøy» til «følg en konvensjon som finnes». Men den innfører en
-stille feil av nøyaktig den familien dette rammeverket finnes for å drepe, og kan derfor
-**ikke** slås på som en bieffekt. Betingelsene står i §6d.
+| Verktøy | Respekterer nodump |
+|---|---|
+| GNU `tar` | **nei** — ingen støtte i det hele tatt |
+| `bsdtar` | bare med eksplisitt `--nodump` |
+| `rsync` | **nei** |
+| `borg` | bare med eksplisitt `--exclude-nodump` |
+| `restic` | **nei** — støtter ikke `chattr`-attributter |
+| `dump` | ja (flagget kommer derfra) |
+
+Ingen av dem hopper over filene uten at brukeren ber om det, og de to som er vanligst på
+en Linux-maskin i dag — `restic` og `rsync` — kan ikke gjøre det i det hele tatt.
+
+**Dermed faller lag 2 som automatisk mitigering.** Det er verdt å sette flagget likevel:
+det koster ingenting, og for den som kjører `borg --exclude-nodump` eller `bsdtar
+--nodump` gjør det nøyaktig det man vil. Men det kan ikke bæres av. Konsekvensen er at
+manifestet i §6d ikke er en ekstra trygghet — det er *den* mekanismen som gjør en backup
+fullstendig, og lag 3 må dekke resten.
 
 **Lag 3 — policy på systemd-enhet, ikke på pid. Verifisert ende til ende.**
 
@@ -796,6 +859,12 @@ i sin helhet. `exclude` er det minst gale valget, og prisen er at det **må** v�
 Punkt 3 er det som gjør `exclude` forsvarlig i det hele tatt. Uten manifestet er en backup
 med nodump bare et hull med en teller ved siden av. Med det er den en fullstendig
 beskrivelse av hva som fantes, og hvor det ligger.
+
+**Og etter målingen i §6c er punkt 3 ikke lenger bare det som gjør `exclude` forsvarlig —
+det er hele mekanismen.** Nesten ingen backupverktøy respekterer nodump uten at brukeren
+ber om det, og `restic` kan ikke i det hele tatt. Det betyr at standardvalget `exclude` i
+praksis oppfører seg som `hydrate` for de fleste: verktøyet leser filene, policyen i §6c
+må nekte dem, og manifestet er det eneste som forteller hva som mangler.
 
 **Konformanstest:** dehydrer *N* filer, kjør en backup med et verktøy som respekterer
 nodump, og krev at (a) statusen rapporterer nøyaktig *N*, og (b) manifestet i backupen
@@ -885,20 +954,21 @@ I ærlighetens navn, siden dette skal være beslutningsgrunnlag:
   Kravet er at ingen annen montering eksponerer filene, og det kan vi ikke håndheve — bare
   oppdage, med `FAN_MNT_ATTACH`. Jeg har **ikke** kjørt en probe på selve
   `FAN_MNT_ATTACH`-abonnementet; det er neste lille probe.
-- Jeg testet **ikke** `FAN_MARK_IGNORE_SURV` empirisk — kun at konstanten finnes.
-  Ytelsespåstanden «hydrerte filer koster null» hviler på at den virker som dokumentert.
+- ~~`FAN_MARK_IGNORE_SURV`~~ — **lukket.** `probes/ignoremark.c`: godtatt, undertrykker,
+  og overlever endring. Ytelsespåstanden står.
 - Jeg testet **ikke** mmap-hydrering eller `truncate`-hydrering. Kildekoden har hookene
   (`fsnotify_mmap_perm`, `fsnotify_truncate_perm`); jeg har ikke sett dem fyre.
-- Fail-closed-mønsteret i §6a er verifisert for `kill -9` på arbeideren. Jeg testet
-  **ikke** hendelser som var *under behandling* i det arbeideren døde — om de blir
-  besvart, henger eller slippes. Det bør inn i konformanstesten.
+- ~~Hendelser under behandling ved arbeiderdød~~ — **lukket, og det var et ekte hull.**
+  En hendelse arbeideren allerede hadde lest ut av køen etterlot leseren hengende
+  ubundet; vakten kunne ikke svare på noe den aldri så. Lukkes ved at arbeideren
+  publiserer fd-nummeret sitt — responser matches på nummer innenfor gruppen. Se §6a.
 - ~~`FAN_REPORT_PIDFD`~~ — **lukket.** `probes/pidfd_cgroup.c` henter pidfd fra hendelsen,
   slår opp pid og leser cgroup. Verifisert at cgroup skiller to lesere med identisk `comm`
   og `exe`. §6c hviler ikke lenger på en antakelse.
-- `chattr +d` er verifisert satt på btrfs. Jeg har **ikke** verifisert hvilke
-  backupverktøy som faktisk respekterer nodump i praksis — det er research som må gjøres
-  før lag 2 kan telles som en reell mitigering. Merk at §6d gjør dette mindre kritisk:
-  manifestet bærer fullstendigheten uansett hva verktøyene gjør.
+- ~~Nodump i praksis~~ — **lukket, og svaret var «nesten ingen».** GNU `tar` og `rsync`
+  har ingen støtte; `bsdtar` og `borg` bare med eksplisitt flagg; `restic` ikke i det hele
+  tatt. Lag 2 i §6c faller som automatisk mitigering, og manifestet i §6d bærer
+  fullstendigheten alene.
 - §5.7 er skrevet ut fra hva som er trygt (SIGBUS-risikoen ved `ftruncate` under en
   `mmap`-et leser er reell og velkjent), men jeg har **ikke** kjørt en probe som
   demonstrerer avviks-tilfellet ende til ende. Den bør inn i konformanstestpakken før §5
@@ -952,23 +1022,87 @@ De tre som feiler er ekte funn. 5.3 er `setattr` som tas imot og forkastes still
 5.8 er begge egenskaper kjernen ville gitt gratis på et ekte filsystem, og som en
 FUSE-klient må velge å implementere.
 
-**Spor B — probene som kan velte arkitekturen (§9).** Prioritert etter hvor mye de kan
-rive ned:
+**Spor B — probene som kan velte arkitekturen (§9).** ✅ **Alle kjørt.**
 
-1. ~~**pidfd→cgroup**~~ — **ferdig.** `probes/pidfd_cgroup.c` bekrefter hele veien, og
-   viser at cgroup skiller to lesere som er identiske på `comm` og `exe`. §6c står.
-2. ~~**Katalogmerker**~~ — **ferdig.** Svaret er at det ikke går: et katalogmerke godtas og
-   leverer ingen hendelser, og `FAN_EVENT_ON_CHILD` stopper ved direkte barn. Eget
-   monteringspunkt er et krav. Se §6.4. Oppfølgeren om bind-mount er også **ferdig**:
-   den holder ikke, og kravet er strengere enn antatt (§6.4a). Anbefaling: eget
-   btrfs-subvolum, pluss `FAN_MNT_ATTACH`-overvåking for det vi ikke kan håndheve.
-3. **`FAN_MARK_IGNORE_SURV`** — bærer ytelsespåstanden «hydrerte filer koster null».
-4. **Hendelser under behandling ved arbeiderdød** — siste hull i fail-closed-beviset (§6a).
-5. **Nodump i praksis** — hvilke backupverktøy respekterer det faktisk? Er svaret «få»,
-   faller lag 2 i §6c bort og §6d må bære mer.
+| Probe | Svar |
+|---|---|
+| pidfd→cgroup | virker; cgroup skiller lesere som er identiske på `comm` og `exe` |
+| Katalogmerker | går ikke — merket godtas og leverer ingenting (§6.4) |
+| Bind-mount | holder ikke — hver variant har en omvei (§6.4a) |
+| `FAN_MNT_ATTACH` | virker, men trenger egen gruppe; hendelsen er en trigger, ikke et oppslag |
+| `FAN_MARK_IGNORE_SURV` | virker, og overlever endring — ytelsespåstanden står |
+| Hendelser under behandling | var et ekte hull; lukket ved å publisere fd-nummeret (§6a) |
+| Nodump i praksis | nesten ingen verktøy respekterer det — lag 2 faller (§6c) |
+
+Ingen av dem veltet arkitekturen. Tre av dem gjorde et krav strengere, og to fant en
+stille feil av samme familie som de åtte invariantene: noe som svarte «greit» på noe det
+ikke gjorde.
 
 **Deretter:** den privilegerte hjelperen — super/worker fra §6a — som den minste tingen
 som får fail-closed-testen og den første invarianten fra spor A til å passere.
 
 Prober og loggene fra denne undersøkelsen ligger i scratchpad-området
 (`ptprobe.c`, `hsmprobe.c` og målelogger) hvis du vil kjøre dem selv.
+
+---
+
+## 11. Bygge rammeverket, eller fikse klienten?
+
+**Anbefaling: fiks de tre funnene i klienten nå. Bygg rammeverket bare som en bevisst
+produktsatsing — ikke som en redningsaksjon.**
+
+Konformanskjøringen ga informasjon designdokumentet ikke hadde da §1 ble skrevet, og den
+peker en annen vei enn jeg ventet.
+
+**Klienten er nærmere riktig enn den så ut.** Fem av åtte invarianter passerer, og de to
+som passerer og var vanskeligst — atomisk lagring og sletting under opplasting — er ekte
+distribuerte kappløp som ingen arkitektur gir gratis. De ble løst i userspace, i FUSE, og
+fiksene holder under en uavhengig test som ikke var skrevet av den som fikset dem.
+
+**De tre som feiler er alminnelige bugger, ikke arkitektoniske umuligheter.** Hver av dem
+er dager, ikke uker:
+
+| Funn | Hva som skal til i FUSE |
+|---|---|
+| 5.3 modus | Lagre modus i databasen og svare med den fra `getattr`. `setattr` tas allerede imot; den forkastes bare. |
+| 5.7 hydreringsavvik | Verifiser lengde og etag før innholdet serveres; forkast delvis nedlasting i stedet for å levere den. |
+| 5.8 blokker | Rapporter `blocks = 0` for placeholders i `getattr`. |
+
+**Og fanotify-veien er ingen trygg havn.** Tre av de fire siste probene fant en stille
+feil av nøyaktig den familien dette prosjektet finnes for å drepe: et katalogmerke som
+godtas og leverer ingenting, en bind-mount som ser ut til å dekke og har en omvei, en
+arbeiderdød som henger leseren i stedet for å svare. Alle er løsbare — men de er *nye*
+ting å få rett, og de kommer i tillegg til det klienten allerede har fått rett.
+
+Det er verdt å si tydelig, siden §1 og §3 argumenterer motsatt vei: **det stemmer fortsatt
+at kjernen eier POSIX-kontrakten bedre enn vi kan, men det er en mindre del av totalen enn
+dokumentet antok.** Rammeverket flytter hvilke ting man må få rett — det fjerner ikke
+listen. POSIX-delen forsvinner; monteringstopologi, privilegiedeling, fail-closed-tilsyn
+og hydreringspolicy kommer i stedet, og de tre siste finnes ikke i en FUSE-klient i det
+hele tatt.
+
+### Hva rammeverket faktisk kjøper
+
+To ting, og begge er langsiktige:
+
+1. **Bugklassene blir umulige, ikke fikset.** Fem av åtte invarianter er gratis på et ekte
+   filsystem. Over år med endringer er det forskjellen på å ikke kunne introdusere feilen
+   og å måtte teste for den hver gang.
+2. **Null kostnad i datastien.** Målt: en hydrert, ignore-merket fil er en vanlig
+   btrfs-fil. Ingen daemon, ikke engang de 8 % FUSE-passthrough koster.
+
+### Beslutningsregelen
+
+- **Er OneDrive-på-Linux produktet?** Fiks de tre. 12–15 uker på et rammeverk er ikke
+  forsvarlig for tre bugger som tar dager.
+- **Er *skyfiler på Linux* produktet** — flere leverandører, eller et fundament andre kan
+  bygge på? Da er rammeverket riktig, og da er det verdt hele prisen i §7.
+
+Det er en produktbeslutning, ikke en teknisk. Teknisk er begge veier farbare, og denne
+undersøkelsen har gjort dem begge tryggere enn de var.
+
+### Uansett hvilken vei
+
+Konformanssuiten er det som gjør begge trygge, og den er ferdig. Den er også det eneste
+her som ikke må velges bort: den kjører mot klienten i dag, den kjører mot rammeverket
+hvis det bygges, og den overlever at valget gjøres om.
