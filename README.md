@@ -1,0 +1,88 @@
+# HydrationAPI
+
+A hydration framework for cloud files on Linux — the equivalent of macOS' File
+Provider and Windows' Cloud Files API. Files appear as ordinary local files with
+their real size and metadata; their content is fetched on first access.
+
+**Status: phase 1 — design and feasibility. No framework implementation yet.**
+
+## The finding
+
+Linux already has the mechanism, and it is not FUSE.
+
+`FAN_CLASS_PRE_CONTENT` + `FAN_PRE_ACCESS` — fanotify pre-content events — are a
+blocking permission hook that fires *before* a file's content is read, built for
+exactly this and in production at Meta for HSM. Files stay on a real ext4, btrfs
+or xfs filesystem, so the kernel keeps owning the POSIX contract.
+
+That matters more than the I/O path. A FUSE client has to reimplement `stat`,
+`rename`, `fsync` and file identity in userspace, and that is where cloud clients
+on Linux get things subtly wrong — not in reading bytes. On a real filesystem
+several of those problems stop existing rather than getting solved.
+
+[DESIGN.md](DESIGN.md) is the full document: what is in the kernel today
+(`fs/netfs`, `cachefiles` on-demand, `FUSE_PASSTHROUGH`, fanotify pre-content),
+what each one can and cannot do, the recommended architecture, what it costs, and
+the contract a cloud client must satisfy.
+
+Everything in it was measured on Linux 7.1.6 / btrfs rather than recalled. Where
+something was not measured, it says so.
+
+## Layout
+
+| Path | What it is |
+|---|---|
+| [DESIGN.md](DESIGN.md) | The design document and the contract (§5) |
+| `conformance/` | The contract as executable tests, against a `Harness` trait |
+| `adapters/onedrive-reference/` | Runs the suite against a real FUSE client |
+| `probes/` | Throwaway feasibility probes that settled specific questions |
+
+## The contract
+
+Eight invariants, each one a real data-loss bug in a shipped client — except
+§5.8, which the suite found on its own. They are written against a trait that
+knows nothing about any implementation, so they outlive the architecture:
+
+1. **Identity** — a locally created file keeps one `st_ino` for its whole life
+2. **Size and mtime** — the local copy is the truth, immediately
+3. **POSIX mode** — the exec bit survives dehydration and rehydration
+4. **Atomic save** — no upload succeeds under a name the file no longer has
+5. **Delete during upload** — the delete is the newer intention and wins
+6. **`fsync`** — never claims durability it did not deliver
+7. **Hydration mismatch** — all of the promised content, or `EIO` and no residue
+8. **Placeholder disk usage** — metadata-only files report zero blocks
+
+```bash
+cargo test -p hydration-conformance
+```
+
+Against the reference client (`OneDriveForLinux` @ `f1f090c`), five pass and
+three fail. Two of the passes are bugs that client fixed recently — the suite
+confirms independently that the fixes hold, rather than only accusing.
+
+```bash
+cargo test -p adapter-onedrive-reference -- --nocapture
+```
+
+Needs `/dev/fuse`. A skip is reported as "did not run", never as a pass; set
+`HYDRATION_REQUIRE_FUSE=1` to make a skip fail instead.
+
+## Probes
+
+Small programs that answered one question each and are kept because the answers
+are load-bearing. Both need `CAP_SYS_ADMIN`, which is itself one of the findings.
+
+```bash
+gcc -O1 -Wall -o probes/build/dirmark probes/dirmark.c
+```
+
+- `pidfd_cgroup.c` — can a hydration policy tell a backup daemon from the user's
+  own shell? Yes, but only via cgroup: two readers were identical in `comm` and
+  `exe`.
+- `dirmark.c` — can `FAN_PRE_ACCESS` be set on a single directory? No. The mark
+  is accepted and delivers nothing, which is worse than being rejected.
+
+## Non-goals for v1
+
+Multi-account, shared folders, bandwidth limits, encryption. One user, one
+account, one machine — done correctly.
