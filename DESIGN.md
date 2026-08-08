@@ -520,10 +520,41 @@ handler — hele skadeområdet fra §6a, utvidet til alt brukeren eier.
 allerede andrelinjeforsvaret i §6a; nå er det også den eneste måten å få dekning på i det
 hele tatt. Ett tiltak, to uavhengige begrunnelser.
 
-Én ting jeg *ikke* har målt: om et bind-mount av en katalog over seg selv er nok, eller om
-det trengs et ekte separat volum (btrfs-subvolum). Et mount-merke er per `vfsmount`, så en
-tilgang som når filene gjennom det underliggende monteringspunktet i stedet ville gå
-utenom. Det bør avklares før systemd-oppsettet skrives.
+### 6.4a Bind-mount holder ikke. Kravet er strengere enn «eget monteringspunkt».
+
+Målt, fordi valget avgjør systemd-oppsettet. Et mount-merke er per `vfsmount`, og
+spørsmålet er om noen *annen* sti når de samme filene.
+
+| Oppsett | Dekning gjennom den tiltenkte stien | Finnes en omvei? |
+|---|---|---|
+| `mount --bind sync alt`, merk `alt` | ja | **ja** — original sti `sync/` gikk rett forbi, `blocks=0` |
+| `mount --bind sync sync` (over seg selv) | ja, også underkataloger | **ja** — `mount --bind` av *forelderen* avdekker den skyggelagte katalogen |
+| Eget btrfs-subvolum, montert separat | ja | **ja, hvis** btrfs-roten (`subvolid=5`) er montert |
+
+Alle tre omveiene ble verifisert ved å lese en placeholder gjennom dem: `blocks=0`, ingen
+hendelse levert, innholdet var nuller. Bind-mount over seg selv er altså ikke nok — en
+ikke-rekursiv bind av forelderen er nok til å omgå det, og det er nøyaktig hva
+container-runtimes og systemd-sandboxing (`BindPaths=`, `ProtectHome=`) gjør rutinemessig.
+
+**Den riktige formuleringen av kravet er derfor ikke «eget monteringspunkt», men:**
+
+> Ingen annen montering i systemet skal eksponere synkmappens filer.
+
+Det er en egenskap ved hele maskinens monteringstabell, ikke ved vårt eget oppsett — og
+det er verdt å si rett ut: **vi kan ikke håndheve det.** En bruker eller en container kan
+lage en omvei etterpå, når som helst.
+
+**Praktisk anbefaling: eget btrfs-subvolum.** På et vanlig Arch/CachyOS-oppsett er
+btrfs-roten ikke montert — verifisert på denne maskinen, der `@`, `@home`, `@root`, `@srv`,
+`@cache` og `@log` er montert hver for seg og `subvolid=5` ikke finnes i tabellen. Da har
+et `@onedrive`-subvolum montert på `~/OneDrive` ingen annen sti. Det er billig, det passer
+oppsettet som allerede finnes, og det krever ingen egen partisjon.
+
+**Og siden vi ikke kan håndheve det, må vi oppdage det.** `FAN_MNT_ATTACH` og
+`FAN_MNT_DETACH` finnes i denne kjernens fanotify (`0x01000000` / `0x02000000`). Daemonen
+skal abonnere på dem og si fra — høyt, i statusen — hvis en ny montering eksponerer
+synkfilene. Det er samme prinsipp som §6d: vi kan ikke gjøre feilen umulig, men vi nekter
+å la den være stille.
 
 **5. Ingen ferdig utkastelsespolicy.** Kjernen sier ikke fra ved diskpress at den vil ha
 plass. Vi må implementere dehydrering (`FALLOC_FL_PUNCH_HOLE` + fjerne ignore-merket)
@@ -811,21 +842,24 @@ risikoprofil enn `ksmbd`-sammenligningen.
 Én bruker, én konto, én maskin — men riktig.
 
 **Med:**
-1. Synkmappe på eget monteringspunkt (ext4/btrfs/xfs), montert kun med daemonen, merket
-   med `FAN_MARK_MOUNT`. Ikke valgfritt: et katalogmerke leverer ingen hendelser (§6.4),
-   og `FAN_MARK_FILESYSTEM` ville lagt hele `/home` under en blokkerende handler.
-2. **Super/worker-delt privilegert hjelper med fail-closed-vakt (§6a).** Ikke valgfritt —
+1. Synkmappe på **eget btrfs-subvolum** (eller separat volum), montert kun med daemonen,
+   merket med `FAN_MARK_MOUNT`. Ikke valgfritt: et katalogmerke leverer ingen hendelser
+   (§6.4), et bind-mount har en omvei (§6.4a), og `FAN_MARK_FILESYSTEM` ville lagt hele
+   `/home` under en blokkerende handler.
+2. `FAN_MNT_ATTACH`-overvåking som sier fra hvis en ny montering eksponerer synkfilene.
+   Kravet i §6.4a kan ikke håndheves, bare oppdages — og da skal det ikke være stille.
+3. **Super/worker-delt privilegert hjelper med fail-closed-vakt (§6a).** Ikke valgfritt —
    uten den er arkitekturen usikrere enn FUSE.
-3. **Privilegieseparasjon med spesifisert protokoll (§6b).** Root-siden ser aldri et token.
-4. Placeholder: sparsom fil, riktig størrelse, sky-ID og modus i xattr, `chattr +d`.
-5. Hydrering ved `FAN_PRE_ACCESS` — hele filen, ikke områder (se under).
-6. `FAN_MARK_IGNORE_SURV` på hydrerte filer, så de koster null.
-7. Endringsdeteksjon → debounce → opplasting, med de fem reglene i §5.
-8. Dehydrering: `PUNCH_HOLE` + fjern ignore-merke + sett nodump. Manuelt utløst i v1.
-9. **Hydreringspolicy (§6c):** pidfd→cgroup, standardliste, `FAN_DENY_ERRNO(EPERM)`,
+4. **Privilegieseparasjon med spesifisert protokoll (§6b).** Root-siden ser aldri et token.
+5. Placeholder: sparsom fil, riktig størrelse, sky-ID og modus i xattr, `chattr +d`.
+6. Hydrering ved `FAN_PRE_ACCESS` — hele filen, ikke områder (se under).
+7. `FAN_MARK_IGNORE_SURV` på hydrerte filer, så de koster null.
+8. Endringsdeteksjon → debounce → opplasting, med de fem reglene i §5.
+9. Dehydrering: `PUNCH_HOLE` + fjern ignore-merke + sett nodump. Manuelt utløst i v1.
+10. **Hydreringspolicy (§6c):** pidfd→cgroup, standardliste, `FAN_DENY_ERRNO(EPERM)`,
    synlig nektelseslogg.
-10. Konformanstestpakken. Alle åtte invariantene, pluss fail-closed-testen fra §6a.
-11. `FAN_DENY_ERRNO(EIO)` ved nedlastingsfeil — aldri stille nuller.
+11. Konformanstestpakken. Alle åtte invariantene, pluss fail-closed-testen fra §6a.
+12. `FAN_DENY_ERRNO(EIO)` ved nedlastingsfeil — aldri stille nuller.
 
 **Utenfor v1, bevisst:**
 - **Områdevis hydrering.** Hendelsen gir `offset`/`count`, men målingen viste at
@@ -845,8 +879,12 @@ I ærlighetens navn, siden dette skal være beslutningsgrunnlag:
 
 - ~~Katalogmerker~~ — **lukket.** `probes/dirmark.c` måler alle fire marketyper: et rent
   katalogmerke godtas og leverer ingenting, `FAN_EVENT_ON_CHILD` dekker bare direkte barn.
-  Eget monteringspunkt er dermed et krav (§6.4). Ett nytt spørsmål åpnet seg: om et
-  bind-mount holder, eller om det trengs et separat volum.
+  Eget monteringspunkt er dermed et krav (§6.4).
+- ~~Bind-mount~~ — **lukket, og svaret ble strengere enn spørsmålet.** Verken bind til en
+  egen sti eller bind over seg selv holder; begge har en omvei som leverer nuller (§6.4a).
+  Kravet er at ingen annen montering eksponerer filene, og det kan vi ikke håndheve — bare
+  oppdage, med `FAN_MNT_ATTACH`. Jeg har **ikke** kjørt en probe på selve
+  `FAN_MNT_ATTACH`-abonnementet; det er neste lille probe.
 - Jeg testet **ikke** `FAN_MARK_IGNORE_SURV` empirisk — kun at konstanten finnes.
   Ytelsespåstanden «hydrerte filer koster null» hviler på at den virker som dokumentert.
 - Jeg testet **ikke** mmap-hydrering eller `truncate`-hydrering. Kildekoden har hookene
@@ -921,8 +959,9 @@ rive ned:
    viser at cgroup skiller to lesere som er identiske på `comm` og `exe`. §6c står.
 2. ~~**Katalogmerker**~~ — **ferdig.** Svaret er at det ikke går: et katalogmerke godtas og
    leverer ingen hendelser, og `FAN_EVENT_ON_CHILD` stopper ved direkte barn. Eget
-   monteringspunkt er et krav. Se §6.4. **Oppfølger:** holder et bind-mount, eller trengs
-   et separat volum? Et mount-merke er per `vfsmount`, så det avgjør systemd-oppsettet.
+   monteringspunkt er et krav. Se §6.4. Oppfølgeren om bind-mount er også **ferdig**:
+   den holder ikke, og kravet er strengere enn antatt (§6.4a). Anbefaling: eget
+   btrfs-subvolum, pluss `FAN_MNT_ATTACH`-overvåking for det vi ikke kan håndheve.
 3. **`FAN_MARK_IGNORE_SURV`** — bærer ytelsespåstanden «hydrerte filer koster null».
 4. **Hendelser under behandling ved arbeiderdød** — siste hull i fail-closed-beviset (§6a).
 5. **Nodump i praksis** — hvilke backupverktøy respekterer det faktisk? Er svaret «få»,
