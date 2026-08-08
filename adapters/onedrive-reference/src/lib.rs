@@ -536,5 +536,26 @@ impl Drop for ReferenceClient {
         if let Some(mount) = self.mount.take() {
             let _ = self.rt.block_on(async { mount.unmount().await });
         }
+        // An invariant that fails does so by panicking, sometimes with a
+        // filesystem operation still in flight, and the session's own unmount
+        // does not always win that race. Without this backstop a failing run
+        // leaves a mount behind pointing at a dead daemon, and they accumulate
+        // across runs until something unrelated breaks.
+        if is_still_mounted(&self.mountpoint) {
+            let _ = std::process::Command::new("fusermount3")
+                .arg("-zu")
+                .arg(&self.mountpoint)
+                .status();
+        }
     }
+}
+
+fn is_still_mounted(path: &Path) -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
+        return false;
+    };
+    let needle = path.to_string_lossy();
+    mounts
+        .lines()
+        .any(|l| l.split_whitespace().nth(1) == Some(needle.as_ref()))
 }
