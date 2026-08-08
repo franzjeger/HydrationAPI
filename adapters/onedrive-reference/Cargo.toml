@@ -5,13 +5,15 @@ edition.workspace = true
 license.workspace = true
 description = "Runs the conformance suite against the OneDriveForLinux FUSE client"
 
-# Pinned to the commit the specification was written against, so a conformance
-# result names a specific client rather than "whatever main was that day".
+# Pinned rather than tracking main, so a conformance result names a specific
+# client. Currently the commit that fixed 5.3, 5.7 and 5.8 (PR #55); the run
+# against the client as it was when the contract was written (f1f090c) is
+# recorded in DESIGN.md §10.
 [dependencies]
 hydration-conformance = { path = "../../conformance" }
-vfs = { git = "https://github.com/franzjeger/OneDriveForLinux", rev = "f1f090c" }
-sync-engine = { git = "https://github.com/franzjeger/OneDriveForLinux", rev = "f1f090c" }
-graph-client = { git = "https://github.com/franzjeger/OneDriveForLinux", rev = "f1f090c", features = ["test-util"] }
+vfs = { git = "https://github.com/franzjeger/OneDriveForLinux", rev = "a6312a8" }
+sync-engine = { git = "https://github.com/franzjeger/OneDriveForLinux", rev = "a6312a8" }
+graph-client = { git = "https://github.com/franzjeger/OneDriveForLinux", rev = "a6312a8", features = ["test-util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
 wiremock = "0.6"
 serde_json = "1"

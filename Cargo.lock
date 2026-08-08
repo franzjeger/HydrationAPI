@@ -529,7 +529,7 @@ dependencies = [
 [[package]]
 name = "graph-client"
 version = "0.1.0"
-source = "git+https://github.com/franzjeger/OneDriveForLinux?rev=f1f090c#f1f090cd68bd366f6a3990be5682764551d1729c"
+source = "git+https://github.com/franzjeger/OneDriveForLinux?rev=a6312a8#a6312a82e38622fa71959d26614f0013f0a16941"
 dependencies = [
  "anyhow",
  "base64",
@@ -1681,7 +1681,7 @@ dependencies = [
 [[package]]
 name = "sync-engine"
 version = "0.1.0"
-source = "git+https://github.com/franzjeger/OneDriveForLinux?rev=f1f090c#f1f090cd68bd366f6a3990be5682764551d1729c"
+source = "git+https://github.com/franzjeger/OneDriveForLinux?rev=a6312a8#a6312a82e38622fa71959d26614f0013f0a16941"
 dependencies = [
  "anyhow",
  "base64",
@@ -2062,7 +2062,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "vfs"
 version = "0.1.0"
-source = "git+https://github.com/franzjeger/OneDriveForLinux?rev=f1f090c#f1f090cd68bd366f6a3990be5682764551d1729c"
+source = "git+https://github.com/franzjeger/OneDriveForLinux?rev=a6312a8#a6312a82e38622fa71959d26614f0013f0a16941"
 dependencies = [
  "anyhow",
  "bytes",

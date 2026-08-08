@@ -1000,27 +1000,36 @@ To spor, parallelt.
 noen implementasjon, og `adapters/onedrive-reference/` kjører dem mot en ekte FUSE-mount,
 ekte sync-motor og ekte SQLite, mot en falsk Graph-API suiten kan styre.
 
-Resultat mot `f1f090c`:
+Suiten ble først kjørt mot `f1f090c` — klienten som den var da kontrakten ble skrevet —
+og deretter mot `a6312a8`, der de tre funnene er fikset og merget.
 
-| Invariant | Resultat |
-|---|---|
-| 5.1 identitet er stabil | PASS |
-| 5.2 størrelse er lokal sannhet | PASS |
-| 5.3 modus overlever dehydrering | **FAIL** — exec-biten ble aldri satt; `chmod +x` returnerte suksess og endret ingenting |
-| 5.4 atomisk lagring beholder navnet | PASS |
-| 5.5 sletting slår opplasting i lufta | PASS |
-| 5.6 `fsync` lyver ikke | PASS |
-| 5.7 hydreringsavvik feiler lukket | **FAIL** — en kort nedlasting lyktes: 2048 byte returnert for et objekt oppgitt som 4096 |
-| 5.8 placeholder opptar ikke disk | **FAIL** — 128 blokker rapportert for innhold den ikke har |
-| 6a arbeiderdød feiler lukket | N/A — ingen separerbar arbeider |
+| Invariant | `f1f090c` | `a6312a8` |
+|---|---|---|
+| 5.1 identitet er stabil | PASS | PASS |
+| 5.2 størrelse er lokal sannhet | PASS | PASS |
+| 5.3 modus overlever dehydrering | **FAIL** | PASS |
+| 5.4 atomisk lagring beholder navnet | PASS | PASS |
+| 5.5 sletting slår opplasting i lufta | PASS | PASS |
+| 5.6 `fsync` lyver ikke | PASS | PASS |
+| 5.7 hydreringsavvik feiler lukket | **FAIL** | PASS |
+| 5.8 placeholder opptar ikke disk | **FAIL** | PASS |
+| 6a arbeiderdød feiler lukket | N/A | N/A — ingen separerbar arbeider |
 
-Verdt å merke seg: **5.4 og 5.5 passerer.** Det er nøyaktig de to buggene klienten fikset
-i #51 og #52, og suiten bekrefter uavhengig at fiksene holder. Den er altså ikke bare et
-anklageskrift — den skiller det som er løst fra det som ikke er.
+**Førstekjøringen er den interessante.** Fem av åtte passerte allerede, inkludert 5.4 og
+5.5 — nøyaktig de to buggene klienten fikset i #51 og #52. Suiten bekreftet uavhengig at
+de fiksene holdt, og skilte dermed det som var løst fra det som ikke var, i stedet for
+bare å anklage.
 
-De tre som feiler er ekte funn. 5.3 er `setattr` som tas imot og forkastes stille. 5.7 og
-5.8 er begge egenskaper kjernen ville gitt gratis på et ekte filsystem, og som en
-FUSE-klient må velge å implementere.
+De tre som feilet er fikset i
+[#55](https://github.com/franzjeger/OneDriveForLinux/pull/55). 5.3 var `setattr` som tok
+imot en modusendring og forkastet den — og, mindre synlig, at modusen ble foreldreløs når
+opplastingen adopterte den ekte OneDrive-ID-en. 5.7 var en nedlasting som endte for tidlig
+og ble servert som en kort fil. 5.8 var `blocks` regnet ut fra `size`.
+
+**Den andre halvdelen av 5.3 er argumentet for suiten.** Den var ikke synlig ved
+kildelesing; den dukket opp fordi testen fortsatte å feile etter at den åpenbare fiksen
+var på plass. Det er en bugklasse — noe som virker helt til en asynkron operasjon fullfører
+— som klienten har hatt fire av tidligere, og som ingen kodegjennomgang fanget.
 
 **Spor B — probene som kan velte arkitekturen (§9).** ✅ **Alle kjørt.**
 

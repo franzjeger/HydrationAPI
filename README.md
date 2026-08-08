@@ -56,9 +56,14 @@ knows nothing about any implementation, so they outlive the architecture:
 cargo test -p hydration-conformance
 ```
 
-Against the reference client (`OneDriveForLinux` @ `f1f090c`), five pass and
-three fail. Two of the passes are bugs that client fixed recently — the suite
-confirms independently that the fixes hold, rather than only accusing.
+Against the reference client as it was when the contract was written
+(`f1f090c`), five passed and three failed. Two of those passes were bugs the
+client had fixed recently — the suite confirmed independently that those fixes
+held, rather than only accusing.
+
+The three failures are fixed in
+[OneDriveForLinux#55](https://github.com/franzjeger/OneDriveForLinux/pull/55),
+and the suite now runs 8/8 against that client.
 
 ```bash
 cargo test -p adapter-onedrive-reference -- --nocapture
