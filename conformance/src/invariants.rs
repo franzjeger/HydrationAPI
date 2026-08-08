@@ -188,7 +188,10 @@ pub fn atomic_save_keeps_its_name<H: Harness>(h: &mut H) -> Outcome {
     h.release_uploads();
     h.settle();
 
-    assert!(target.exists(), "the target file disappeared after an atomic save");
+    assert!(
+        target.exists(),
+        "the target file disappeared after an atomic save"
+    );
     assert_eq!(
         fs::read(&target).expect("read target"),
         b"edited\n",
@@ -448,12 +451,27 @@ pub fn run_all<H: Harness>(h: &mut H) -> Vec<(&'static str, Outcome)> {
     vec![
         ("5.1 identity is stable", identity_is_stable(h)),
         ("5.2 size is local truth", size_is_local_truth(h)),
-        ("5.3 mode survives dehydration", mode_survives_dehydration(h)),
-        ("5.4 atomic save keeps its name", atomic_save_keeps_its_name(h)),
-        ("5.5 delete beats in-flight upload", delete_beats_inflight_upload(h)),
+        (
+            "5.3 mode survives dehydration",
+            mode_survives_dehydration(h),
+        ),
+        (
+            "5.4 atomic save keeps its name",
+            atomic_save_keeps_its_name(h),
+        ),
+        (
+            "5.5 delete beats in-flight upload",
+            delete_beats_inflight_upload(h),
+        ),
         ("5.6 fsync does not lie", fsync_does_not_lie(h)),
-        ("5.7 hydration mismatch fails closed", hydration_mismatch_fails_closed(h)),
-        ("5.8 placeholder consumes no disk", placeholder_consumes_no_disk(h)),
+        (
+            "5.7 hydration mismatch fails closed",
+            hydration_mismatch_fails_closed(h),
+        ),
+        (
+            "5.8 placeholder consumes no disk",
+            placeholder_consumes_no_disk(h),
+        ),
         ("6a worker death fails closed", worker_death_fails_closed(h)),
     ]
 }

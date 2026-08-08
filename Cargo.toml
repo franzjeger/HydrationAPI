@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["conformance", "adapters/onedrive-reference"]
+members = ["conformance", "adapters/onedrive-reference", "crates/hydration-protocol", "crates/hydrationd"]
 
 [workspace.package]
 edition = "2021"

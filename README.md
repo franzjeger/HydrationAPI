@@ -35,7 +35,37 @@ something was not measured, it says so.
 | [DESIGN.md](DESIGN.md) | The design document and the contract (§5) |
 | `conformance/` | The contract as executable tests, against a `Harness` trait |
 | `adapters/onedrive-reference/` | Runs the suite against a real FUSE client |
-| `probes/` | Throwaway feasibility probes that settled specific questions |
+| `crates/hydrationd/` | The privileged helper: fanotify pre-content, fail-closed |
+| `crates/hydration-protocol/` | The wire format across the privilege boundary |
+| `probes/` | Feasibility probes that settled specific questions |
+
+## The framework
+
+Under construction. `crates/hydrationd` is the privileged half — the part that
+holds `CAP_SYS_ADMIN`, watches a mount for pre-content events, fills
+placeholders, and refuses rather than serving zeros. It never opens a socket to
+the network and never sees a credential.
+
+It is split into a supervisor and a worker sharing one fanotify group, because
+bare fanotify fails *open*: kill the daemon and a dehydrated file reads back as
+zeros with exit 0. Three failure modes are covered and one is not:
+
+| | |
+|---|---|
+| worker dies between events | supervisor denies with `EIO` |
+| worker dies holding an event | supervisor answers it by fd number |
+| a fetch returns the wrong length | refused, placeholder left untouched |
+| **both processes die** | **not covered** — needs the mount torn down (§6.4a) |
+
+```bash
+cargo test -p hydrationd                     # unit + placeholder behaviour
+sudo -E HYDRATIOND_TEST_MOUNT=/mnt/scratch \
+  cargo test -p hydrationd --test fail_closed  # needs root and a real mount
+```
+
+What is not built yet: the unprivileged sync daemon, the socket that connects
+the two halves, the state store, change detection and upload, and eviction.
+See DESIGN.md §8 for the v1 scope.
 
 ## The contract
 

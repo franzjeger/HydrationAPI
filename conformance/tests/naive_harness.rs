@@ -181,7 +181,10 @@ impl Harness for NaiveLocal {
     fn dehydrate(&mut self, name: &str) {
         let path = self.dir.path().join(name);
         let len = fs::metadata(&path).expect("stat").len();
-        let f = fs::OpenOptions::new().write(true).open(&path).expect("open");
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open");
         f.set_len(0).expect("truncate");
         f.set_len(len).expect("restore size, no blocks");
     }
@@ -226,9 +229,15 @@ fn expectation(name: &str) -> (bool, &'static str) {
     match name {
         "5.1 identity is stable" => (true, "free: the inode is real and never swapped"),
         "5.2 size is local truth" => (true, "free: stat reads a real inode"),
-        "5.3 mode survives dehydration" => (false, "no interception: a dehydrated read gives zeros"),
-        "5.4 atomic save keeps its name" => (false, "modelled bug: upload addressed by captured name"),
-        "5.5 delete beats in-flight upload" => (false, "modelled bug: missing file read as missing data"),
+        "5.3 mode survives dehydration" => {
+            (false, "no interception: a dehydrated read gives zeros")
+        }
+        "5.4 atomic save keeps its name" => {
+            (false, "modelled bug: upload addressed by captured name")
+        }
+        "5.5 delete beats in-flight upload" => {
+            (false, "modelled bug: missing file read as missing data")
+        }
         "5.6 fsync does not lie" => (true, "free: fsync(2) on a real file"),
         "5.7 hydration mismatch fails closed" => (false, "no interception: cannot refuse a read"),
         "5.8 placeholder consumes no disk" => (true, "free: a sparse file reports what it uses"),
@@ -280,7 +289,11 @@ fn the_specification_has_teeth() {
             Err(_) => "FAIL",
         };
         let (want_pass, why) = expectation(name);
-        let verdict = if passed == want_pass { "ok" } else { "UNEXPECTED" };
+        let verdict = if passed == want_pass {
+            "ok"
+        } else {
+            "UNEXPECTED"
+        };
         println!("  {name:<38} {label}     {verdict} — {why}");
 
         if passed != want_pass {

@@ -1,0 +1,10 @@
+[package]
+name = "hydrationd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The privileged hydration helper: fanotify pre-content, fail-closed"
+
+[dependencies]
+hydration-protocol = { path = "../hydration-protocol" }
+libc = "0.2"
