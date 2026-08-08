@@ -310,6 +310,10 @@ opplastingstilstand.
 *Test:* skriv 23 byte, `stat` med én gang — `st_size == 23`. (Referanseklientens bug
 ga her `left: 0, right: 23`.)
 
+**Merk:** dette gjelder en fil med *lokale* endringer. Tilfellet der placeholderens
+størrelse er feil fordi filen endret seg i skyen før noen leste den, er en egen invariant
+— se §5.7.
+
 ### 5.3 POSIX-modus
 
 **Kjernen eier den. Rammeverket lagrer den som skygge.**
@@ -390,6 +394,49 @@ over arbeid som ikke har forlatt maskinen.
 usendte endringer er alltid korrekt, inkludert de som venter på stillhet.
 *Test:* skriv, `fsync`, hardt strømbrudd (eller `echo b > /proc/sysrq-trigger` i VM) —
 dataene er der. Og: en fil skrevet og slettet inne i stilleperioden når aldri skyen.
+
+### 5.7 Hydrering som ikke stemmer med placeholderen
+
+**Rammeverket eier den. Leseren skal aldri se delvis eller feil innhold.**
+
+Placeholderens `st_size` settes fra servermetadata ved opprettelse. Endres filen i skyen
+før noen leser den, hydrerer vi inn i en fil hvis størrelse er feil — og leseren står
+allerede blokkert inne i `read()` når vi oppdager det. På et delta-synket filsystem er
+dette ikke et hjørnetilfelle; det er tirsdag.
+
+**Å korrigere størrelsen under en levende leser er ikke trygt.** Leseren har allerede
+`stat`-et filen og kan ha dimensjonert en buffer etter det. Verre: er filen `mmap`-et,
+gir en `ftruncate` nedover **SIGBUS** ved tilgang forbi den nye enden. Vi kan ikke
+reparere oss ut av dette mens noen ser på.
+
+**Regelen er derfor:**
+
+> **En placeholder blir enten helt hydrert med det innholdet den lovet, eller den forblir
+> uendret og leseren får `EIO`. Det finnes ingen tredje utgang.**
+
+Placeholderen bærer skyens versjon i `user.hydration.etag` fra den ble opprettet.
+Hydreringen verifiserer mot den, og de to tilfellene håndteres slik:
+
+- **Avvik oppdaget før noe er skrevet** — provideren melder en annen lengde eller etag enn
+  placeholderen lover. Ingenting skrives. Svar `FAN_DENY_ERRNO(EIO)`, marker inoden for
+  metadata-resynk, og la neste delta-pass rette størrelsen. Leseren prøver igjen og møter
+  da en placeholder som stemmer.
+- **Avvik oppdaget underveis** — strømmen tar slutt for tidlig, eller etag endrer seg
+  midt i. Filen er nå delvis fylt og *ser* hydrert ut. Punch hole tilbake til fullt
+  dehydrert tilstand før det svares, deretter `FAN_DENY_ERRNO(EIO)`. En delvis fylt
+  placeholder må aldri overleve svaret.
+
+Dette er samme invariant som referanseklienten kom frem til for cachefiler — «en cachefil
+er bare noen gang hel, nedlastinger lander via rename fra `.tmp`» — men håndhevet på
+hydreringssiden, der `rename` ikke er tilgjengelig for oss fordi vi fyller en fil som
+allerede har en identitet og en leser.
+
+*Garanti:* en leser får aldri bytes fra en annen versjon enn den `stat` beskrev, og aldri
+en delvis fylt fil. Ved uenighet mellom placeholder og sky vinner ingen av dem — leseren
+får `EIO` og metadata resynkes.
+*Test:* opprett placeholder med størrelse *N*, la provideren returnere *N−k* byte, les —
+krev `EIO`, krev `blocks=0` etterpå, og krev at et påfølgende delta-pass retter `st_size`
+slik at neste lesing lykkes. Samme test med etag endret mens strømmen er åpen.
 
 ---
 
@@ -556,30 +603,45 @@ blocks=0
 er en vesentlig innsnevring av problemet: bare verktøy som faktisk leser bytes er i
 faresonen.
 
-**Lag 2 — `chattr +d` (nodump). Verifisert på btrfs.**
+**Lag 2 — `chattr +d` (nodump). Virker teknisk, men er en felle. Se §6d.**
 
 ```
 $ chattr +d hsm/w3.txt && lsattr hsm/w3.txt
 ------d--------------- hsm/w3.txt
 ```
 
-Dette er en *eksisterende* Linux-konvensjon. Dehydrerte filer bør bære nodump-flagget og
-miste det ved hydrering. Verktøy som allerede respekterer det hopper over filene uten at
-vi trenger å kjenne dem. Det flytter arbeidet fra «vedlikehold en liste over alle
-backupverktøy» til «følg en konvensjon som finnes».
+Dette er en eksisterende Linux-konvensjon, og den flytter arbeidet fra «vedlikehold en
+liste over alle backupverktøy» til «følg en konvensjon som finnes». Men den innfører en
+stille feil av nøyaktig den familien dette rammeverket finnes for å drepe, og kan derfor
+**ikke** slås på som en bieffekt. Betingelsene står i §6d.
 
-**Lag 3 — policy på systemd-enhet, ikke på pid.**
+**Lag 3 — policy på systemd-enhet, ikke på pid. Verifisert ende til ende.**
 
-For resten trengs en policy. `md->pid` alene er feil nøkkel: pid-er gjenbrukes, og
-kappløpet er reelt når du slår opp `/proc/<pid>/exe` etter at hendelsen kom.
-`FAN_REPORT_PIDFD` finnes i denne kjernen (`FAN_EVENT_INFO_TYPE_PIDFD`) og gir en pidfd —
-en referanse som ikke kan gjenbrukes under føttene på deg.
+`md->pid` alene er feil nøkkel: pid-er gjenbrukes, og oppslaget i `/proc/<pid>/` kappløper
+med at prosessen dør. En pidfd pinner pid-en så lenge den er åpen, og gjør oppslaget
+trygt. `probes/pidfd_cgroup.c` kjører hele veien og bekrefter at den virker:
 
-Fra pidfd-en er `/proc/<pid>/cgroup` den riktige nøkkelen, ikke kjørbar-stien:
-`restic.service`, `baloo_file.service`, `clamd.service`. En cgroup-nøkkel overlever at
-verktøyet oppdateres eller ligger et annet sted, og den skiller `rsync` kjørt av backup-
-enheten fra `rsync` kjørt av brukeren i et terminalvindu — som er nøyaktig skillet som
-betyr noe, og som en exe-basert liste ikke klarer.
+```
+[pidfd]   event->pid (racy key)  = 584386
+[pidfd]   pidfd = 5 -> pid 584386
+[pidfd]   comm   = cat
+[pidfd]   exe    = /usr/bin/cat
+[pidfd]   CGROUP = 0::/user.slice/.../app-com.anthropic.Claude-13945.scope
+
+[pidfd]   event->pid (racy key)  = 584391
+[pidfd]   pidfd = 5 -> pid 584391
+[pidfd]   comm   = cat
+[pidfd]   exe    = /usr/bin/cat
+[pidfd]   CGROUP = 0::/system.slice/restic-probe.scope
+```
+
+Legg merke til hva dette faktisk viser. De to leserne er **identiske** på alt annet enn
+cgroup: samme `comm`, samme `exe`, samme binærfil. En policy basert på kjørbar-sti kan
+ikke skille dem — den ville enten sluppet gjennom backupen eller nektet brukeren sin egen
+`cat`. Cgroup-en skiller dem rent: `restic-probe.scope` mot brukerens app-scope.
+
+Det er nøyaktig skillet som betyr noe — `rsync` kjørt av backup-enheten mot `rsync` kjørt
+av brukeren i et terminalvindu — og det er nå målt, ikke antatt. Cgroup er policy-nøkkelen.
 
 **Lag 4 — nekt, aldri stille nuller.** `FAN_DENY_ERRNO(EPERM)` for en nektet leser. Da
 logger backupverktøyet en feil i stedet for å skrive 300 GB nuller inn i arkivet sitt —
@@ -598,6 +660,53 @@ som en kjent begrensning.
 
 ---
 
+## 6d. Backup-kontrakten: nodump må aldri være stille
+
+**En backup som hopper over dehydrerte filer inneholder ikke skyfilene dine.**
+
+Det er kanskje riktig — de *er* i skyen — men en bruker som tror `restic` sikrer
+`~/OneDrive`, og som ved gjenoppretting finner at hvert dehydrerte objekt manglet, har
+mistet data av nøyaktig samme grunn som alle buggene i §5: noe svarte «greit» på
+noe det ikke gjorde. `chattr +d` er teknisk elegant og semantisk en felle, og den må
+behandles deretter.
+
+**Regel: nodump settes aldri som bieffekt av dehydrering.** Den er en uttalt policy med
+tre lovlige verdier, valgt ved oppsett, uten stille standard:
+
+| `backup_policy` | Oppførsel | Konsekvens brukeren må se |
+|---|---|---|
+| `exclude` | nodump settes, backupverktøy hopper over | «*N* filer utelatt fra backup fordi de er skylagret» |
+| `hydrate` | ingen nodump, backup leser og hydrerer alt | full backup, full nedlasting, full diskbruk |
+| `deny` | ingen nodump, policyen nekter med `EPERM` | backupverktøyet feiler høyt og logger det |
+
+Standard er `exclude` — men bare fordi de to andre er verre, ikke fordi den er trygg.
+`hydrate` beseirer hele poenget med on-demand, og `deny` gjør at en nattlig backup feilar
+i sin helhet. `exclude` er det minst gale valget, og prisen er at det **må** være synlig.
+
+**Tre krav som følger, og som hører til kontrakten:**
+
+1. **Tallet skal alltid stå i statusen.** Ikke i en loggfil, ikke bak et flagg. Samme sted
+   som «alt er synkronisert» vises, skal det stå «412 filer utelatt fra backup fordi de er
+   skylagret». Rammeverket eier telleren; klienten kan ikke la være å vise den.
+2. **Valget tas ved oppsett, ikke arves.** Første gang synkmappen konfigureres skal
+   spørsmålet stilles eksplisitt, med konsekvensen skrevet ut. En bruker som aldri tok
+   stilling til dette har ikke tatt stilling til det.
+3. **En manifest-fil som selv alltid er dense.** Rammeverket vedlikeholder
+   `.hydration-manifest` i synkmappens rot: sti, sky-ID, størrelse, hash og versjon for
+   hver dehydrerte fil. Den er liten, den er aldri dehydrert, og den blir dermed med i
+   backupen. Da er backupen *fullstendig i den forstand som betyr noe* — en gjenoppretting
+   kan hente innholdet igjen, i stedet for å oppdage et hull.
+
+Punkt 3 er det som gjør `exclude` forsvarlig i det hele tatt. Uten manifestet er en backup
+med nodump bare et hull med en teller ved siden av. Med det er den en fullstendig
+beskrivelse av hva som fantes, og hvor det ligger.
+
+**Konformanstest:** dehydrer *N* filer, kjør en backup med et verktøy som respekterer
+nodump, og krev at (a) statusen rapporterer nøyaktig *N*, og (b) manifestet i backupen
+lister alle *N* med hash som lar dem hentes igjen.
+
+---
+
 ## 7. Kostnad
 
 Forutsatt at klienten (auth, Graph-API, delta-sync) allerede finnes, som den gjør i
@@ -612,7 +721,7 @@ referanseimplementasjonen.
 | Endringsdeteksjon og opplastingskø | debounce, avlysning, køtelling | 1–2 uker |
 | Monteringspunkt-oppsett og systemd | subvolum, ordnet montering, `BindsTo`, OOM-herding | 1 uke |
 | **Hydreringspolicy (§6c)** | pidfd→cgroup, standardliste, brukerkonfig, nektelseslogg | **2 uker** |
-| **Konformanstestpakke (§5, §6a)** | de seks invariantene, fail-closed, deterministiske kappløp | **3 uker** |
+| **Konformanstestpakke (§5, §6a)** | de sju invariantene, fail-closed, deterministiske kappløp | **3 uker** |
 | Integrasjon mot referanseklienten | erstatte `crates/vfs` med provider-implementasjon | 1–2 uker |
 
 **Sum: 12–15 uker** til en v1 som er nyttig for én ekte skyklient.
@@ -648,7 +757,7 @@ risikoprofil enn `ksmbd`-sammenligningen.
 8. Dehydrering: `PUNCH_HOLE` + fjern ignore-merke + sett nodump. Manuelt utløst i v1.
 9. **Hydreringspolicy (§6c):** pidfd→cgroup, standardliste, `FAN_DENY_ERRNO(EPERM)`,
    synlig nektelseslogg.
-10. Konformanstestpakken. Alle seks invariantene, pluss fail-closed-testen fra §6a.
+10. Konformanstestpakken. Alle sju invariantene, pluss fail-closed-testen fra §6a.
 11. `FAN_DENY_ERRNO(EIO)` ved nedlastingsfeil — aldri stille nuller.
 
 **Utenfor v1, bevisst:**
@@ -677,12 +786,17 @@ I ærlighetens navn, siden dette skal være beslutningsgrunnlag:
 - Fail-closed-mønsteret i §6a er verifisert for `kill -9` på arbeideren. Jeg testet
   **ikke** hendelser som var *under behandling* i det arbeideren døde — om de blir
   besvart, henger eller slippes. Det bør inn i konformanstesten.
-- `FAN_REPORT_PIDFD` er verifisert å finnes i headeren, men jeg har **ikke** kjørt en
-  probe som faktisk henter en pidfd og slår opp cgroup fra den. Hele policy-designet i
-  §6c hviler på at den veien virker.
+- ~~`FAN_REPORT_PIDFD`~~ — **lukket.** `probes/pidfd_cgroup.c` henter pidfd fra hendelsen,
+  slår opp pid og leser cgroup. Verifisert at cgroup skiller to lesere med identisk `comm`
+  og `exe`. §6c hviler ikke lenger på en antakelse.
 - `chattr +d` er verifisert satt på btrfs. Jeg har **ikke** verifisert hvilke
   backupverktøy som faktisk respekterer nodump i praksis — det er research som må gjøres
-  før lag 2 kan telles som en reell mitigering.
+  før lag 2 kan telles som en reell mitigering. Merk at §6d gjør dette mindre kritisk:
+  manifestet bærer fullstendigheten uansett hva verktøyene gjør.
+- §5.7 er skrevet ut fra hva som er trygt (SIGBUS-risikoen ved `ftruncate` under en
+  `mmap`-et leser er reell og velkjent), men jeg har **ikke** kjørt en probe som
+  demonstrerer avviks-tilfellet ende til ende. Den bør inn i konformanstestpakken før §5
+  låses.
 - Ytelsestallene i §2.3 er på tmpfs med en triviell C-daemon. En ekte Rust/tokio-daemon
   med databaseoppslag er vesentlig tregere, og på NVMe ser forholdet annerledes ut.
   Tallene viser strukturen — passthrough fjerner userspace-rundturen — ikke absolutte
@@ -702,16 +816,32 @@ loop-enheter eller prosesser står igjen.
 
 Hvis du er enig i retningen, er den naturlige rekkefølgen:
 
-1. Lukk de åpne punktene i §9 med små prober. Prioritert rekkefølge, etter hvor mye de
-   kan velte: **pidfd→cgroup** (hele §6c hviler på den), **katalogmerker** (avgjør om
-   eget monteringspunkt er et krav eller en anbefaling), `FAN_MARK_IGNORE_SURV`
-   (ytelsespåstanden), hendelser under behandling ved arbeiderdød.
-2. Undersøk hvilke backupverktøy som faktisk respekterer nodump. Hvis svaret er «få»,
-   faller lag 2 i §6c bort og policylisten må bære mer.
-3. Skriv konformanstestpakken i §5 **først**, mot referanseklienten som den er. Den skal
-   feile på de seks invariantene i dag. Det gir en fasit før en linje rammeverk finnes.
-4. Deretter den privilegerte hjelperen — super/worker fra §6a — som den minste tingen som
-   får fail-closed-testen og den første invarianten til å passere.
+To spor, parallelt.
+
+**Spor A — konformanstestpakken (§5, sju invarianter).** Starter nå, uavhengig av alt
+annet. Skrives mot referanseklienten som den er, og skal feile på alle sju i dag.
+
+Grunnen til at den går parallelt og ikke etter probene: **den er det eneste her som har
+verdi selv om rammeverket aldri blir bygget.** Sju invarianter skrevet som kjørbare tester
+er en spesifikasjon som overlever hvilken som helst arkitekturbeslutning — bytter vi bort
+fanotify i morgen, står testene. Og den beviser sin egen verdi ved å feile på alle sju mot
+dagens klient. Ingen probe kan velte den, så ingenting er vunnet på å vente.
+
+**Spor B — probene som kan velte arkitekturen (§9).** Prioritert etter hvor mye de kan
+rive ned:
+
+1. ~~**pidfd→cgroup**~~ — **ferdig.** `probes/pidfd_cgroup.c` bekrefter hele veien, og
+   viser at cgroup skiller to lesere som er identiske på `comm` og `exe`. §6c står.
+2. **Katalogmerker** — kan `FAN_PRE_ACCESS` settes på én katalog, eller kreves
+   `FAN_MARK_MOUNT`? Avgjør om eget monteringspunkt er et krav eller en anbefaling, og
+   dermed hvor mye systemd-arbeid v1 har.
+3. **`FAN_MARK_IGNORE_SURV`** — bærer ytelsespåstanden «hydrerte filer koster null».
+4. **Hendelser under behandling ved arbeiderdød** — siste hull i fail-closed-beviset (§6a).
+5. **Nodump i praksis** — hvilke backupverktøy respekterer det faktisk? Er svaret «få»,
+   faller lag 2 i §6c bort og §6d må bære mer.
+
+**Deretter:** den privilegerte hjelperen — super/worker fra §6a — som den minste tingen
+som får fail-closed-testen og den første invarianten fra spor A til å passere.
 
 Prober og loggene fra denne undersøkelsen ligger i scratchpad-området
 (`ptprobe.c`, `hsmprobe.c` og målelogger) hvis du vil kjøre dem selv.
