@@ -1,0 +1,21 @@
+[package]
+name = "adapter-onedrive-reference"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Runs the conformance suite against the OneDriveForLinux FUSE client"
+
+# Pinned to the commit the specification was written against, so a conformance
+# result names a specific client rather than "whatever main was that day".
+[dependencies]
+hydration-conformance = { path = "../../conformance" }
+vfs = { git = "https://github.com/franzjeger/OneDriveForLinux", rev = "f1f090c" }
+sync-engine = { git = "https://github.com/franzjeger/OneDriveForLinux", rev = "f1f090c" }
+graph-client = { git = "https://github.com/franzjeger/OneDriveForLinux", rev = "f1f090c", features = ["test-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
+wiremock = "0.6"
+serde_json = "1"
+chrono = "0.4"
+fuse3 = { version = "0.7", features = ["tokio-runtime", "unprivileged"] }
+tempfile.workspace = true
+anyhow = "1"

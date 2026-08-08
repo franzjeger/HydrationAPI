@@ -435,8 +435,32 @@ allerede har en identitet og en leser.
 en delvis fylt fil. Ved uenighet mellom placeholder og sky vinner ingen av dem — leseren
 får `EIO` og metadata resynkes.
 *Test:* opprett placeholder med størrelse *N*, la provideren returnere *N−k* byte, les —
-krev `EIO`, krev `blocks=0` etterpå, og krev at et påfølgende delta-pass retter `st_size`
-slik at neste lesing lykkes. Samme test med etag endret mens strømmen er åpen.
+krev `EIO`, og krev at en påfølgende ærlig lesing gir hele objektet, slik at ingen rest
+fra den mislykkede hydreringen overlevde. Samme test med etag endret mens strømmen er åpen.
+
+### 5.8 En placeholder opptar ikke diskplass
+
+**Kandidat — ikke i §5 da kontrakten ble skrevet. Funnet av suiten.**
+
+> En fil som finnes som metadata alene rapporterer null allokerte blokker.
+
+Dette sto ikke i spesifikasjonen. Det kom frem ved å kjøre suiten mot referanseklienten,
+som rapporterer 128 blokker for en 64 KB placeholder den ikke har innhold for.
+
+Grunnen til at det hører hjemme i kontrakten: on-demand finnes for å spare disk, og `du`
+er måten en bruker sjekker om det virket. En placeholder som rapporterer blokker for
+innhold den ikke har, gjør at `du -sh ~/OneDrive` viser full skystørrelse — funksjonen kan
+ikke observeres å virke selv når den gjør det. Verre for oss: enhver diskplass-policy vi
+bygger oppå, inkludert utkastelse ved press, leser tall som er feil.
+
+På et ekte filsystem er dette gratis — en sparsom fil rapporterer det den faktisk bruker,
+og målingen i §2.4 viste nettopp `size=36 blocks=0`. En FUSE-klient må velge å rapportere
+det, og kan like gjerne la være. Det er det samme mønsteret som resten av §3: kjernen har
+allerede rett, userspace må gjenskape det.
+
+*Garanti:* `st_blocks` er null for en dehydrert fil og reflekterer faktisk forbruk for en
+hydrert.
+*Test:* seed en 64 KB placeholder, `stat` — `st_size` 65536, `st_blocks` 0.
 
 ---
 
@@ -818,14 +842,33 @@ Hvis du er enig i retningen, er den naturlige rekkefølgen:
 
 To spor, parallelt.
 
-**Spor A — konformanstestpakken (§5, sju invarianter).** Starter nå, uavhengig av alt
-annet. Skrives mot referanseklienten som den er, og skal feile på alle sju i dag.
+**Spor A — konformanstestpakken.** ✅ **Bygget og kjørt mot referanseklienten.**
 
-Grunnen til at den går parallelt og ikke etter probene: **den er det eneste her som har
-verdi selv om rammeverket aldri blir bygget.** Sju invarianter skrevet som kjørbare tester
-er en spesifikasjon som overlever hvilken som helst arkitekturbeslutning — bytter vi bort
-fanotify i morgen, står testene. Og den beviser sin egen verdi ved å feile på alle sju mot
-dagens klient. Ingen probe kan velte den, så ingenting er vunnet på å vente.
+`conformance/` inneholder invariantene skrevet mot en `Harness`-trait som ikke kjenner
+noen implementasjon, og `adapters/onedrive-reference/` kjører dem mot en ekte FUSE-mount,
+ekte sync-motor og ekte SQLite, mot en falsk Graph-API suiten kan styre.
+
+Resultat mot `f1f090c`:
+
+| Invariant | Resultat |
+|---|---|
+| 5.1 identitet er stabil | PASS |
+| 5.2 størrelse er lokal sannhet | PASS |
+| 5.3 modus overlever dehydrering | **FAIL** — exec-biten ble aldri satt; `chmod +x` returnerte suksess og endret ingenting |
+| 5.4 atomisk lagring beholder navnet | PASS |
+| 5.5 sletting slår opplasting i lufta | PASS |
+| 5.6 `fsync` lyver ikke | PASS |
+| 5.7 hydreringsavvik feiler lukket | **FAIL** — en kort nedlasting lyktes: 2048 byte returnert for et objekt oppgitt som 4096 |
+| 5.8 placeholder opptar ikke disk | **FAIL** — 128 blokker rapportert for innhold den ikke har |
+| 6a arbeiderdød feiler lukket | N/A — ingen separerbar arbeider |
+
+Verdt å merke seg: **5.4 og 5.5 passerer.** Det er nøyaktig de to buggene klienten fikset
+i #51 og #52, og suiten bekrefter uavhengig at fiksene holder. Den er altså ikke bare et
+anklageskrift — den skiller det som er løst fra det som ikke er.
+
+De tre som feiler er ekte funn. 5.3 er `setattr` som tas imot og forkastes stille. 5.7 og
+5.8 er begge egenskaper kjernen ville gitt gratis på et ekte filsystem, og som en
+FUSE-klient må velge å implementere.
 
 **Spor B — probene som kan velte arkitekturen (§9).** Prioritert etter hvor mye de kan
 rive ned:

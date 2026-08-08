@@ -116,6 +116,16 @@ pub fn mode_survives_dehydration<H: Harness>(h: &mut H) -> Outcome {
     let mut perms = fs::metadata(&path).expect("stat").permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&path, perms).expect("chmod +x");
+
+    // Checked before anything is dehydrated, so a client that quietly discards
+    // setattr is reported as never having applied the mode rather than as
+    // having lost it later. Same symptom, different bug, different fix.
+    assert_eq!(
+        fs::metadata(&path).expect("stat").permissions().mode() & 0o777,
+        0o755,
+        "the exec bit was never applied: chmod +x returned success and changed nothing"
+    );
+
     h.settle();
     let size_before = fs::metadata(&path).expect("stat").len();
 
@@ -303,39 +313,75 @@ pub fn fsync_does_not_lie<H: Harness>(h: &mut H) -> Outcome {
 /// size underneath a live reader is not safe: shrinking a file that is mapped
 /// gives SIGBUS past the new end. So the only sound answer is to refuse.
 pub fn hydration_mismatch_fails_closed<H: Harness>(h: &mut H) -> Outcome {
-    h.seed_remote("report.pdf", &vec![b'x'; 4096], "etag-1");
+    let declared = vec![b'x'; 4096];
+    h.seed_remote("report.pdf", &declared, "etag-1");
     let path = h.sync_dir().join("report.pdf");
 
-    assert_eq!(
-        blocks(&path),
-        0,
-        "a freshly seeded placeholder already has content"
+    // "Not yet hydrated" asked in an implementation-neutral way: nothing has
+    // been fetched for this object. Asking via st_blocks would conflate this
+    // with whether a placeholder reports its disk usage honestly, which is a
+    // separate property and must not decide whether this test can run.
+    assert!(
+        !h.ops_observed()
+            .iter()
+            .any(|op| matches!(op, CloudOp::Get { .. })),
+        "the object was fetched before the test began; it is not a placeholder"
     );
 
     // The cloud object changed after the placeholder was made.
     h.set_fetch_behaviour("report.pdf", FetchBehaviour::Short { bytes: 2048 });
 
-    let err = fs::read(&path).expect_err("a short hydration must not succeed");
-    assert!(
-        matches!(err.kind(), ErrorKind::Other | ErrorKind::InvalidData) || err.raw_os_error() == Some(libc_eio()),
-        "expected EIO for a hydration that disagrees with the placeholder, got {err:?}"
-    );
+    match fs::read(&path) {
+        Ok(bytes) => panic!(
+            "a short hydration succeeded: the read returned {} bytes for an object \
+             declared as {}. The reader was handed a silently truncated file.",
+            bytes.len(),
+            declared.len()
+        ),
+        Err(err) => assert!(
+            matches!(err.kind(), ErrorKind::Other | ErrorKind::InvalidData)
+                || err.raw_os_error() == Some(libc_eio()),
+            "expected EIO for a hydration that disagrees with the placeholder, got {err:?}"
+        ),
+    }
 
-    assert_eq!(
-        blocks(&path),
-        0,
-        "a partially filled placeholder survived the failed hydration; \
-         it now looks hydrated and is not"
-    );
-
-    // Once the metadata is resynced, the same read must succeed.
+    // The real requirement: nothing partial survived to poison the next read.
     h.set_fetch_behaviour("report.pdf", FetchBehaviour::Honest);
     h.settle();
-    let content = fs::read(&path).expect("read after resync");
+    let content = fs::read(&path).expect("read after the cloud agrees again");
     assert_eq!(
-        content.len(),
-        fs::metadata(&path).expect("stat").len() as usize,
-        "content length still disagrees with st_size after resync"
+        content, declared,
+        "a later honest read did not return the whole object: residue from the \
+         failed hydration survived"
+    );
+
+    Outcome::Pass
+}
+
+/// §5.8 (candidate) — A placeholder does not consume disk.
+///
+/// > A file present as metadata only reports zero allocated blocks.
+///
+/// Not in DESIGN.md §5 yet; surfaced by running the suite against a real
+/// client. On-demand exists to save disk, and `du` is how a user checks whether
+/// it worked. A placeholder that reports blocks for content it does not hold
+/// makes `du -sh ~/OneDrive` report the full cloud size, so the feature cannot
+/// be seen to be working even when it is.
+///
+/// On a real filesystem this is free -- a sparse file reports what it uses. A
+/// FUSE client has to choose to report it, and can just as easily not.
+pub fn placeholder_consumes_no_disk<H: Harness>(h: &mut H) -> Outcome {
+    h.seed_remote("large.bin", &vec![b'y'; 65536], "etag-1");
+    let path = h.sync_dir().join("large.bin");
+
+    let md = fs::metadata(&path).expect("stat placeholder");
+    assert_eq!(md.len(), 65536, "a placeholder must report the real size");
+    assert_eq!(
+        md.blocks(),
+        0,
+        "a placeholder reports {} allocated blocks for content it does not hold; \
+         du will claim disk that is not in use",
+        md.blocks()
     );
 
     Outcome::Pass
@@ -403,6 +449,7 @@ pub fn run_all<H: Harness>(h: &mut H) -> Vec<(&'static str, Outcome)> {
         ("5.5 delete beats in-flight upload", delete_beats_inflight_upload(h)),
         ("5.6 fsync does not lie", fsync_does_not_lie(h)),
         ("5.7 hydration mismatch fails closed", hydration_mismatch_fails_closed(h)),
+        ("5.8 placeholder consumes no disk", placeholder_consumes_no_disk(h)),
         ("6a worker death fails closed", worker_death_fails_closed(h)),
     ]
 }

@@ -231,6 +231,7 @@ fn expectation(name: &str) -> (bool, &'static str) {
         "5.5 delete beats in-flight upload" => (false, "modelled bug: missing file read as missing data"),
         "5.6 fsync does not lie" => (true, "free: fsync(2) on a real file"),
         "5.7 hydration mismatch fails closed" => (false, "no interception: cannot refuse a read"),
+        "5.8 placeholder consumes no disk" => (true, "free: a sparse file reports what it uses"),
         "6a worker death fails closed" => (false, "not applicable: no separable worker"),
         other => panic!("unexpected invariant {other}"),
     }
@@ -246,6 +247,7 @@ fn the_specification_has_teeth() {
         "5.5 delete beats in-flight upload",
         "5.6 fsync does not lie",
         "5.7 hydration mismatch fails closed",
+        "5.8 placeholder consumes no disk",
         "6a worker death fails closed",
     ];
 
@@ -259,6 +261,7 @@ fn the_specification_has_teeth() {
         invariants::delete_beats_inflight_upload,
         invariants::fsync_does_not_lie,
         invariants::hydration_mismatch_fails_closed,
+        invariants::placeholder_consumes_no_disk,
         invariants::worker_death_fails_closed,
     ];
 
