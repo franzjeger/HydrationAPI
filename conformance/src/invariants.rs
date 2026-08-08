@@ -358,17 +358,21 @@ pub fn hydration_mismatch_fails_closed<H: Harness>(h: &mut H) -> Outcome {
     Outcome::Pass
 }
 
-/// §5.8 (candidate) — A placeholder does not consume disk.
+/// §5.8 — A placeholder does not consume disk.
 ///
 /// > A file present as metadata only reports zero allocated blocks.
 ///
-/// Not in DESIGN.md §5 yet; surfaced by running the suite against a real
-/// client. On-demand exists to save disk, and `du` is how a user checks whether
-/// it worked. A placeholder that reports blocks for content it does not hold
-/// makes `du -sh ~/OneDrive` report the full cloud size, so the feature cannot
-/// be seen to be working even when it is.
+/// The one invariant here that was not written from a known bug: it was
+/// surfaced by running this suite against a real client, which reported 128
+/// blocks for a 64 KB placeholder holding nothing.
 ///
-/// On a real filesystem this is free -- a sparse file reports what it uses. A
+/// On-demand exists to save disk, and `du` is how a user checks whether it
+/// worked. A placeholder that reports blocks for content it does not hold makes
+/// `du -sh ~/OneDrive` report the full cloud size, so the feature cannot be seen
+/// to be working even when it is — and any eviction policy built on those
+/// numbers is reading fiction.
+///
+/// On a real filesystem this is free: a sparse file reports what it uses. A
 /// FUSE client has to choose to report it, and can just as easily not.
 pub fn placeholder_consumes_no_disk<H: Harness>(h: &mut H) -> Outcome {
     h.seed_remote("large.bin", &vec![b'y'; 65536], "etag-1");

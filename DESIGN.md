@@ -440,12 +440,13 @@ fra den mislykkede hydreringen overlevde. Samme test med etag endret mens strøm
 
 ### 5.8 En placeholder opptar ikke diskplass
 
-**Kandidat — ikke i §5 da kontrakten ble skrevet. Funnet av suiten.**
+**Kjernen eier den — hvis vi ikke rapporterer noe annet.**
 
 > En fil som finnes som metadata alene rapporterer null allokerte blokker.
 
-Dette sto ikke i spesifikasjonen. Det kom frem ved å kjøre suiten mot referanseklienten,
-som rapporterer 128 blokker for en 64 KB placeholder den ikke har innhold for.
+Denne sto ikke i spesifikasjonen da kontrakten ble skrevet. Den kom frem ved å kjøre
+suiten mot referanseklienten, som rapporterer 128 blokker for en 64 KB placeholder den
+ikke har innhold for.
 
 Grunnen til at det hører hjemme i kontrakten: on-demand finnes for å spare disk, og `du`
 er måten en bruker sjekker om det virket. En placeholder som rapporterer blokker for
@@ -461,6 +462,12 @@ allerede rett, userspace må gjenskape det.
 *Garanti:* `st_blocks` er null for en dehydrert fil og reflekterer faktisk forbruk for en
 hydrert.
 *Test:* seed en 64 KB placeholder, `stat` — `st_size` 65536, `st_blocks` 0.
+
+**Koster ingenting i den anbefalte arkitekturen.** En sparsom fil på ext4/btrfs/xfs
+rapporterer allerede det den faktisk bruker — målingen i §2.4 ga `size=36 blocks=0` uten
+at noe ble implementert for det. Å låse den inn utvider altså kontrakten uten å utvide
+arbeidet, og den fanger en hel klasse feil hvis vi noen gang skulle vurdere en
+implementasjon som ikke ligger på et ekte filsystem.
 
 ---
 
@@ -745,7 +752,7 @@ referanseimplementasjonen.
 | Endringsdeteksjon og opplastingskø | debounce, avlysning, køtelling | 1–2 uker |
 | Monteringspunkt-oppsett og systemd | subvolum, ordnet montering, `BindsTo`, OOM-herding | 1 uke |
 | **Hydreringspolicy (§6c)** | pidfd→cgroup, standardliste, brukerkonfig, nektelseslogg | **2 uker** |
-| **Konformanstestpakke (§5, §6a)** | de sju invariantene, fail-closed, deterministiske kappløp | **3 uker** |
+| **Konformanstestpakke (§5, §6a)** | de åtte invariantene, fail-closed, deterministiske kappløp | **3 uker** |
 | Integrasjon mot referanseklienten | erstatte `crates/vfs` med provider-implementasjon | 1–2 uker |
 
 **Sum: 12–15 uker** til en v1 som er nyttig for én ekte skyklient.
@@ -781,7 +788,7 @@ risikoprofil enn `ksmbd`-sammenligningen.
 8. Dehydrering: `PUNCH_HOLE` + fjern ignore-merke + sett nodump. Manuelt utløst i v1.
 9. **Hydreringspolicy (§6c):** pidfd→cgroup, standardliste, `FAN_DENY_ERRNO(EPERM)`,
    synlig nektelseslogg.
-10. Konformanstestpakken. Alle sju invariantene, pluss fail-closed-testen fra §6a.
+10. Konformanstestpakken. Alle åtte invariantene, pluss fail-closed-testen fra §6a.
 11. `FAN_DENY_ERRNO(EIO)` ved nedlastingsfeil — aldri stille nuller.
 
 **Utenfor v1, bevisst:**
