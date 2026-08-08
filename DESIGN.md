@@ -490,9 +490,40 @@ riktig svar, ikke å henge). Jeg bygget dette inn i testproben — auto-avslutni
 `FAN_ALLOW` på alle feilstier — nettopp fordi et blokkerende filter på et levende
 filsystem ellers kan stoppe maskinen.
 
-**4. Merker er per monteringspunkt/filsystem, ikke per katalog.** Jeg verifiserte
-`FAN_MARK_MOUNT`. Det betyr at vi ser hendelser for hele monteringspunktet og må filtrere
-— nok en grunn til at synkmappen bør være sitt eget monteringspunkt.
+**4. Man kan ikke merke en katalog. Målt, og fellen er verre enn begrensningen.**
+
+`probes/dirmark.c` prøver alle fire marketyper på samme katalog, med en fil rett i den og
+en i en underkatalog:
+
+| Marketype | `fanotify_mark` | `top.txt` | `sub/nested.txt` |
+|---|---|---|---|
+| `FAN_MARK_ADD` (inode) | **godtatt** | ingen hendelse | ingen hendelse |
+| `FAN_MARK_ADD` + `FAN_EVENT_ON_CHILD` | godtatt | hydrert | **ingen hendelse** |
+| `FAN_MARK_MOUNT` | godtatt | hydrert | hydrert |
+| `FAN_MARK_FILESYSTEM` | godtatt | hydrert | hydrert |
+
+Tre ting følger:
+
+- **Et rent katalogmerke godtas og leverer ingenting.** Ikke en feilkode, ikke en advarsel
+  — `fanotify_mark` returnerer 0 og hver dehydrerte fil leser som nuller. Det er samme
+  familie som §6a og §6d: noe svarte «greit» på noe det ikke gjorde. Å bygge på det ville
+  sett riktig ut helt til første ekte fil.
+- **`FAN_EVENT_ON_CHILD` dekker bare direkte barn.** En synkmappe med underkataloger —
+  altså enhver ekte synkmappe — er ikke dekket.
+- **Bare `FAN_MARK_MOUNT` og `FAN_MARK_FILESYSTEM` virker.**
+
+Mellom de to er `FAN_MARK_MOUNT` det riktige valget. `FAN_MARK_FILESYSTEM` på `/home`
+ville sendt *hver eneste* filtilgang i brukerens hjemmeområde gjennom en blokkerende
+handler — hele skadeområdet fra §6a, utvidet til alt brukeren eier.
+
+**Konsekvens: synkmappen på eget monteringspunkt er et krav, ikke en anbefaling.** Det var
+allerede andrelinjeforsvaret i §6a; nå er det også den eneste måten å få dekning på i det
+hele tatt. Ett tiltak, to uavhengige begrunnelser.
+
+Én ting jeg *ikke* har målt: om et bind-mount av en katalog over seg selv er nok, eller om
+det trengs et ekte separat volum (btrfs-subvolum). Et mount-merke er per `vfsmount`, så en
+tilgang som når filene gjennom det underliggende monteringspunktet i stedet ville gå
+utenom. Det bør avklares før systemd-oppsettet skrives.
 
 **5. Ingen ferdig utkastelsespolicy.** Kjernen sier ikke fra ved diskpress at den vil ha
 plass. Vi må implementere dehydrering (`FALLOC_FL_PUNCH_HOLE` + fjerne ignore-merket)
@@ -572,8 +603,11 @@ prosessgruppa, kjernepanikk. Da er vi tilbake til stille nuller. Forsvar i lag:
    `Restart=always` i systemd-enheten.
 3. Synkmappen på eget monteringspunkt, med `BindsTo=`/`StopPropagatedFrom=` slik at
    monteringspunktet rives når enheten dør. Da er filene *utilgjengelige* i stedet for
-   feil. Dette er andrelinje, ikke førstelinje — den dekker vinduet der ingenting av
-   vårt kjører i det hele tatt.
+   feil. Den dekker vinduet der ingenting av vårt kjører i det hele tatt.
+
+   Dette punktet sto opprinnelig som andrelinjeforsvar. Etter målingen i §6.4 er det
+   uansett obligatorisk: et katalogmerke leverer ingen hendelser, så eget monteringspunkt
+   er den eneste måten å få dekning på. To uavhengige grunner til samme tiltak.
 
 **Konformanstest som må finnes:** `kill -9` arbeideren, les en placeholder, krev `EIO`.
 Og: drep begge, krev at monteringspunktet er borte innen N sekunder.
@@ -777,7 +811,9 @@ risikoprofil enn `ksmbd`-sammenligningen.
 Én bruker, én konto, én maskin — men riktig.
 
 **Med:**
-1. Synkmappe på eget monteringspunkt (ext4/btrfs/xfs), montert kun med daemonen.
+1. Synkmappe på eget monteringspunkt (ext4/btrfs/xfs), montert kun med daemonen, merket
+   med `FAN_MARK_MOUNT`. Ikke valgfritt: et katalogmerke leverer ingen hendelser (§6.4),
+   og `FAN_MARK_FILESYSTEM` ville lagt hele `/home` under en blokkerende handler.
 2. **Super/worker-delt privilegert hjelper med fail-closed-vakt (§6a).** Ikke valgfritt —
    uten den er arkitekturen usikrere enn FUSE.
 3. **Privilegieseparasjon med spesifisert protokoll (§6b).** Root-siden ser aldri et token.
@@ -807,9 +843,10 @@ risikoprofil enn `ksmbd`-sammenligningen.
 
 I ærlighetens navn, siden dette skal være beslutningsgrunnlag:
 
-- Jeg testet `FAN_MARK_MOUNT`. Jeg testet **ikke** om `FAN_PRE_ACCESS` kan settes på en
-  enkelt katalog med `FAN_MARK_ADD` alene. Hvis det går, blir monteringspunkt-kravet
-  mindre strengt.
+- ~~Katalogmerker~~ — **lukket.** `probes/dirmark.c` måler alle fire marketyper: et rent
+  katalogmerke godtas og leverer ingenting, `FAN_EVENT_ON_CHILD` dekker bare direkte barn.
+  Eget monteringspunkt er dermed et krav (§6.4). Ett nytt spørsmål åpnet seg: om et
+  bind-mount holder, eller om det trengs et separat volum.
 - Jeg testet **ikke** `FAN_MARK_IGNORE_SURV` empirisk — kun at konstanten finnes.
   Ytelsespåstanden «hydrerte filer koster null» hviler på at den virker som dokumentert.
 - Jeg testet **ikke** mmap-hydrering eller `truncate`-hydrering. Kildekoden har hookene
@@ -882,9 +919,10 @@ rive ned:
 
 1. ~~**pidfd→cgroup**~~ — **ferdig.** `probes/pidfd_cgroup.c` bekrefter hele veien, og
    viser at cgroup skiller to lesere som er identiske på `comm` og `exe`. §6c står.
-2. **Katalogmerker** — kan `FAN_PRE_ACCESS` settes på én katalog, eller kreves
-   `FAN_MARK_MOUNT`? Avgjør om eget monteringspunkt er et krav eller en anbefaling, og
-   dermed hvor mye systemd-arbeid v1 har.
+2. ~~**Katalogmerker**~~ — **ferdig.** Svaret er at det ikke går: et katalogmerke godtas og
+   leverer ingen hendelser, og `FAN_EVENT_ON_CHILD` stopper ved direkte barn. Eget
+   monteringspunkt er et krav. Se §6.4. **Oppfølger:** holder et bind-mount, eller trengs
+   et separat volum? Et mount-merke er per `vfsmount`, så det avgjør systemd-oppsettet.
 3. **`FAN_MARK_IGNORE_SURV`** — bærer ytelsespåstanden «hydrerte filer koster null».
 4. **Hendelser under behandling ved arbeiderdød** — siste hull i fail-closed-beviset (§6a).
 5. **Nodump i praksis** — hvilke backupverktøy respekterer det faktisk? Er svaret «få»,
