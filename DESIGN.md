@@ -1261,6 +1261,42 @@ noensinne vil nevne.
 
 ---
 
+## 6h. Utkastelse trenger ikke den privilegerte siden
+
+Dette var det siste punktet i §8 uten utløser, og grunnen var §6b. En utløser må
+navngi en fil, og den privilegerte siden tar aldri imot en destinasjon. Å gi root
+en sti å punsje hull i er verre enn å gi den en sti å skrive til — det er
+vilkårlig ødeleggelse som root — og å låne ut evnen til å undertrykke hendelser
+på en navngitt inode er evnen til å få hvilken som helst fil til å lese som
+nuller.
+
+Svaret lå allerede i opprettelsen. En placeholder trenger ikke lages ved å hule
+ut filen som er der; den kan bygges på en anonym inode og byttes inn. `place()`
+gjør nøyaktig det, uten privilegier — så utkastelse er bare plassering over en
+fil som tilfeldigvis har innhold, og den privilegerte halvdelen er ikke involvert
+i det hele tatt.
+
+Forskjellen fra å punsje på stedet, og begge er verdt å vite:
+
+- **Inoden byttes.** Den som holder den gamle filen åpen leser videre innholdet
+  de åpnet — bedre enn å få det fjernet under seg — og blokkene frigjøres når de
+  slipper. Harde lenker til den gamle inoden beholder innholdet, så utkastelse
+  frigjør ingenting for dem før siste lenke er borte. Det er det ærlige utfallet,
+  siden innholdet fortsatt er tilgjengelig under et annet navn.
+- **Ingen ignore-merke må fjernes.** Det gamle merket dør med inoden, og den nye
+  har aldri hatt et — så filen avskjæres igjen ved konstruksjon framfor ved et
+  privilegert kall som må sekvenseres riktig.
+
+Utløseren ligger i den kjørende daemonen, ikke i verktøyet, og det er poenget:
+et frittstående verktøy kunne kastet ut en fil daemonen laster opp akkurat nå, og
+regelen om sletting under opplasting (§5.5) ville da sett at inoden byttet og
+fjernet objektet den nettopp lagde. Bare prosessen som eier køen kan nekte det.
+
+`hydrationd`s egen `evict` finnes fortsatt, for en kaller som *har* gruppen —
+konformansadapteren er en — og punsjer på stedet der.
+
+---
+
 ## 7. Kostnad
 
 Forutsatt at klienten (auth, Graph-API, delta-sync) allerede finnes, som den gjør i
@@ -1316,13 +1352,9 @@ risikoprofil enn `ksmbd`-sammenligningen.
 7. Hydrering ved `FAN_PRE_ACCESS` — hele filen, ikke områder (se under).
 8. `FAN_MARK_IGNORE_SURV` på hydrerte filer, så de koster null.
 9. Endringsdeteksjon → debounce → opplasting, med de fem reglene i §5.
-10. Dehydrering: `PUNCH_HOLE` + fjern ignore-merke + sett nodump. **Mekanismen er
-   bygget og testet (7 tester), men ingen utløser er koblet til.** Det er ikke
-   glemt: en utløser utenfra må navngi en fil, og §6b sier at den privilegerte
-   siden aldri tar imot en destinasjon fra den uprivilegerte. Å løse det ordentlig
-   er en egen designrunde av samme slag som opprettelsen krevde, og å haste den
-   fram ville vært å gjenta feilen §6a-ter er en liste over. Inntil da kjøres
-   utkastelse bare fra konformanspakken.
+10. Dehydrering: `PUNCH_HOLE` + fjern ignore-merke + sett nodump, og en utløser
+   brukeren kan kjøre (`hydration-ctl evict <sti>`). Se §6h — utløseren så ut til
+   å kreve at den privilegerte siden tok imot en destinasjon, og gjorde det ikke.
 11. **Hydreringspolicy (§6c):** pidfd→cgroup, standardliste, `FAN_DENY_ERRNO(EPERM)`,
    synlig nektelseslogg.
 12. Konformanstestpakken. Alle åtte invariantene, pluss fail-closed-testen fra §6a.

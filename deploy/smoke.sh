@@ -136,7 +136,41 @@ grep -rqs 'rewritten by rename' "$CLOUD" \
   || fail "a rename-edit was never uploaded (see /tmp/smoke-sync.log)"
 echo "PASS: a rename-edit reached the cloud"
 
-# 5. With the worker gone, a read fails rather than returning zeros.
+# 5. Eviction, through the tool a user would actually run.
+#
+# The last thing in §8 with no trigger. It needs no privilege: the replacement
+# placeholder is built on an anonymous inode and swapped in, so the privileged
+# helper is never asked to accept a path.
+CTL="$BIN/hydration-ctl --socket ${SOCK%.sock}.ctl"
+BEFORE=$(stat -c %b "$MOUNT/notes.txt")
+[ "$BEFORE" != "0" ] || fail "notes.txt should have content by now"
+OUT=$(runuser -u "$SYNC_USER" -- $CTL evict notes.txt 2>&1) \
+  || fail "hydration-ctl could not reach the daemon: $OUT"
+case "$OUT" in
+  reclaimed*) echo "evict: $OUT" ;;
+  *) fail "eviction refused unexpectedly: $OUT" ;;
+esac
+[ "$(stat -c %b "$MOUNT/notes.txt")" = "0" ] || fail "the disk was not returned"
+[ "$(stat -c %s "$MOUNT/notes.txt")" = "$SIZE" ] || fail "the size stopped describing the object"
+echo "PASS: a file was evicted and gave its disk back"
+
+# And it must still read. An eviction that cannot be undone is a deletion.
+GOT3=$(timeout 15 cat "$MOUNT/notes.txt") || fail "the evicted file could not be read back"
+[ "$GOT3" = "content that lives in the cloud" ] || fail "wrong content after re-hydration: $GOT3"
+echo "PASS: the evicted file hydrated again on read"
+
+# A file the cloud does not have must never be a candidate, whatever is asked.
+printf 'only ever existed here\n' > "$MOUNT/local-only.txt"
+chown "$SYNC_USER" "$MOUNT/local-only.txt"
+OUT=$(runuser -u "$SYNC_USER" -- $CTL evict local-only.txt 2>&1)
+case "$OUT" in
+  kept*) echo "evict refused, as it must: $OUT" ;;
+  *) fail "a file with no remote copy was evicted: $OUT" ;;
+esac
+grep -q 'only ever existed here' "$MOUNT/local-only.txt" || fail "its content is gone"
+echo "PASS: a file the cloud does not have was refused"
+
+# 6. With the worker gone, a read fails rather than returning zeros.
 printf 'second object\n' > "$CLOUD/obj-2"; printf 'other.txt' > "$CLOUD/obj-2.name"
 kill -9 "$WORKER"; sleep 2
 SIZE2=$(stat -c %s "$CLOUD/obj-2")

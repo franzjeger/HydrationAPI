@@ -113,8 +113,10 @@ pub enum Outcome {
 
 pub struct Queue<C: Clock> {
     waiting: HashMap<FileId, Waiting>,
-    /// Uploads that have started. Counted as unsent, because they are.
-    in_flight: usize,
+    /// Uploads that have started. Counted as unsent, because they are — and
+    /// named rather than counted, because eviction has to be able to ask
+    /// *which* file is being sent, not just how many.
+    in_flight: std::collections::HashSet<FileId>,
     debounce: Duration,
     clock: C,
 }
@@ -123,7 +125,7 @@ impl<C: Clock> Queue<C> {
     pub fn new(debounce: Duration, clock: C) -> Self {
         Self {
             waiting: HashMap::new(),
-            in_flight: 0,
+            in_flight: std::collections::HashSet::new(),
             debounce,
             clock,
         }
@@ -178,7 +180,7 @@ impl<C: Clock> Queue<C> {
     /// The one number the user is asked to trust. Counting only what has started
     /// would show "synced" over a fifteen-minute queue.
     pub fn pending(&self) -> usize {
-        self.waiting.len() + self.in_flight
+        self.waiting.len() + self.in_flight.len()
     }
 
     /// Whether this file has an edit that has not been sent.
@@ -204,11 +206,21 @@ impl<C: Clock> Queue<C> {
         self.waiting.keys().copied().collect()
     }
 
+    /// Whether this file is being sent right now.
+    ///
+    /// Eviction needs this as well as the waiting set: a file whose upload has
+    /// already started is no longer *waiting*, and replacing it mid-transfer
+    /// makes the delete-during-upload rule (§5.5) see the inode change and
+    /// remove the object it had just created.
+    pub fn sending_set(&self) -> std::collections::HashSet<FileId> {
+        self.in_flight.clone()
+    }
+
     /// Run one upload, start to finish, applying rules 2 and 3.
     pub fn run_one<S: Sink>(&mut self, file: FileId, store: &mut Store, sink: &mut S) -> Outcome {
         self.begin(file);
         let outcome = run_upload(file, store, sink);
-        self.finish();
+        self.finish(file);
         outcome
     }
 
@@ -221,12 +233,12 @@ impl<C: Clock> Queue<C> {
     /// to trust, so it must not be the thing that stops responding.
     pub fn begin(&mut self, file: FileId) {
         self.waiting.remove(&file);
-        self.in_flight += 1;
+        self.in_flight.insert(file);
     }
 
     /// Release a claim taken by [`Queue::begin`].
-    pub fn finish(&mut self) {
-        self.in_flight = self.in_flight.saturating_sub(1);
+    pub fn finish(&mut self, file: FileId) {
+        self.in_flight.remove(&file);
     }
 }
 

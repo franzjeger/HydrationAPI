@@ -13,6 +13,7 @@ pub mod delta;
 pub mod manifest;
 pub mod place;
 pub mod providers;
+pub mod reclaim;
 pub mod store;
 pub mod upload;
 

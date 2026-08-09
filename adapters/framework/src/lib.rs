@@ -171,7 +171,7 @@ impl Framework {
                     for file in due {
                         q.lock().unwrap().begin(file);
                         let outcome = run_upload(file, &mut store, &mut sink);
-                        q.lock().unwrap().finish();
+                        q.lock().unwrap().finish(file);
                         let _ = outcome;
                     }
                     std::thread::sleep(Duration::from_millis(50));

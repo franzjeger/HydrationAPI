@@ -24,6 +24,7 @@ use hydration_client::delta::{self, Applied, Cursor, Discover};
 use hydration_client::manifest::{BackupPolicy, Manifest};
 use hydration_client::place::TmpfilePlacer;
 use hydration_client::providers::FolderCloud;
+use hydration_client::reclaim;
 use hydration_client::store::Store;
 use hydration_client::upload::{run_upload, Queue, SystemClock};
 use hydration_client::{Changes, Daemon};
@@ -205,6 +206,83 @@ fn dirty_files(root: &std::path::Path) -> io::Result<Vec<FileId>> {
     Ok(out)
 }
 
+/// The user's own way in: a line-oriented socket only they can reach.
+///
+/// Eviction and status both have to be triggered by somebody, and the trigger
+/// has to name a file. That is why §8 left it unwired — until placeholder
+/// creation showed that turning a file back into a placeholder needs no
+/// privilege at all, so the naming happens entirely on the unprivileged side and
+/// §6b never comes into it.
+///
+/// It runs inside the daemon rather than as a separate command deliberately. A
+/// standalone tool could evict a file the daemon is uploading right now, and the
+/// upload's delete-during-upload rule would then see the inode change and remove
+/// the object it had just created (§5.5). Only the process that owns the queue
+/// can refuse that, so only it does the work.
+fn control(
+    socket: &std::path::Path,
+    mount: PathBuf,
+    queue: Arc<Mutex<Queue<SystemClock>>>,
+    exposures: Arc<Mutex<Vec<String>>>,
+) -> io::Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let _ = std::fs::remove_file(socket);
+    let listener = UnixListener::bind(socket)?;
+    // Owner-only. Everything reachable here the user could do by hand — these
+    // are their files — so the socket is a convenience, not a privilege.
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+
+    for conn in listener.incoming().flatten() {
+        let reader = BufReader::new(match conn.try_clone() {
+            Ok(c) => c,
+            Err(_) => continue,
+        });
+        let mut out = conn;
+        for line in reader.lines().map_while(Result::ok) {
+            let (verb, arg) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
+            let reply = match verb {
+                "evict" => {
+                    let target = mount.join(arg.trim_start_matches('/'));
+                    // Snapshotted, so the control socket never holds the queue
+                    // across a directory walk.
+                    let (waiting, sending) = {
+                        let q = queue.lock().unwrap();
+                        (q.waiting_set(), q.sending_set())
+                    };
+                    let mut store = Store::new();
+                    let _ = store.scan(&mount);
+                    match reclaim::reclaim(&mount, &target, &mut store, &waiting, &sending) {
+                        Ok(Ok(r)) => format!("reclaimed {} bytes", r.bytes),
+                        Ok(Err(why)) => format!("kept: {why:?}"),
+                        Err(e) => format!("error: {e}"),
+                    }
+                }
+                "status" => {
+                    let pending = queue.lock().unwrap().pending();
+                    let m = Manifest::build(&mount).unwrap_or_default();
+                    let seen = exposures.lock().unwrap();
+                    format!(
+                        "{pending} unsent\n{}\n{}",
+                        hydration_client::manifest::status_line(BackupPolicy::Exclude, m.len()),
+                        if seen.is_empty() {
+                            "no other mount exposes these files".to_string()
+                        } else {
+                            format!("WARNING: {} other mount(s) bypass hydration: {seen:?}", seen.len())
+                        }
+                    )
+                }
+                "" => continue,
+                other => format!("unknown command: {other}"),
+            };
+            if writeln!(out, "{reply}").is_err() {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     let args = parse();
     if !args.mount.is_dir() {
@@ -312,7 +390,7 @@ fn main() -> io::Result<()> {
                 for file in due {
                     q.lock().unwrap().begin(file);
                     let outcome = run_upload(file, &mut store, &mut sink);
-                    q.lock().unwrap().finish();
+                    q.lock().unwrap().finish(file);
                     eprintln!("hydration-sync: upload {file:?} -> {outcome:?}");
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -386,6 +464,23 @@ fn main() -> io::Result<()> {
                     Err(e) => eprintln!("hydration-sync: could not list the cloud: {e}"),
                 }
                 std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+    }
+
+    // The user's way in. §8 item 10's trigger, and the status surface item 11
+    // asked for.
+    {
+        let ctl = args.socket.with_extension("ctl");
+        let (mount, q, ex) = (
+            args.mount.clone(),
+            Arc::clone(&queue),
+            Arc::clone(&exposures),
+        );
+        eprintln!("hydration-sync: control socket at {}", ctl.display());
+        std::thread::spawn(move || {
+            if let Err(e) = control(&ctl, mount, q, ex) {
+                eprintln!("hydration-sync: control socket unavailable: {e}");
             }
         });
     }
