@@ -11,6 +11,7 @@
 
 pub mod delta;
 pub mod manifest;
+pub mod namespace;
 pub mod place;
 pub mod providers;
 pub mod reclaim;
