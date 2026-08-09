@@ -2476,6 +2476,8 @@ fn item_id(item: &Item) -> &str {
 // wrong.
 // ---------------------------------------------------------------------------
 
+use hydration_client::upload::Uploaded;
+
 /// The verbs the write half uses.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Method {
@@ -2689,18 +2691,1115 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
     }
 }
 
+// --- addressing ------------------------------------------------------------
+//
+// Every URL below is composed here rather than at the call site, so the
+// difference between the two addressing forms — by id and by name — is one
+// function apart and cannot be reached by accident. The whole of Class A is
+// that difference: a name resolves to whichever object currently holds it, and
+// the delta pass renames local files itself, so the path an inode sits at
+// routinely stops naming the object that inode claims.
+
+/// The API version every URL in this half is built on.
+const GRAPH_VERSION: &str = "v1.0";
+
+/// `https://{host}/{version}/drives/{drive}` — the prefix every form shares.
+fn drive_base(drive: &DriveId) -> String {
+    format!(
+        "https://{GRAPH_HOST}/{GRAPH_VERSION}/drives/{}",
+        drive.as_str()
+    )
+}
+
+/// Content, addressed by the identity the local file claims. The update form.
+fn item_content_url(key: &ObjectKey) -> String {
+    format!(
+        "{}/items/{}/content",
+        drive_base(key.drive()),
+        key.item().as_str()
+    )
+}
+
+/// The object itself: metadata with `GET`, the object with `DELETE`.
+fn item_url(key: &ObjectKey) -> String {
+    format!("{}/items/{}", drive_base(key.drive()), key.item().as_str())
+}
+
+/// An upload session against an object that already exists.
+fn item_session_url(key: &ObjectKey) -> String {
+    format!(
+        "{}/items/{}/createUploadSession",
+        drive_base(key.drive()),
+        key.item().as_str()
+    )
+}
+
+/// Content, addressed by a drive-root-relative name. The create form, and the
+/// only place in this half where a name reaches a URL at all.
+fn path_content_url(drive: &DriveId, rel: &str, behaviour: ConflictBehavior) -> String {
+    format!(
+        "{}/root:/{}:/content?@microsoft.graph.conflictBehavior={}",
+        drive_base(drive),
+        encode_path(rel),
+        behaviour.as_str()
+    )
+}
+
+fn path_session_url(drive: &DriveId, rel: &str) -> String {
+    format!(
+        "{}/root:/{}:/createUploadSession",
+        drive_base(drive),
+        encode_path(rel)
+    )
+}
+
+/// The properties a write's follow-up metadata read has to come back with.
+///
+/// The same discipline as [`REQUIRED_SELECT`]: a field nobody asks for reads as
+/// `None` on every item, and a `None` here becomes an upload that reports no
+/// content tag — which leaves version 1's tag on a file that now holds version
+/// 2 and puts a placeholder over content the user just uploaded.
+const WRITE_SELECT: &[&str] = &[
+    "id",
+    "name",
+    "size",
+    "eTag",
+    "cTag",
+    "file",
+    "parentReference",
+];
+
+fn item_metadata_url(key: &ObjectKey) -> String {
+    format!("{}?$select={}", item_url(key), WRITE_SELECT.join(","))
+}
+
+/// The path form Graph addresses a *name* with, percent-encoded.
+///
+/// `/` survives, because the segments below the sync root are part of the path
+/// between `root:` and `:/content`. Nothing else outside the unreserved set
+/// does: a `#` in a file name would otherwise cut the URL short and address the
+/// *parent*, and a `%` or a `?` would turn the rest of the name into an escape
+/// or a query — each of which lands a create on an object the user never named.
+fn encode_path(rel: &str) -> String {
+    let mut out = String::with_capacity(rel.len());
+    for b in rel.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+// --- names -----------------------------------------------------------------
+
+/// Names the service refuses outright, compared case-insensitively and whole.
+///
+/// `.lock` and `desktop.ini` are on the same list as the DOS device names in
+/// OneDrive's own documentation, so they are judged the same way.
+const RESERVED_NAMES: &[&str] = &[
+    ".lock",
+    "desktop.ini",
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    "com0",
+    "com1",
+    "com2",
+    "com3",
+    "com4",
+    "com5",
+    "com6",
+    "com7",
+    "com8",
+    "com9",
+    "lpt0",
+    "lpt1",
+    "lpt2",
+    "lpt3",
+    "lpt4",
+    "lpt5",
+    "lpt6",
+    "lpt7",
+    "lpt8",
+    "lpt9",
+];
+
+/// Characters the service will not hold in a name.
+const RESERVED_CHARS: &[char] = &['"', '*', ':', '<', '>', '?', '\\', '|', '/'];
+
+/// Whether this drive-relative name can exist in the cloud, judged before a
+/// byte moves.
+///
+/// Two separate losses if this is left to the service. Sending it spends a whole
+/// transfer that can only fail, and on a resumable upload the rejection arrives
+/// at the *last* fragment — so a 2 GB file transfers 2 GB and then 400s, on
+/// every retry, forever. Sanitising is worse: the object is created under a name
+/// no local file has, and the next delta round places it as a second file beside
+/// the one the user is editing.
+///
+/// The trailing period is refused for a third reason. Leading and trailing
+/// spaces are documented as invalid, but a trailing period is not addressed at
+/// all — so the service may reject it or may silently trim it, and if it trims,
+/// the object is named `report`, the local file is `report.`, and the id gets
+/// stamped onto a file whose name the cloud does not have. Refusing is the only
+/// branch that cannot produce that pair.
+fn check_relative_name(rel: &str) -> io::Result<()> {
+    if rel.is_empty() {
+        return Err(refused("a file with no name below the sync root"));
+    }
+    // Counted in characters, because the ceiling is on the decoded path Graph
+    // shows the user, not on its percent-encoded form.
+    if rel.chars().count() > MAX_PATH_CHARS {
+        return Err(refused(format!(
+            "the path is {} characters, and the service holds {MAX_PATH_CHARS}",
+            rel.chars().count()
+        )));
+    }
+    for segment in rel.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(refused("a path segment that names no object"));
+        }
+        if segment.len() > MAX_NAME_BYTES {
+            return Err(refused(format!(
+                "the segment {segment:?} is {} bytes, and the service holds {MAX_NAME_BYTES}",
+                segment.len()
+            )));
+        }
+        if segment.starts_with(' ') || segment.ends_with(' ') || segment.ends_with('.') {
+            return Err(refused(format!(
+                "{segment:?} would be trimmed or refused, and a trimmed name is one \
+                 the local file does not have"
+            )));
+        }
+        if segment.starts_with("~$") {
+            return Err(refused(format!("{segment:?} is a name the service reserves")));
+        }
+        let unholdable =
+            |c: char| RESERVED_CHARS.contains(&c) || (c as u32) < 0x20 || c == '\u{7f}';
+        if segment.chars().any(unholdable) {
+            return Err(refused(format!(
+                "{segment:?} holds a character the service will not"
+            )));
+        }
+        let folded = segment.to_ascii_lowercase();
+        if folded.contains("_vti_") {
+            return Err(refused(format!("{segment:?} holds the reserved infix _vti_")));
+        }
+        if RESERVED_NAMES.contains(&folded.as_str()) {
+            return Err(refused(format!("{segment:?} is a name the service reserves")));
+        }
+    }
+    Ok(())
+}
+
+// --- the local file --------------------------------------------------------
+
+/// How much of the file's head is kept as evidence of *which* content the
+/// transfer is describing.
+const HEAD_BYTES: usize = 4096;
+
+/// The inode a transfer describes, at the moment it started describing it.
+///
+/// `mtime` alone is not enough and the shortfall is not theoretical: the kernel
+/// stamps an inode from a coarse clock, so a save that lands in the same tick as
+/// the one before it moves nothing a comparison of stamps can see — and a save
+/// that lands *during* the transfer is the whole case this guard exists for.
+/// Size does not close it either, because an editor rewriting a file in place
+/// usually produces the same length. The head is the cheapest byte-level
+/// evidence there is that the inode still holds the document the earlier
+/// fragments came from.
+struct Snapshot {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+    head: Vec<u8>,
+}
+
+/// Whether the file carries reclaim's eviction mark.
+///
+/// The mark, never the bytes. `reclaim::evict` builds a fresh inode sparse to
+/// the object's full size, stamps it and renames it over the path, so a
+/// placeholder is a file of NULs at the right size under the right name with its
+/// own fresh stamp — nothing in the content distinguishes it from a freshly
+/// `truncate`d database or a disk image, and refusing a body of zeros would
+/// silently stop syncing both of those forever.
+///
+/// An xattr that cannot be *read* is treated as a placeholder rather than as an
+/// ordinary file: the question is whether these bytes are the user's document,
+/// and "I could not find out" is not an answer that may commit over one.
+fn is_placeholder(path: &std::path::Path) -> io::Result<bool> {
+    match hydration_client::store::get_xattr(path, hydration_protocol::xattr::DEHYDRATED) {
+        Ok(mark) => Ok(mark.is_some()),
+        Err(e) => Err(refused(format!(
+            "cannot tell a placeholder from content at this path: {e}"
+        ))),
+    }
+}
+
+fn snapshot_of(file: &std::fs::File) -> io::Result<Snapshot> {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let md = file.metadata()?;
+    let len = md.len();
+    let mut head = vec![0u8; std::cmp::min(len as usize, HEAD_BYTES)];
+    if !head.is_empty() {
+        // A short read is not padded here either: what was readable is what the
+        // comparison is made against.
+        let got = file.read_at(&mut head, 0)?;
+        head.truncate(got);
+    }
+    Ok(Snapshot {
+        dev: md.dev(),
+        ino: md.ino(),
+        len,
+        mtime: md.modified().ok(),
+        head,
+    })
+}
+
+/// A whole small file, read through the handle it was judged through.
+///
+/// The size is a hint for the allocation and never a promise about what comes
+/// back: a file that grew between the two is sent whole, and one that shrank is
+/// sent short. The buffer is filled by reading rather than sized and handed to
+/// the wire, because an untouched tail goes out as the user's data and the
+/// service commits it.
+fn read_whole(file: &std::fs::File, snap: &Snapshot) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut body = Vec::with_capacity(snap.len as usize);
+    (&mut &*file).read_to_end(&mut body)?;
+    Ok(body)
+}
+
+/// Whether the file at `path` is still the one `snap` describes.
+///
+/// Consulted before every fragment, because a session is minutes long and each
+/// of the three ways it can stop being true commits something that has never
+/// existed on any machine: an in-place save splices two documents together, a
+/// truncation leaves the tail of the buffer to be sent as the user's data, and
+/// an eviction replaces the file with a hole of exactly the right size.
+fn unchanged(path: &std::path::Path, snap: &Snapshot) -> io::Result<()> {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    if is_placeholder(path)? {
+        return Err(refused(
+            "the file became a dehydrated placeholder while the transfer ran",
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    let md = file.metadata()?;
+    if md.dev() != snap.dev || md.ino() != snap.ino {
+        return Err(refused("another inode took the path while the transfer ran"));
+    }
+    if md.len() != snap.len {
+        return Err(refused(format!(
+            "the file is {} bytes and the transfer declared {}",
+            md.len(),
+            snap.len
+        )));
+    }
+    if md.modified().ok() != snap.mtime {
+        return Err(refused("the file was written while the transfer ran"));
+    }
+    let mut head = vec![0u8; snap.head.len()];
+    if !head.is_empty() {
+        let got = file.read_at(&mut head, 0)?;
+        head.truncate(got);
+    }
+    if head != snap.head {
+        return Err(refused(
+            "the file's content changed while the transfer ran, without moving its \
+             size or its timestamp",
+        ));
+    }
+    Ok(())
+}
+
+// --- session wire shapes ---------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionBody {
+    upload_url: Option<String>,
+    next_expected_ranges: Option<Vec<String>>,
+}
+
+/// The offset the service is still waiting for, read from its own answer.
+///
+/// A starting point, never a size. The documentation carries an explicit warning
+/// against using a range's length as the next fragment's length, because a
+/// fragment that is not a whole number of quanta fails at the *commit* — after
+/// the entire file has crossed the wire.
+fn outstanding_offset(body: &[u8]) -> Option<u64> {
+    let parsed: SessionBody = serde_json::from_slice(body).ok()?;
+    let ranges = parsed.next_expected_ranges?;
+    let first = ranges.first()?;
+    first
+        .split('-')
+        .next()
+        .and_then(|start| start.trim().parse::<u64>().ok())
+}
+
+// --- errors ----------------------------------------------------------------
+//
+// `run_upload` turns every `Err` into `Outcome::Failed(e.to_string())`, which
+// the daemon logs and shows in status output. So an error string is a log line,
+// and nothing that reaches one may name a credential.
+
+fn refused(what: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, what.into())
+}
+
+/// A Graph refusal, named by the service's own error code.
+fn service_refused(what: &str, status: u16, body: &[u8]) -> io::Error {
+    let code = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    io::Error::new(
+        io::ErrorKind::Other,
+        format!("{what}: the service answered {status} {code}"),
+    )
+}
+
+/// The one answer an update with nothing to guard it may have.
+///
+/// Both forms refuse for the same reason and it is worth saying once: an update
+/// is a write over a version somebody else may have moved on from, and the only
+/// thing that catches that is a value this drive can offer as a precondition.
+/// The cost is named rather than hidden — on a drive whose tags are hashes this
+/// refuses every update to an object that already exists, and the framework then
+/// keeps the file visibly unsent instead of overwriting a stranger's edit with
+/// it.
+fn no_precondition() -> io::Error {
+    refused(
+        "this drive offers no value the service accepts as a precondition, so the \
+         update is refused rather than written blind",
+    )
+}
+
+/// Everything an upload session can go wrong with, said without saying where.
+///
+/// The `uploadUrl` is a bearer credential — the documentation says to strip
+/// `Authorization` when using it precisely because it carries its own — so the
+/// URL, its host and its query are never allowed into a message, a `Debug`
+/// rendering or a source chain. That is why the underlying error is discarded
+/// here rather than wrapped: `source()` is walked when an error is rendered.
+fn session_failed(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, format!("the upload session {what}"))
+}
+
+/// How many times one Graph request may be re-issued before the call gives up.
+///
+/// Bounded, not "until it works". A failed upload is re-queued by the framework
+/// and stays visibly unsent, so a bounded failure here costs a delay; an
+/// unbounded retry costs the upload thread, and every edit behind it in the
+/// queue exists nowhere but this machine.
+const MAX_WRITE_ATTEMPTS: u32 = 4;
+
+/// How many transport faults one session tolerates before it is abandoned.
+const MAX_FRAGMENT_FAULTS: u32 = 3;
+
+/// How many answers that do not move the outstanding offset forward a session
+/// tolerates before it is given up as stuck.
+///
+/// A `202` is progress, and a `202` that names the same offset forever is not.
+/// Without this the natural loop re-sends the completing fragment against a
+/// service that never finishes assembling, for as long as the process lives.
+const MAX_FRAGMENT_STALLS: u32 = 3;
+
+/// A ceiling on fragments per session, for the case the stall counter cannot
+/// see: a service that alternates between two outstanding offsets makes forward
+/// progress by the counter's measure on every other answer and still never
+/// converges.
+const FRAGMENT_HEADROOM: u64 = 8;
+
+impl<T: Transport, K: Sleeper> GraphSink<T, K> {
+    // --- the transport, and the two retry policies -------------------------
+
+    /// One Graph request, with throttling and transient service failures
+    /// answered by waiting rather than by taking a different route.
+    ///
+    /// The *same* request object is re-sent, which is the whole point: the
+    /// natural retry loop rebuilds the request from whatever is still in scope
+    /// and drops the `if-match` on the way, and `429 activityLimitReached` is
+    /// the single most common thing a busy drive answers — so that is not a rare
+    /// path, it is most writes, and each one destroys the remote edit the
+    /// precondition existed to catch.
+    fn call(&mut self, request: &Request) -> io::Result<Reply> {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let reply = self.transport.send(request)?;
+            let transient = reply.status == 429 || (500..600).contains(&reply.status);
+            if transient && attempt < MAX_WRITE_ATTEMPTS {
+                // Never zero: `retry_after.unwrap_or_default()` re-issues
+                // immediately against the endpoint that has just said it is
+                // overloaded, and the ban that earns lands on the app
+                // registration rather than on the user who caused it.
+                self.sleeper
+                    .sleep(reply.retry_after.unwrap_or(BLIND_BACKOFF));
+                continue;
+            }
+            return Ok(reply);
+        }
+    }
+
+    /// One request to a URL a *response body* named.
+    ///
+    /// Identical to [`GraphSink::call`] but for the error: nothing the transport
+    /// says about this request may be propagated, because everything it can say
+    /// contains the pre-authenticated URL.
+    fn call_session(&mut self, request: &Request) -> io::Result<Reply> {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let reply = match self.transport.send(request) {
+                Ok(r) => r,
+                Err(_) => return Err(session_failed("could not be reached")),
+            };
+            let transient = reply.status == 429 || (500..600).contains(&reply.status);
+            if transient && attempt < MAX_WRITE_ATTEMPTS {
+                self.sleeper
+                    .sleep(reply.retry_after.unwrap_or(BLIND_BACKOFF));
+                continue;
+            }
+            return Ok(reply);
+        }
+    }
+
+    /// The `if-match` an update to `cloud_id` may carry, if there is one.
+    ///
+    /// Not "some header": `if-match: *` matches any version and a quickXor hash
+    /// matches none, so the first is the blind overwrite this precondition
+    /// exists to forbid and the second rejects every attempt forever. A drive
+    /// whose tags are hashes has no value Graph accepts as a precondition, and
+    /// that is a fact about the drive rather than a gap to fill in.
+    ///
+    /// The tag is the one the *last completed round* recorded — the version this
+    /// upload is based on — never one read back immediately before the write,
+    /// which is a precondition that can never fail and silently overwrites the
+    /// newer version it has just seen.
+    fn precondition(&self, cloud_id: &str) -> Option<String> {
+        if self.tags != TagSource::CTag {
+            return None;
+        }
+        let tag = self.known.get(cloud_id)?;
+        match tag.strip_prefix("ct:") {
+            Some(raw) if !raw.is_empty() => Some(raw.to_string()),
+            _ => None,
+        }
+    }
+
+    /// The content tag of the version an object holds right now.
+    fn read_tag(&mut self, key: &ObjectKey) -> io::Result<Option<String>> {
+        let reply = self.call(&Request::new(Method::Get, item_metadata_url(key)))?;
+        if !(200..300).contains(&reply.status) {
+            return Err(service_refused(
+                "the object's metadata could not be read",
+                reply.status,
+                &reply.body,
+            ));
+        }
+        let item: DriveItem = serde_json::from_slice(&reply.body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        Ok(content_tag(&item.body(), self.tags).ok())
+    }
+
+    /// What a successful write means, once the service has answered.
+    ///
+    /// The id comes from the response and is drive-qualified here, never taken
+    /// from `existing`: some services renumber an item on write, and a cloud id
+    /// naming an object the service has replaced can never be fetched again.
+    /// The drive is the one the request was addressed at — the only drive this
+    /// call can know the object is on.
+    fn settle(&mut self, drive: &DriveId, body: &[u8]) -> io::Result<Uploaded> {
+        let item: DriveItem = serde_json::from_slice(body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        let Some(raw) = item.id.as_deref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the service accepted the write and named no object",
+            ));
+        };
+        let key = ObjectKey::new(
+            drive.clone(),
+            ItemId::parse(raw).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("the service named {e:?}"))
+            })?,
+        );
+        // Graph's documented default property set carries no cTag and no
+        // hashes, and hashes routinely lag a write. `store::adopt_cloud_id`
+        // writes the etag only when it is `Some` and never clears a stale one,
+        // so punting here leaves the *previous* version's tag on a file that
+        // now holds this one — and the next delta pass puts a placeholder over
+        // content the user has just successfully uploaded. Reading it back
+        // costs one request; inventing one is not available, and failing would
+        // re-queue an upload that already happened, forever.
+        let tag = match content_tag(&item.body(), self.tags) {
+            Ok(t) => Some(t),
+            Err(_) => self.read_tag(&key)?,
+        };
+        let cloud_id = key.to_cloud_id().into_inner();
+        if let Some(t) = &tag {
+            // Remembered so a `remove` seconds later can be conditional on the
+            // version this sink wrote, rather than on whatever another device
+            // has committed since.
+            self.known.insert(cloud_id.clone(), t.clone());
+        }
+        Ok(Uploaded {
+            cloud_id,
+            etag: tag,
+        })
+    }
+
+    // --- the simple form ---------------------------------------------------
+
+    /// A whole file as one `PUT`, at the object the local file claims.
+    fn put_at_item(
+        &mut self,
+        key: &ObjectKey,
+        cloud_id: &str,
+        body: Vec<u8>,
+    ) -> io::Result<Written> {
+        let Some(tag) = self.precondition(cloud_id) else {
+            return Err(no_precondition());
+        };
+        let request = Request::new(Method::Put, item_content_url(key))
+            .with_header("if-match", &tag)
+            .with_header("content-type", "application/octet-stream")
+            .with_body(body);
+        let reply = self.call(&request)?;
+        match reply.status {
+            200..=299 => Ok(Written::Done(self.settle(key.drive(), &reply.body)?)),
+            // The one place a failed update may become a create, and it is one
+            // token wide: `if !reply.ok()` where `if status == 404` was meant
+            // answers a throttle with a second object holding the same document
+            // under the same name, and the two then chase each other.
+            404 => Ok(Written::Gone),
+            _ => Err(service_refused(
+                "the update was refused",
+                reply.status,
+                &reply.body,
+            )),
+        }
+    }
+
+    /// A whole file as one `PUT`, at a name the drive may or may not hold.
+    fn put_at_path(&mut self, rel: &str, body: Vec<u8>) -> io::Result<Uploaded> {
+        check_relative_name(rel)?;
+        let drive = self.scope.drive().clone();
+        let request = Request::new(
+            Method::Put,
+            // Never `replace`, and never `rename`. A create has never seen the
+            // object it would be replacing, and `rename` invents `notes 1.txt` —
+            // an object no local file claims, stamped onto the inode that asked
+            // for `notes.txt`. The parameter is never omitted either: the two
+            // v1.0 pages disagree about the default, so an omitted parameter is
+            // a bet on which page is right, with the user's data.
+            path_content_url(&drive, rel, ConflictBehavior::Fail),
+        )
+        .with_header("content-type", "application/octet-stream")
+        .with_body(body);
+        let reply = self.call(&request)?;
+        match reply.status {
+            200..=299 => self.settle(&drive, &reply.body),
+            // A collision is answered by stopping. Adopting the other object's
+            // id writes a stranger's item id onto the local inode: reclaim may
+            // then evict the local file, the next read fetches their document,
+            // and when the user deletes their own file the framework calls
+            // `remove` on the stranger's object.
+            _ => Err(service_refused(
+                "the create was refused",
+                reply.status,
+                &reply.body,
+            )),
+        }
+    }
+
+    // --- the resumable form ------------------------------------------------
+
+    /// Open a session, transfer the file through it, and commit.
+    fn upload_session(
+        &mut self,
+        path: &std::path::Path,
+        rel: &str,
+        target: Option<(ObjectKey, String)>,
+        file: &std::fs::File,
+        snap: &Snapshot,
+    ) -> io::Result<Written> {
+        let drive = match &target {
+            Some((key, _)) => key.drive().clone(),
+            None => self.scope.drive().clone(),
+        };
+        let (url, behaviour) = match &target {
+            // An update's session is created *at the item*. A path-addressed
+            // one lands on whichever object now holds the name — and the
+            // framework's rename repair calls back with the id it was just
+            // given and relies entirely on that second call updating that
+            // object, so a path-addressed session orphans the first one under
+            // its temp name forever.
+            //
+            // `replace` rather than `fail`, and only because the URL names the
+            // object: the behaviour governs a *name* collision, and the name in
+            // question is the object's own. `fail` would make every large update
+            // collide with itself, which is the other way to lose an edit. A
+            // path-addressed session gets `fail` for exactly the opposite
+            // reason — it has never seen what it would be replacing.
+            Some((key, cloud_id)) => {
+                // Asked here, before the transfer rather than at the commit.
+                // The pre-commit re-read compares against this tag, so without
+                // one the session can only ever be abandoned — after the whole
+                // file has crossed the wire, on every retry, forever.
+                if self.precondition(cloud_id).is_none() {
+                    return Err(no_precondition());
+                }
+                (item_session_url(key), ConflictBehavior::Replace)
+            }
+            None => {
+                check_relative_name(rel)?;
+                (path_session_url(&drive, rel), ConflictBehavior::Fail)
+            }
+        };
+        // The body carries the conflict behaviour and nothing else. A `name`
+        // here would rename the object the session is addressed at, which is
+        // the one thing an update must never do.
+        let body = serde_json::json!({
+            "item": {"@microsoft.graph.conflictBehavior": behaviour.as_str()},
+        })
+        .to_string();
+        let reply = self.call(
+            &Request::new(Method::Post, url)
+                .with_header("content-type", "application/json")
+                .with_body(body.into_bytes()),
+        )?;
+        if reply.status == 404 && target.is_some() {
+            return Ok(Written::Gone);
+        }
+        if !(200..300).contains(&reply.status) {
+            return Err(service_refused(
+                "the upload session was refused",
+                reply.status,
+                &reply.body,
+            ));
+        }
+        let session: SessionBody = serde_json::from_slice(&reply.body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        let Some(upload_url) = session.upload_url.filter(|u| u.starts_with("https://")) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the service opened an upload session at no usable URL",
+            ));
+        };
+
+        let outcome = self.transfer(path, &upload_url, &target, file, snap);
+        match outcome {
+            Ok(Transferred::Committed(body)) => Ok(Written::Done(self.settle(&drive, &body)?)),
+            // The session is already gone; there is nothing at the far end to
+            // cancel, and a `DELETE` would only ask a second time.
+            Ok(Transferred::Vanished) => Err(session_failed(
+                "vanished before the transfer committed, and a session that has \
+                 completed vanishes the same way — so nothing here is evidence the \
+                 content landed",
+            )),
+            Ok(Transferred::Abandoned(e)) | Err(e) => {
+                // The destination item is untouched until the commit, so a failed
+                // session has nothing of its own to clean up but the staged
+                // bytes. On OneDrive Personal those count against quota until
+                // expiry, so leaving them turns repeated failures into a drive
+                // full of invisible partial copies and unrelated uploads start
+                // failing 507. "Delete the item I was writing to" would recycle
+                // the user's complete previous version instead.
+                let _ = self.call_session(
+                    &Request::new(Method::Delete, upload_url.clone()).unauthorized(),
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// The fragment protocol: what to send next is the service's answer, not a
+    /// local byte counter.
+    fn transfer(
+        &mut self,
+        path: &std::path::Path,
+        upload_url: &str,
+        target: &Option<(ObjectKey, String)>,
+        file: &std::fs::File,
+        snap: &Snapshot,
+    ) -> io::Result<Transferred> {
+        use std::os::unix::fs::FileExt;
+
+        // Fixed here and never recomputed. "Your app must ensure the total file
+        // size specified in the Content-Range header is the same for all
+        // requests" — and a `metadata()` call inside the loop turns any save
+        // during a long upload into a wasted whole-file transfer.
+        let total = snap.len;
+        let fragment = self.fragment_bytes();
+        let ceiling = total / fragment as u64 + FRAGMENT_HEADROOM + 1;
+
+        let mut offset = 0u64;
+        let mut stalls = 0u32;
+        let mut faults = 0u32;
+        let mut sent = 0u64;
+        // Once per session, immediately before the first attempt at the
+        // fragment that completes the file. Re-reading before *every* attempt
+        // doubles the request count against an endpoint that is already
+        // answering slowly, and the question it asks is the same one.
+        let mut rechecked = false;
+
+        while offset < total {
+            if sent > ceiling {
+                return Ok(Transferred::Abandoned(session_failed(
+                    "never converged on an outstanding range",
+                )));
+            }
+            sent += 1;
+
+            // Before the bytes are read, every time: a session is minutes long,
+            // and the reclaim guard that would otherwise cover this is read
+            // outside the transfer.
+            unchanged(path, snap)?;
+
+            let len = std::cmp::min(fragment as u64, total - offset) as usize;
+            let mut buf = vec![0u8; len];
+            // `read_exact_at`, never `read`: `read` may return short and its
+            // return value is easy to discard, and then the untouched tail of
+            // the buffer goes on the wire as the user's data and the service
+            // commits it.
+            file.read_exact_at(&mut buf, offset)?;
+            let end = offset + len as u64 - 1;
+
+            if end + 1 == total && !rechecked {
+                rechecked = true;
+                if let Some((key, cloud_id)) = target {
+                    // `if-match` on an upload session is evaluated when the
+                    // session is created and never re-evaluated when the bytes
+                    // commit. A 12 MiB file is seconds; a 2 GB file is an hour,
+                    // and every remote edit made during that hour is destroyed
+                    // by the commit.
+                    let based_on = self.known.get(cloud_id).cloned();
+                    let now = self.read_tag(key)?;
+                    if now.is_none() || now != based_on {
+                        return Ok(Transferred::Abandoned(refused(
+                            "the object moved on under the session, so the commit \
+                             would overwrite a version this machine has never seen",
+                        )));
+                    }
+                }
+            }
+
+            let request = Request::new(Method::Put, upload_url.to_string())
+                .with_header("content-range", &format!("bytes {offset}-{end}/{total}"))
+                .with_body(buf)
+                // The `uploadUrl` carries its own pre-authorisation. Attaching
+                // the Graph token would hand a live write credential for the
+                // user's whole drive to whatever host a response body named.
+                .unauthorized();
+            let reply = match self.call_session(&request) {
+                Ok(r) => r,
+                Err(e) => {
+                    faults += 1;
+                    if faults >= MAX_FRAGMENT_FAULTS {
+                        return Ok(Transferred::Abandoned(e));
+                    }
+                    // The server's view is the authoritative one, so a lost
+                    // fragment is resolved by asking where it is rather than by
+                    // restarting the session or by assuming the local counter
+                    // was right. If the probe cannot be reached either, the
+                    // same fragment goes again from the same offset.
+                    if let Some(at) = self.probe(upload_url) {
+                        offset = at;
+                    }
+                    continue;
+                }
+            };
+
+            match reply.status {
+                // The commit. Only a `200` or a `201` is one: `202` is a
+                // success status to every HTTP client library and means the
+                // service has the bytes and has not assembled them, so an early
+                // return here stamps the file Clean over content that was never
+                // committed.
+                200 | 201 => return Ok(Transferred::Committed(reply.body)),
+                202 => {
+                    let next = outstanding_offset(&reply.body).unwrap_or(end + 1);
+                    if next >= total {
+                        return Ok(Transferred::Abandoned(session_failed(
+                            "accepted every byte without committing any of them",
+                        )));
+                    }
+                    // `offset.max(next)` is a one-word defensive clamp that
+                    // silently discards the only signal a chunk was lost, and
+                    // the session can then never commit. The server's
+                    // outstanding range is honoured even when it goes backwards.
+                    if next <= offset {
+                        stalls += 1;
+                        if stalls >= MAX_FRAGMENT_STALLS {
+                            return Ok(Transferred::Abandoned(session_failed(
+                                "kept asking for a range it had already been sent",
+                            )));
+                        }
+                    } else {
+                        stalls = 0;
+                    }
+                    offset = next;
+                }
+                416 => {
+                    // The range is not one the service is willing to take. Read
+                    // as fatal this makes every lost fragment a permanently
+                    // failing upload; read as "restart" it re-transfers
+                    // gigabytes on a blip; read as "it already has it" it
+                    // returns Ok with no commit at all.
+                    match self.probe(upload_url) {
+                        Some(at) => offset = at,
+                        None => {
+                            return Ok(Transferred::Abandoned(session_failed(
+                                "refused the range and would not say which it wanted",
+                            )))
+                        }
+                    }
+                }
+                // A session vanishes on expiry, on `DELETE` *and* on successful
+                // completion, so this is genuinely ambiguous. Resolving it
+                // optimistically returns Ok for content that never committed;
+                // resolving it by deleting the item destroys the good version
+                // too. Reporting it re-queues one upload.
+                404 | 410 => return Ok(Transferred::Vanished),
+                _ => {
+                    return Ok(Transferred::Abandoned(service_refused(
+                        "a fragment was refused",
+                        reply.status,
+                        &reply.body,
+                    )))
+                }
+            }
+        }
+
+        // Every declared byte has been offered and nothing was answered as a
+        // commit.
+        Ok(Transferred::Abandoned(session_failed(
+            "took the whole file and never committed it",
+        )))
+    }
+
+    /// Where the service says the transfer is.
+    ///
+    /// Best effort: a probe that cannot be reached leaves the caller to resend
+    /// from where it was, which is correct and merely wasteful.
+    fn probe(&mut self, upload_url: &str) -> Option<u64> {
+        let reply = self
+            .call_session(&Request::new(Method::Get, upload_url.to_string()).unauthorized())
+            .ok()?;
+        if !(200..300).contains(&reply.status) {
+            return None;
+        }
+        outstanding_offset(&reply.body)
+    }
+
+    /// The fragment size, held to the two limits that only fail at the commit.
+    ///
+    /// A size that is not a whole number of quanta fails *after* the entire file
+    /// has crossed the wire, so a policy that names one is corrected here rather
+    /// than believed.
+    fn fragment_bytes(&self) -> usize {
+        let quanta = (self.policy.fragment_bytes / FRAGMENT_QUANTUM).max(1);
+        let ceiling = (MAX_FRAGMENT_BYTES - 1) / FRAGMENT_QUANTUM;
+        std::cmp::min(quanta, ceiling) * FRAGMENT_QUANTUM
+    }
+}
+
+/// What one write attempt settled on.
+enum Written {
+    Done(Uploaded),
+    /// The service does not have the object the local file claims. The local
+    /// file is now the only copy, so this becomes a create — the one and only
+    /// place in this half where a failed update may.
+    Gone,
+}
+
+/// What one session's transfer settled on.
+enum Transferred {
+    Committed(Vec<u8>),
+    /// The session is no longer there, and a completed session is gone the same
+    /// way — so this is not evidence either way.
+    Vanished,
+    Abandoned(io::Error),
+}
+
 impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K> {
     fn upload(
         &mut self,
         path: &std::path::Path,
         existing: Option<&str>,
-    ) -> io::Result<hydration_client::upload::Uploaded> {
-        let _ = (path, existing);
-        unimplemented!("GraphSink::upload")
+    ) -> io::Result<Uploaded> {
+        // §5.5 states the absence rule about the moment an upload *finishes*.
+        // The moment it starts is the same fact: `run_upload` folds `ENOENT`
+        // into `None` and calls this anyway, so the path is routinely one that
+        // no longer exists. `fs::read(path).unwrap_or_default()` would replace
+        // the user's document with an empty object, and answering from a
+        // remembered copy of the last call restores the file they just deleted.
+        // An empty file that *exists* is content and still uploads: refusing it
+        // leaves the pre-truncation version in the cloud permanently.
+        let file = std::fs::File::open(path)?;
+        if is_placeholder(path)? {
+            return Err(refused(
+                "the file is a dehydrated placeholder, and its holes are not the \
+                 user's document",
+            ));
+        }
+        let snap = snapshot_of(&file)?;
+
+        // Resolved now, from the path the framework resolved now — never from a
+        // name captured when the job was queued (§5.4).
+        //
+        // Judged only where it is *sent*, which is the create forms and the
+        // fallback below. An update is addressed by id and carries no name at
+        // all, so refusing one for a name the service dislikes would strand an
+        // edit to an object whose remote name is already whatever the service
+        // agreed to — a local file called `report .docx` that the cloud holds as
+        // `report.docx` is an ordinary state, and its edits still have to leave
+        // the laptop.
+        let rel = path
+            .strip_prefix(&self.root)
+            .map_err(|_| refused("the file is not under this sink's sync root"))?
+            .to_str()
+            .ok_or_else(|| refused("the path below the sync root is not UTF-8"))?
+            .to_string();
+
+        let target = match existing {
+            None => None,
+            Some(cloud_id) => {
+                let Some(key) = key_of_cloud_id(cloud_id) else {
+                    // A junk id is a damaged record of *which* object this file
+                    // is. Creating a second one instead would put the same
+                    // document in the cloud twice under one name, and the two
+                    // would then overwrite each other every round; the error is
+                    // visible and the file stays queued.
+                    return Err(refused(
+                        "the recorded cloud id names no drive and no item, so there is \
+                         no object this write could be addressed at",
+                    ));
+                };
+                Some((key, cloud_id.to_string()))
+            }
+        };
+
+        // The size observed once, before the first byte is read. Both the
+        // threshold and every `content-range` come from it.
+        if snap.len > self.policy.simple_upload_max {
+            return match self.upload_session(path, &rel, target, &file, &snap)? {
+                Written::Done(u) => Ok(u),
+                Written::Gone => self.create(path, &rel),
+            };
+        }
+
+        // Read through the handle the checks above were made against, so the
+        // whole body is one inode's worth of bytes even if the path is renamed
+        // out from under it while the read runs.
+        let body = read_whole(&file, &snap)?;
+        match &target {
+            Some((key, cloud_id)) => {
+                let key = key.clone();
+                let cloud_id = cloud_id.clone();
+                match self.put_at_item(&key, &cloud_id, body)? {
+                    Written::Done(u) => Ok(u),
+                    Written::Gone => self.create(path, &rel),
+                }
+            }
+            None => self.put_at_path(&rel, body),
+        }
     }
 
     fn remove(&mut self, cloud_id: &str) -> io::Result<()> {
-        let _ = cloud_id;
-        unimplemented!("GraphSink::remove")
+        // Before a request, not after a response. `rsplit('|').next()
+        // .unwrap_or(cloud_id)` turns junk in an extended attribute — one
+        // written by an older build, or by another provider — into a live
+        // `DELETE` against a real endpoint, and item ids are unique per drive,
+        // so a shared-drive id sent to the user's own drive either 404s or
+        // removes something unrelated.
+        let Some(key) = key_of_cloud_id(cloud_id) else {
+            return Err(refused(
+                "the cloud id names no drive and no item, so there is no object to \
+                 remove",
+            ));
+        };
+        let mut request = Request::new(Method::Delete, item_url(&key));
+        // Conditional when it can be. §5.5 makes the local delete win, and it
+        // is right about the *file* — it says nothing about the *version* the
+        // object holds. `run_upload`'s delete-during-upload path removes an id
+        // this sink wrote seconds earlier and whose tag it therefore knows; if
+        // another device committed in between, an unconditional `DELETE`
+        // recycle-bins work that was never on this machine at all. A
+        // precondition the sink cannot supply is not a reason to strand the
+        // user's delete, so an object with no recorded tag is removed anyway.
+        if let Some(tag) = self.precondition(cloud_id) {
+            request = request.with_header("if-match", &tag);
+        }
+        // Never `permanentDelete`, which needs no permission beyond an ordinary
+        // delete and has no undo — the recycle bin is the only recovery a
+        // business drive has. Never `prefer: bypass-shared-lock` either: a
+        // coauthoring lock means somebody has the document open, and it is not
+        // ours to bypass.
+        let reply = self.call(&request)?;
+        match reply.status {
+            // Already gone is the state that was wanted. An error here makes
+            // the framework retry forever, so the object is never removed and
+            // comes back down the delta feed to resurrect the file the user
+            // deleted.
+            200..=299 | 404 => Ok(()),
+            // A `412` is another device's newer version saying so, and
+            // re-issuing without the precondition is the same instinct as
+            // retrying a `412` on a write — except that a `DELETE` has no
+            // version history behind it to recover from.
+            _ => Err(service_refused(
+                "the object was not removed",
+                reply.status,
+                &reply.body,
+            )),
+        }
+    }
+}
+
+impl<T: Transport, K: Sleeper> GraphSink<T, K> {
+    /// The create an update falls back to when the service no longer has the
+    /// object the local file claims.
+    ///
+    /// Opened and judged again rather than reusing anything the update was built
+    /// from: the two are separated by a round trip, and in that window the file
+    /// can be saved over, truncated, or evicted into a placeholder. The content
+    /// that goes up is the content at send time, and every guard that decided
+    /// the first attempt has to decide this one too.
+    fn create(
+        &mut self,
+        path: &std::path::Path,
+        rel: &str,
+    ) -> io::Result<Uploaded> {
+        let file = std::fs::File::open(path)?;
+        if is_placeholder(path)? {
+            return Err(refused(
+                "the file is a dehydrated placeholder, and its holes are not the \
+                 user's document",
+            ));
+        }
+        let snap = snapshot_of(&file)?;
+        if snap.len > self.policy.simple_upload_max {
+            return match self.upload_session(path, rel, None, &file, &snap)? {
+                Written::Done(u) => Ok(u),
+                // A create has no object to be told is gone; kept total rather
+                // than unwrapped, because a panic here kills the upload thread.
+                Written::Gone => Err(refused("the create named no object")),
+            };
+        }
+        let body = read_whole(&file, &snap)?;
+        self.put_at_path(rel, body)
     }
 }

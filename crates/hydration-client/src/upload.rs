@@ -294,8 +294,38 @@ pub fn run_upload<S: Sink>(file: FileId, store: &mut Store, sink: &mut S) -> Out
             }
             if let Some(moved) = store.lookup(&file) {
                 if moved.path != path {
-                    return match sink.upload(&moved.path, Some(&uploaded.cloud_id)) {
+                    // Resent as a *create*, not as an update of the object we
+                    // just made.
+                    //
+                    // Passing the existing id looks tidier and is wrong: to a
+                    // provider that addresses an update by object id — Graph
+                    // does — an update changes content and not the name, so the
+                    // object keeps the temp name the create gave it. §5.4 says
+                    // no upload succeeds under a name the file no longer has,
+                    // and an atomic save is precisely this shape: written as
+                    // `x.tmp`, uploaded, renamed to `x`. The reference provider
+                    // happens to rename on update, which is why this only
+                    // surfaced when a second one was written.
+                    //
+                    // Observed before the send, so an edit that lands during it
+                    // leaves the file dirty and is sent again rather than being
+                    // blessed as delivered.
+                    let sent_state = std::fs::metadata(&moved.path).ok();
+                    return match sink.upload(&moved.path, None) {
                         Ok(again) => {
+                            // The object created under the old name is ours and
+                            // holds nothing anyone wants. Removing it is the one
+                            // deletion this path may issue, because it is the
+                            // object this call created moments ago.
+                            if again.cloud_id != uploaded.cloud_id {
+                                if let Err(e) = sink.remove(&uploaded.cloud_id) {
+                                    return Outcome::Failed(format!(
+                                        "resent under the new name, but the object \
+                                         created under the old one could not be \
+                                         removed: {e}"
+                                    ));
+                                }
+                            }
                             if let Err(e) = store.adopt_cloud_id(
                                 &moved.path,
                                 &again.cloud_id,
@@ -305,8 +335,8 @@ pub fn run_upload<S: Sink>(file: FileId, store: &mut Store, sink: &mut S) -> Out
                                     "could not record the cloud id after a rename: {e}"
                                 ));
                             }
-                            if let Ok(md) = std::fs::metadata(&moved.path) {
-                                let _ = hydration_protocol::stamp::write_as(&moved.path, &md);
+                            if let Some(md) = &sent_state {
+                                let _ = hydration_protocol::stamp::write_as(&moved.path, md);
                             }
                             Outcome::Sent {
                                 cloud_id: again.cloud_id,
