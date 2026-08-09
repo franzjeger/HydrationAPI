@@ -373,6 +373,12 @@ impl Harness for Framework {
         // The content has to exist somewhere else first, or evicting it is
         // deleting it. Settling makes sure it does.
         self.settle();
+
+        // The ignore mark protects the punch from generating an event nobody
+        // answers. It must come off again whatever happens next: `evict` removes
+        // it on success, but on any early return it would be left behind — and a
+        // file with an ignore mark is never intercepted again, so every later
+        // read of it is served the zeros the eviction left behind. Silently.
         let _ = self.group.ignore(&path);
         let safe = || {
             store::get_xattr(&path, store::XATTR_ID)
@@ -380,10 +386,19 @@ impl Harness for Framework {
                 .flatten()
                 .is_some()
         };
-        match evict::evict(&self.group, &path, safe) {
+        let outcome = evict::evict(&self.group, &path, safe);
+        match outcome {
             Ok(Ok(())) => {}
-            Ok(Err(r)) => panic!("the harness could not dehydrate {name}: {r:?}"),
-            Err(e) => panic!("the harness could not dehydrate {name}: {e}"),
+            other => {
+                // evict did not get as far as removing the mark. Undo it here
+                // rather than leaving the file permanently invisible.
+                let _ = self.group.unignore(&path);
+                match other {
+                    Ok(Err(r)) => panic!("the harness could not dehydrate {name}: {r:?}"),
+                    Err(e) => panic!("the harness could not dehydrate {name}: {e}"),
+                    Ok(Ok(())) => unreachable!(),
+                }
+            }
         }
     }
 

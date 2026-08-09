@@ -103,10 +103,16 @@ fn framework_conformance() {
 
     // Deliberately no pass/fail assertion yet, and that is the current finding.
     //
-    // Consecutive runs of this suite do not agree: one run reported 7 of 9, the
-    // next 5 of 9, with different invariants failing. The framework is not
-    // stable, so any expectation table written today would be recording a coin
-    // toss and would fail for the wrong reason tomorrow.
+    // Consecutive runs do not agree: 6, 7 and 7 of 9 across three runs, with
+    // different invariants failing. The framework is not stable, so an
+    // expectation table written today would record a coin toss.
+    //
+    // What the instability is *not*: a kernel that fails to generate or deliver
+    // pre-content events. `probes/eventtrace.c` puts a reader on a well-formed
+    // placeholder eight times over and gets an event every time, and the kernel
+    // stack of a blocked writer names the path directly —
+    // `do_ftruncate -> fsnotify_pre_content -> fanotify_handle_event`. The
+    // events are there. Whatever is dropping them is on this side.
     //
     // What is established:
     //
