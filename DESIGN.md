@@ -1452,11 +1452,18 @@ I ærlighetens navn, siden dette skal være beslutningsgrunnlag:
   egen sti eller bind over seg selv holder; begge har en omvei som leverer nuller (§6.4a).
   Kravet er at ingen annen montering eksponerer filene, og det kan vi ikke håndheve — bare
   oppdage, med `FAN_MNT_ATTACH`. Jeg har **ikke** kjørt en probe på selve
-  `FAN_MNT_ATTACH`-abonnementet; det er neste lille probe.
+  `FAN_MNT_ATTACH`-abonnementet isolert, men eksponeringsvakten som bygger på det
+  har fire tester som kjører mot en ekte montering (`tests/exposure.rs`).
 - ~~`FAN_MARK_IGNORE_SURV`~~ — **lukket.** `probes/ignoremark.c`: godtatt, undertrykker,
   og overlever endring. Ytelsespåstanden står.
-- Jeg testet **ikke** mmap-hydrering eller `truncate`-hydrering. Kildekoden har hookene
-  (`fsnotify_mmap_perm`, `fsnotify_truncate_perm`); jeg har ikke sett dem fyre.
+- ~~mmap- og `truncate`-hydrering~~ — **lukket, og begge svarene var de gode.**
+  `probes/mmapread.c`, 6.17: en *mappet* lesing av en placeholder utløser én hendelse og
+  leseren får hydrert innhold. Det var det farligste åpne punktet her — de fleste
+  språkruntimer, databaser og enhver ELF-laster mapper framfor å lese, og en udekket
+  mmap ville gitt dem hullet uten feilmelding. `truncate` fyrer også, og det som
+  overlever en forkorting er det ekte innholdet, ikke nuller. Udekket ville en
+  forkortet placeholder blitt til de første N *nullene* — verre enn nuller, fordi
+  resultatet ser ut som en bevisst redigering og ville blitt lastet opp.
 - ~~Hendelser under behandling ved arbeiderdød~~ — **lukket, og det var et ekte hull.**
   En hendelse arbeideren allerede hadde lest ut av køen etterlot leseren hengende
   ubundet; vakten kunne ikke svare på noe den aldri så. Lukkes ved at arbeideren
