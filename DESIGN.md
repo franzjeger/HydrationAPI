@@ -1604,6 +1604,16 @@ loop-enheter eller prosesser står igjen.
 
 ## 10. Neste steg
 
+> **Status per nå:** alt i §8s v1-omfang er bygget og verifisert — 294 tester,
+> åtte privilegerte suiter mot en ekte kjerne, og en smoke-kjøring ende-til-ende
+> med begge ekte binærer. To av fem deler av en Graph-leverandør er skrevet
+> (`crates/hydration-graph`): kartleggingslaget og delta-driveren. Opplastings-
+> siden, autentisering og sømmen som lar en leverandør kobles inn i
+> `hydration-sync` gjenstår, og ingenting her har snakket med ekte Graph.
+> Sporene under er beholdt som de ble skrevet, fordi rekkefølgen de foreslo er
+> den som faktisk ble fulgt.
+
+
 Hvis du er enig i retningen, er den naturlige rekkefølgen:
 
 To spor, parallelt.

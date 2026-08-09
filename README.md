@@ -4,7 +4,11 @@ A hydration framework for cloud files on Linux — the equivalent of macOS' File
 Provider and Windows' Cloud Files API. Files appear as ordinary local files with
 their real size and metadata; their content is fetched on first access.
 
-**Status: phase 1 — design and feasibility. No framework implementation yet.**
+**Status: the framework is built and hardened. A Microsoft Graph provider is
+half written.** 294 tests, eight privileged suites against a real kernel, and an
+end-to-end smoke run with both real binaries. What is *not* done is the part that
+needs a real OneDrive account, and nothing here has met live Graph — see
+[Where this actually stands](#where-this-actually-stands).
 
 ## The finding
 
@@ -38,11 +42,14 @@ something was not measured, it says so.
 | `crates/hydrationd/` | The privileged helper: fanotify pre-content, fail-closed |
 | `crates/hydration-client/` | The unprivileged sync daemon: credentials, cloud access |
 | `crates/hydration-protocol/` | The wire format across the privilege boundary |
+| `crates/hydration-graph/` | A Microsoft Graph provider: the mapping layer and the delta driver |
+| [PROVIDER.md](PROVIDER.md) | What a provider must uphold, and what the framework guarantees back |
+| `docs/` | The groundwork the Graph layers were written from, with their critiques kept verbatim |
 | `probes/` | Feasibility probes that settled specific questions |
 
 ## The framework
 
-Under construction. `crates/hydrationd` is the privileged half — the part that
+`crates/hydrationd` is the privileged half — the part that
 holds `CAP_SYS_ADMIN`, watches a mount for pre-content events, fills
 placeholders, and refuses rather than serving zeros. It never opens a socket to
 the network and never sees a credential.
@@ -56,7 +63,9 @@ zeros with exit 0. Three failure modes are covered and one is not:
 | worker dies between events | supervisor denies with `EIO` |
 | worker dies holding an event | supervisor answers it by fd number |
 | a fetch returns the wrong length | refused, placeholder left untouched |
-| **both processes die** | **not covered** — needs the mount torn down (§6.4a) |
+| a worker that stops answering | supervisor takes over and detaches the mount |
+| a fetch that never completes | abandoned; the placeholder is punched back |
+| **both processes die at once** | **not covered** — needs the mount torn down (§6.4a) |
 
 ```bash
 cargo test -p hydrationd                     # unit + placeholder behaviour
@@ -109,9 +118,73 @@ causes, none of them the kernel: a placeholder that ignore-marked itself while
 being created, an index scanned once and never again, and a name collision the
 harness resolved by hash order.
 
-What is not built yet: the `FAN_MNT_ATTACH` exposure watch wired through to
-status, the backup manifest, per-event timeouts (§6a-bis), and the binaries the
-systemd units point at. See DESIGN.md §8.
+Everything in §8's v1 scope is now built: the exposure watch, the backup
+manifest, per-event deadlines and a supervisor that watches progress rather than
+liveness (§6a-bis), streaming hydration (§8c–§8d), eviction with a trigger a user
+can run, and the two binaries the systemd units point at.
+
+```bash
+sudo ./deploy/smoke.sh /mnt/scratch    # both real binaries, end to end
+```
+
+Nine checks: a placeholder hydrates on first read; the framework creates its own
+placeholder live inside the marked mount and that one hydrates too; a local edit
+reaches the cloud; a rename-edit reaches the cloud; the framework's own writes do
+not come back as changes; a file is evicted and gives its disk back; the evicted
+file hydrates again; a file the cloud does not have is refused; and with the
+worker gone a read fails rather than returning zeros.
+
+## The Graph provider
+
+`crates/hydration-graph` turns Microsoft Graph's delta feed into the changes the
+framework consumes. Two of the five pieces are done — the mapping layer (60
+tests) and the delta driver (55) — and both were written the same way: the attack
+suite first, by authors who had not seen the implementation, then falsified by
+someone whose only job was to find the tests that *cannot fail*.
+
+That order paid for itself immediately. In the mapping layer, five tests took
+design decisions the opposite way from mine and each time they were right. In the
+driver, the reverse happened: nineteen tests encoded a data-loss bug, and only an
+experiment could settle it —
+
+> A tombstone the framework never applied was unrecoverable after a restart. The
+> round had written its tree and its token, so the restart resumed past the
+> deletion, `listing()` cannot express one, and the persisted tree already agreed
+> the file was gone. The file stayed as a placeholder forever, and every read of
+> it fetched an object that no longer existed.
+
+Both writes are now held until the framework proves it accepted the batch, by
+coming back with a different cursor than the one it was handed.
+
+The hardest piece is not the API. It is that **a service reports one change when
+a folder moves and does not re-enumerate the thousand files inside it** — so a
+provider that forwards changes one-for-one splits the local tree, and no single
+change looks wrong. `namespace.rs` holds the remote tree and derives paths from
+it; a root-level move of 100,000 files expands in about 50 ms, and an unchanged
+folder costs nothing, which matters more.
+
+[PROVIDER.md](PROVIDER.md) is the contract, including the six Graph mapping traps
+that have each bitten somebody.
+
+## Where this actually stands
+
+Honest, because the interesting number is not the test count.
+
+**Done and hardened.** The framework: seven adversarial review rounds, every
+finding fixed, 294 tests, 8/8 privileged suites against a real kernel. Two of the
+five Graph pieces.
+
+**Not done.** The upload half — no Graph `Sink` exists. Authentication. And there
+is no seam to plug a provider into `hydration-sync`, which is still wired to the
+demo `FolderCloud` in six places.
+
+**Not verifiable here.** Nothing in this repository has spoken to live Microsoft
+Graph. The provider layers are tested against scripted responses, which catches
+the logic and cannot catch the world. Three consecutive modules in this project
+shipped with blocking defects that only an adversarial review found — an infinite
+loop, a use-after-close that wrote one object's bytes into another file, a rename
+that failed all six of its own batch shapes. First contact with a real account
+will find things nobody predicted.
 
 ## The contract
 
@@ -162,6 +235,15 @@ gcc -O1 -Wall -o probes/build/dirmark probes/dirmark.c
   `exe`.
 - `dirmark.c` — can `FAN_PRE_ACCESS` be set on a single directory? No. The mark
   is accepted and delivers nothing, which is worse than being rejected.
+- `demand.c` — is the event's `count` a hint or a demand? A demand. Answer
+  `FAN_ALLOW` having written less than it asked for and the reader gets zeros,
+  silently, with no second event. A mapped read demands the whole object in one
+  event, which is why streaming moves the size ceiling rather than removing it.
+- `stream.c` — is a half-filled placeholder observable? No: a second reader's
+  event queues behind the one being served. That is what makes filling
+  incrementally safe rather than merely convenient.
+- `mmapread.c` — does a mapped read hydrate? Yes, and so does `truncate`. Both
+  were the last open questions that could have produced silently wrong data.
 
 ## Non-goals for v1
 

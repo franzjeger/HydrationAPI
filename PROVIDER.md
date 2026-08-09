@@ -2,6 +2,11 @@
 
 What the framework guarantees, and what it demands of you.
 
+A worked example is in `crates/hydration-graph`: the Microsoft Graph mapping
+layer and delta driver, with `namespace::Namespace` doing the folder-move
+expansion described below. The groundwork both were written from — including the
+critiques of that groundwork, kept verbatim — is in `docs/`.
+
 Everything here is enforced by tests you can run — `cargo test -p hydration-client
 --test hostile_cloud` is a cloud that breaks each rule on purpose. If your
 provider passes against a real service what that file asserts against a fake one,
