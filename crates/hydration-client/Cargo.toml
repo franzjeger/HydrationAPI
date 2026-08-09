@@ -1,0 +1,10 @@
+[package]
+name = "hydration-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The unprivileged sync daemon: credentials, cloud access, state"
+
+[dependencies]
+hydration-protocol = { path = "../hydration-protocol" }
+libc = "0.2"

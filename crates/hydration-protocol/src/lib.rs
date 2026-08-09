@@ -10,12 +10,15 @@
 //! is no field in this protocol that a compromised sync daemon could use to
 //! make the root helper write somewhere it did not already intend to write.
 //!
-//! Messages are newline-delimited JSON. Not because the volume warrants it, but
-//! because the whole point of this boundary is that it can be read and audited
-//! in an afternoon, and a binary format would trade that for throughput we do
-//! not need — the payload travels out of band anyway.
+//! Messages are newline-delimited JSON, with file content following a `Ready`
+//! response as raw bytes on the same stream. Not because the volume warrants
+//! JSON, but because the whole point of this boundary is that it can be read and
+//! audited in an afternoon; the bulk path is the byte run, which costs nothing
+//! to frame.
 
 use serde::{Deserialize, Serialize};
+
+pub mod transport;
 
 /// Identifies a file without naming it.
 ///
@@ -54,9 +57,16 @@ pub struct FetchRequest {
 /// deliver the whole object is a [`FetchResponse::Failed`], not a short success.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FetchResponse {
-    /// Content follows out of band, on the fd passed alongside this message.
-    /// `len` must equal the size the placeholder promised, or the helper
-    /// refuses it.
+    /// Exactly `len` raw bytes follow this line on the same stream.
+    ///
+    /// Not `SCM_RIGHTS`, which would be the obvious choice and is the wrong one
+    /// here: passing a descriptor means the privileged side accepts an object
+    /// chosen by the unprivileged side, and the whole point of §6b is that it
+    /// never does. Length-prefixed bytes are something the helper can bound,
+    /// verify and discard.
+    ///
+    /// `len` must equal the size the placeholder promised. The helper checks it
+    /// again anyway — it is the one that has to live with being wrong.
     Ready { id: u64, len: u64 },
     /// Nothing will be delivered. The reader gets `errno` and the placeholder is
     /// left exactly as it was.

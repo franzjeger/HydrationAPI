@@ -163,15 +163,8 @@ impl Group {
     fn mark(&self, flags: u32, mask: u64, path: &std::path::Path) -> io::Result<()> {
         let c = CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has an interior nul"))?;
-        let rc = unsafe {
-            fanotify_mark(
-                self.fd.as_raw_fd(),
-                flags,
-                mask,
-                libc::AT_FDCWD,
-                c.as_ptr(),
-            )
-        };
+        let rc =
+            unsafe { fanotify_mark(self.fd.as_raw_fd(), flags, mask, libc::AT_FDCWD, c.as_ptr()) };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }

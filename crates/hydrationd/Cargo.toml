@@ -8,3 +8,6 @@ description = "The privileged hydration helper: fanotify pre-content, fail-close
 [dependencies]
 hydration-protocol = { path = "../hydration-protocol" }
 libc = "0.2"
+
+[dev-dependencies]
+hydration-client = { path = "../hydration-client" }

@@ -12,4 +12,5 @@ pub mod daemon;
 pub mod fanotify;
 pub mod placeholder;
 pub mod policy;
+pub mod remote;
 pub mod supervisor;
