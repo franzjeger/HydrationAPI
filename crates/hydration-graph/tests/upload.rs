@@ -53,7 +53,9 @@ use std::time::Duration;
 
 use hydration_client::delta::Change;
 use hydration_client::namespace::Namespace;
-use hydration_client::upload::{Sink, Uploaded};
+use hydration_client::store::{self, Store};
+use hydration_client::upload::{run_upload, Outcome as RunOutcome, Sink, Uploaded};
+use hydration_protocol::{stamp, xattr, FileId};
 use hydration_graph::{
     DeltaPage, DriveId, DriveScope, GraphSink, ItemId, Method, ObjectKey, Reply, Request, Round,
     Sleeper, TagSource, Transport, UploadPolicy, FRAGMENT_QUANTUM, MAX_FRAGMENT_BYTES,
@@ -311,6 +313,10 @@ fn effect(f: impl Fn() + Send + Sync + 'static) -> Effect {
 #[derive(Clone)]
 enum Outcome {
     Reply(u16, Vec<u8>),
+    /// A reply that names its own retry interval. Kept separate from
+    /// [`Outcome::Reply`] rather than adding a field to it, so that not one
+    /// existing fixture changes shape.
+    Throttled(u16, Vec<u8>, Duration),
     Fail(io::ErrorKind, String),
 }
 
@@ -343,6 +349,19 @@ fn created(body: impl Into<String>) -> Act {
 
 fn no_content() -> Act {
     reply(204, "")
+}
+
+/// A refusal that names when to come back — `429` or `503` with `retry-after`.
+///
+/// The only way this suite can express a throttle, and the only thing that makes
+/// the injected `Sleeper` say anything: every test written before this one
+/// asserts `sleeps().is_empty()`, so the whole retry surface was scripted as
+/// though the service never pushes back.
+fn throttled(status: u16, body: impl Into<String>, after: Duration) -> Act {
+    Act {
+        outcome: Outcome::Throttled(status, body.into().into_bytes(), after),
+        effect: None,
+    }
 }
 
 fn boom(kind: io::ErrorKind, what: &str) -> Act {
@@ -566,6 +585,11 @@ impl Transport for Wire {
             Outcome::Reply(status, body) => Ok(Reply {
                 status,
                 retry_after: None,
+                body,
+            }),
+            Outcome::Throttled(status, body, after) => Ok(Reply {
+                status,
+                retry_after: Some(after),
                 body,
             }),
             Outcome::Fail(kind, what) => Err(io::Error::new(kind, what)),
@@ -831,6 +855,12 @@ fn an_update_creates_an_item_addressed_session_never_a_path_addressed_one() {
     let u2 = upload_url("S2");
 
     rig.script(post(item_session(MINE, "01A")), vec![ok(session(&u1))]);
+    // The pre-commit re-read `a_session_does_not_commit_after_the_item_changed_
+    // under_it` requires, answered with the version the upload is based on.
+    rig.script(
+        get(item_url(MINE, "01A")),
+        vec![ok(drive_item("01A", "report.pdf", 900, "c:{G},1"))],
+    );
     rig.script(
         put(u1.clone()).range("bytes 0-327679/655360"),
         vec![reply(202, accepted(&["327680-"]))],
@@ -938,6 +968,12 @@ fn a_failed_write_never_deletes_the_destination() {
         rig.journal.calls()
     );
     let calls = rig.journal.calls();
+    // Without this the `all` below is vacuously true of a sink that sent
+    // nothing, and the 500 this test is about was never received.
+    assert!(
+        !calls.is_empty(),
+        "the write was attempted, so the 500 was answered rather than avoided"
+    );
     assert!(
         calls
             .iter()
@@ -987,6 +1023,17 @@ fn a_409_on_a_create_is_an_error_and_never_adopts_the_other_objects_id() {
 
     assert!(out.is_err(), "a name collision is a conflict, not a success");
     let calls = rig.journal.calls();
+    // Every other assertion here is a negative, and all of them hold of a sink
+    // that never sent the create at all — in which case the 409 under test
+    // never happened.
+    assert!(
+        calls.iter().any(|r| {
+            r.method == Method::Put
+                && r.path() == path_content(MINE, "Work/plan.md")
+                && r.query().contains("@microsoft.graph.conflictBehavior=fail")
+        }),
+        "the create was sent, so the collision was answered: {calls:#?}"
+    );
     assert!(
         !calls.iter().any(|r| r.mentions("replace")),
         "a collision is never resolved by replacing the other object: {calls:#?}"
@@ -1066,6 +1113,16 @@ fn a_delete_never_escalates_to_permanent_delete_or_a_lock_bypass() {
 
     assert!(out.is_err(), "a locked object was not removed");
     let calls = rig.journal.calls();
+    assert!(
+        calls.iter().any(|r| {
+            r.method == Method::Delete
+                && r.path() == item_url(MINE, "01LOCKED")
+                && r.header("prefer").is_none()
+        }),
+        "the ordinary delete was sent, so the 423 was answered rather than \
+         avoided — everything below this line holds of a sink that sent \
+         nothing: {calls:#?}"
+    );
     assert!(
         !calls.iter().any(|r| r.path().ends_with("/permanentDelete")),
         "the recycle bin is the only recovery a business drive has: {calls:#?}"
@@ -1148,22 +1205,30 @@ fn an_update_with_no_usable_precondition_is_refused_rather_than_written_blind() 
     sink.record_tag(&cloud(MINE, "01NOTES"), "qx:BAJk9sAAAAAAAAAAAAAAAAAAAAA=");
     let out = sink.upload(&path, Some(&cloud(MINE, "01NOTES")));
 
-    let blind: Vec<Rec> = rig
-        .journal
-        .writes()
-        .into_iter()
-        .filter(|r| r.header("if-match").is_none())
-        .collect();
+    // Not "every write carries some if-match": `if-match: *` and `if-match:
+    // qx:BAJk9s…` are both headers, both pass such a check, and both are the
+    // blind overwrite this test exists to forbid — `*` matches any version and
+    // a hash matches none, so the service either ignores the guard or rejects
+    // every attempt forever. There is no precondition this drive can offer, so
+    // the only correct number of conditional updates is zero.
     assert!(
-        blind.is_empty(),
-        "every write carries a precondition or is not sent: {blind:#?}"
+        rig.journal.writes().is_empty(),
+        "a drive whose tags are hashes has no value Graph accepts as a \
+         precondition, so the update is refused rather than sent: {:#?}",
+        rig.journal.calls()
     );
-    if rig.journal.writes().is_empty() {
-        assert!(
-            out.is_err(),
-            "failing closed is an error, never a fabricated Ok"
-        );
-    }
+    assert!(
+        !rig.journal
+            .calls()
+            .iter()
+            .any(|r| r.header("if-match").is_some()),
+        "and nothing is invented to fill the header with: {:#?}",
+        rig.journal.calls()
+    );
+    assert!(
+        out.is_err(),
+        "failing closed is an error, never a fabricated Ok"
+    );
 }
 
 /// A precondition read back from the service immediately before the write is a
@@ -1263,14 +1328,23 @@ fn a_create_states_its_conflict_behaviour_in_the_url_and_it_is_never_replace() {
     let out = sink.upload(&path, None);
 
     let call = only_call(&rig.journal);
+    // The value, not merely the parameter: `=rename` also "states a conflict
+    // behaviour", and it answers a collision by inventing `notes 1.txt` — an
+    // object no local file claims, stamped onto the inode that asked for
+    // `notes.txt`.
     assert!(
-        call.query().contains("@microsoft.graph.conflictBehavior="),
-        "a create states its conflict behaviour in the URL: {}",
+        call.query().contains("@microsoft.graph.conflictBehavior=fail"),
+        "a create declares that a collision is an error: {}",
         call.url
     );
     assert!(
         !call.mentions("replace"),
         "a create never replaces an object it knows nothing about: {}",
+        call.url
+    );
+    assert!(
+        !call.mentions("rename"),
+        "and never accepts a name the user did not choose: {}",
         call.url
     );
     assert_eq!(
@@ -1297,6 +1371,11 @@ fn every_create_session_states_its_conflict_behaviour_and_never_replaces_without
         post(path_session(MINE, "Work/new.bin")),
         vec![ok(session(&u2))],
     );
+    // The update's pre-commit re-read, answered with the version it is based on.
+    rig.script(
+        get(item_url(MINE, "01A")),
+        vec![ok(drive_item("01A", "report.pdf", 900, "c:{G},1"))],
+    );
     for (u, id) in [(&u1, "01A"), (&u2, "01NEW")] {
         rig.script(
             put(u.clone()),
@@ -1309,8 +1388,13 @@ fn every_create_session_states_its_conflict_behaviour_and_never_replaces_without
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let _ = sink.upload(&update, Some(&cloud(MINE, "01A")));
-    let _ = sink.upload(&create, None);
+    let updated = sink.upload(&update, Some(&cloud(MINE, "01A")));
+    let made = sink.upload(&create, None);
+
+    // Both are scripted end to end. Discarding the results let a sink that
+    // creates a session and then abandons it satisfy every assertion below.
+    assert!(updated.is_ok(), "the update must commit: {updated:?}");
+    assert!(made.is_ok(), "the create must commit: {made:?}");
 
     let sessions: Vec<Rec> = rig
         .journal
@@ -1328,15 +1412,23 @@ fn every_create_session_states_its_conflict_behaviour_and_never_replaces_without
             "a session body states its conflict behaviour: {}",
             String::from_utf8_lossy(&s.body)
         );
+        assert_ne!(
+            behaviour.as_deref(),
+            Some("rename"),
+            "and never `rename`, which commits the transfer to an object under a \
+             name no local file holds and leaves the original untouched: {}",
+            String::from_utf8_lossy(&s.body)
+        );
     }
     let create_session = sessions
         .iter()
         .find(|s| s.path() == path_session(MINE, "Work/new.bin"))
         .expect("the create's session");
-    assert_ne!(
+    assert_eq!(
         create_session.json()["item"]["@microsoft.graph.conflictBehavior"].as_str(),
-        Some("replace"),
-        "a sink with no id has never seen the object it would be replacing"
+        Some("fail"),
+        "a sink with no id has never seen the object it would be replacing: {}",
+        String::from_utf8_lossy(&create_session.body)
     );
 }
 
@@ -1350,7 +1442,9 @@ fn every_create_session_states_its_conflict_behaviour_and_never_replaces_without
 /// committed.
 #[test]
 fn a_202_on_the_last_fragment_is_not_a_successful_upload() {
-    let rig = Rig::with_cap("202_is_not_a_commit", 12);
+    // The cap is the anti-loop backstop and has to sit above the bound this
+    // test asserts, or the assertion is one the harness already guarantees.
+    let rig = Rig::with_cap("202_is_not_a_commit", 20);
     let bytes = pattern(12_582_912);
     let path = rig.file("big.bin", &bytes);
     let u = upload_url("S3");
@@ -1384,6 +1478,14 @@ fn a_202_on_the_last_fragment_is_not_a_successful_upload() {
         out.is_err(),
         "Ok is a claim about durability, not about having sent bytes"
     );
+    // Otherwise a sink that stopped before the last fragment passes a test
+    // about what the last fragment's answer means.
+    let frags = fragments(&rig.journal, &u);
+    assert!(
+        frags.iter().any(|(f, _)| f.end + 1 == f.total),
+        "the fragment that completes the file was sent, so the 202 under test \
+         was received: {frags:#?}"
+    );
     assert!(
         rig.journal.calls().len() <= 12,
         "the session must give up, not spin: {} calls",
@@ -1402,6 +1504,13 @@ fn a_202_on_a_fragment_is_progress_and_is_never_a_completed_upload() {
     let u = upload_url("SP");
 
     rig.script(post(item_session(MINE, "01A")), vec![ok(session(&u))]);
+    // The pre-commit re-read, answered with the version the upload is based on.
+    // Without it the final fragment can never be reached and the coverage
+    // assertion below is one no correct sink can satisfy.
+    rig.script(
+        get(item_url(MINE, "01A")),
+        vec![ok(drive_item("01A", "report.pdf", 900, "c:{G},1"))],
+    );
     rig.script(
         put(u.clone()).range("bytes 0-327679/983040"),
         vec![reply(202, accepted(&["327680-"]))],
@@ -1475,6 +1584,13 @@ fn a_file_that_changed_during_a_session_is_not_committed_as_a_splice() {
     let out = sink.upload(&path, Some(&cloud(MINE, "01BIG")));
 
     let frags = fragments(&rig.journal, &u);
+    // The `<= 1` and the loop below are both true of an empty log, and the
+    // rewrite this test turns on only happens once a fragment has been sent.
+    assert!(
+        !frags.is_empty(),
+        "the first fragment was sent, so the save mid-transfer happened: {:#?}",
+        rig.journal.calls()
+    );
     let totals: BTreeSet<u64> = frags.iter().map(|(f, _)| f.total).collect();
     assert!(
         totals.len() <= 1,
@@ -1606,6 +1722,14 @@ fn a_name_conflict_at_commit_is_never_resolved_by_replacing_the_other_object() {
 
     assert!(out.is_err(), "somebody else got there first");
     let calls = rig.journal.calls();
+    // The 409 arrives on the fragment that completes the file. A sink that
+    // never got that far satisfies every negative below without ever meeting
+    // the conflict.
+    let frags = fragments(&rig.journal, &u);
+    assert!(
+        frags.iter().any(|(f, _)| f.end + 1 == f.total),
+        "the whole file crossed the wire and the commit collided: {frags:#?}"
+    );
     assert!(
         !calls.iter().any(|r| r.mentions("replace")),
         "the value `replace` appears in no query and no body: {calls:#?}"
@@ -1693,35 +1817,46 @@ fn a_commit_response_without_a_content_tag_never_yields_ok_with_no_etag() {
         put(u.clone()).range("bytes 655360-983039/983040"),
         vec![created(bare_item("01A", "report.pdf", 983_040))],
     );
+    // Two answers, in order: the pre-commit re-read sees the version this
+    // upload is based on, so the commit is allowed to proceed; the read after
+    // the commit sees the version it produced. One answer of `{G},9` made the
+    // re-check fail, which made `Err` the only reachable outcome and left the
+    // whole test satisfied by the empty arm below.
     rig.script(
         get(item_url(MINE, "01A")),
-        vec![ok(drive_item("01A", "report.pdf", 983_040, "c:{G},9"))],
+        vec![
+            ok(drive_item("01A", "report.pdf", 900, "c:{G},1")),
+            ok(drive_item("01A", "report.pdf", 983_040, "c:{G},9")),
+        ],
     );
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    // The service committed the content. Reporting failure here re-queues an
+    // upload that already happened, forever, so `Err` is not an acceptable way
+    // to avoid inventing a tag — reading the tag back is.
+    let out = sink
+        .upload(&path, Some(&cloud(MINE, "01A")))
+        .expect("the commit succeeded, so the call succeeded");
 
-    match out {
-        Err(_) => {}
-        Ok(u) => {
-            assert_eq!(
-                u.etag.as_deref(),
-                Some("ct:c:{G},9"),
-                "a tag the delta half would also produce, fetched rather than punted"
-            );
-            let calls = rig.journal.calls();
-            let commit = calls
-                .iter()
-                .position(|r| r.range() == Some("bytes 655360-983039/983040"))
-                .expect("the commit");
-            let meta = calls
-                .iter()
-                .position(|r| r.method == Method::Get && r.path() == item_url(MINE, "01A"))
-                .expect("a follow-up metadata read");
-            assert!(meta > commit, "the tag is read back after the commit");
-        }
-    }
+    assert_eq!(
+        out.etag.as_deref(),
+        Some("ct:c:{G},9"),
+        "a tag the delta half would also produce, fetched rather than punted"
+    );
+    let calls = rig.journal.calls();
+    let commit = calls
+        .iter()
+        .position(|r| r.range() == Some("bytes 655360-983039/983040"))
+        .expect("the commit");
+    let meta = calls
+        .iter()
+        .rposition(|r| r.method == Method::Get && r.path() == item_url(MINE, "01A"))
+        .expect("a follow-up metadata read");
+    assert!(
+        meta > commit,
+        "the tag is read back after the commit, not before it: {calls:#?}"
+    );
 }
 
 /// The destination item is untouched until commit, so a failed session has
@@ -1762,6 +1897,11 @@ fn abandoning_a_session_never_deletes_the_drive_item() {
 
     assert!(out.is_err(), "a 400 mid-session is a failure");
     let calls = rig.journal.calls();
+    assert!(
+        fragments(&rig.journal, &u).len() >= 2,
+        "the session reached the fragment that 400s, so there was something to \
+         abandon: {calls:#?}"
+    );
     assert!(
         !calls
             .iter()
@@ -1936,16 +2076,29 @@ fn a_416_is_resolved_by_asking_the_server_where_it_is() {
         .filter(|r| r.path() == item_session(MINE, "01A"))
         .count();
     assert_eq!(sessions, 1, "the session was resumed, not restarted: {calls:#?}");
-    let after_416 = calls
-        .iter()
-        .position(|r| r.range() == Some("bytes 0-327679/655360") && r.method == Method::Put);
-    assert!(after_416.is_some());
+    // `any PUT at bytes 0-327679` is the *first* fragment, sent before the
+    // reset and before the 416 — the flow guarantees it, so asserting it
+    // asserts nothing. What the 416 has to produce is a probe, and then a
+    // transfer that continues from what the probe said rather than from where
+    // the sink thought it was.
+    let first_frag = "bytes 0-327679/655360";
     let status_at = calls
         .iter()
-        .position(|r| r.method == Method::Get && r.url == u);
+        .position(|r| r.method == Method::Get && r.url == u)
+        .unwrap_or_else(|| {
+            panic!("a 416 is resolved by asking the server where it is: {calls:#?}")
+        });
     assert!(
-        status_at.is_some(),
-        "a 416 is resolved by asking the server where it is: {calls:#?}"
+        calls[status_at + 1..]
+            .iter()
+            .any(|r| r.range() == Some("bytes 327680-655359/655360")),
+        "and the transfer continues at the offset the answer named: {calls:#?}"
+    );
+    assert!(
+        !calls[status_at + 1..]
+            .iter()
+            .any(|r| r.method == Method::Put && r.range() == Some(first_frag)),
+        "a range the server has just said it already holds is not sent again: {calls:#?}"
     );
     assert!(
         !calls.iter().any(|r| r.url == u2),
@@ -2056,7 +2209,13 @@ fn a_next_expected_range_is_a_starting_point_not_a_fragment_size() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let _ = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    // Every continuation is scripted through to a commit, so a discarded result
+    // hid the case where the sink gives up after the odd range.
+    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    assert!(
+        out.is_ok(),
+        "a `nextExpectedRanges` entry with an end is not an error: {out:?}"
+    );
 
     let frags = fragments(&rig.journal, &u);
     let second = frags
@@ -2300,6 +2459,13 @@ fn a_404_on_the_final_fragment_is_not_evidence_that_the_commit_happened() {
 
     let calls = rig.journal.calls();
     assert!(
+        calls
+            .iter()
+            .any(|r| r.url == u && r.range() == Some("bytes 327680-655359/655360")),
+        "the final fragment of the first session was sent, so the ambiguous 404 \
+         was actually received: {calls:#?}"
+    );
+    assert!(
         !calls
             .iter()
             .any(|r| r.method == Method::Delete && r.path() == item_url(MINE, "01A")),
@@ -2351,6 +2517,14 @@ fn the_upload_url_never_reaches_the_framework_in_an_error_string() {
     let err = sink
         .upload(&path, Some(&cloud(MINE, "01A")))
         .expect_err("the transport failed");
+
+    // A sink that refused this upload before ever creating a session never held
+    // the secret, and passes a leak test by never having anything to leak.
+    assert!(
+        rig.journal.calls().iter().any(|r| r.url == u),
+        "the sink held the pre-authenticated URL and used it: {:#?}",
+        rig.journal.calls()
+    );
 
     let text = rendered(&err);
     for secret in ["SECRET-TOKEN-9", "sn3302.up.1drv.com", "/up/f00bar"] {
@@ -3036,3 +3210,672 @@ fn sink_is_a_framework_sink<T: Transport + 'static, K: Sleeper + 'static>(
 ) -> Box<dyn Sink> {
     Box::new(s)
 }
+
+// ===========================================================================
+// CLASS J — A placeholder is not content
+//
+// `reclaim::evict` does not truncate in place. It builds a fresh inode, sparse
+// to the object's full size, marks it `user.hydration.dehydrated`, stamps it
+// while still anonymous, and renames it over the path (`place::TmpfilePlacer`).
+// So a dehydrated file is a file of NULs *at the original size*, under the
+// original name, reading as `stamp::State::Clean`.
+//
+// Nothing in the file distinguishes it from real content. Reclaim closes the
+// race from its own side — it answers `Refused::UploadPending` for any inode in
+// `Queue::waiting_set` or `Queue::sending_set` — but that guard is read outside
+// the transfer, and a large upload is minutes long. The sink is the last thing
+// between a placeholder and a commit that replaces the user's document with
+// holes, and that commit is silent: the length matches, so the size check that
+// guards both halves of the framework passes forever.
+// ===========================================================================
+
+/// The whole-file case, which needs no race at all — a resync walk queueing a
+/// placeholder whose stamp went missing is enough. Both writes are scripted to
+/// succeed; only the mark on the file separates them.
+#[test]
+fn a_dehydrated_placeholder_is_never_uploaded_as_content() {
+    let rig = Rig::new("placeholder_is_not_content");
+    let path = rig.file("Work/report.docx", &vec![0u8; 4096]);
+    store::set_xattr(&path, xattr::DEHYDRATED, b"1").expect("the eviction mark");
+
+    rig.script(
+        put(item_content(MINE, "01REPORT")),
+        vec![ok(drive_item("01REPORT", "report.docx", 4096, "c:{G},2"))],
+    );
+    rig.script(
+        put(path_content(MINE, "Work/report.docx")),
+        vec![created(drive_item("01FRESH", "report.docx", 4096, "c:{G},1"))],
+    );
+
+    let mut sink = rig.sink();
+    sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
+    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+
+    assert!(
+        out.is_err(),
+        "a placeholder's holes are not the user's document"
+    );
+    assert!(
+        rig.journal.calls().is_empty(),
+        "the mark is on the file, so the refusal costs no request: {:#?}",
+        rig.journal.calls()
+    );
+}
+
+/// POSITIVE CONTROL for the rule above. "Refuse a body of zeros" and "refuse a
+/// sparse file" both satisfy it, and both silently stop syncing real files: a
+/// freshly `truncate`d database, a disk image, a zeroed test fixture. The mark
+/// is the evidence — the bytes never are, which is exactly why
+/// `xattr::DEHYDRATED` exists rather than an `st_blocks` test.
+#[test]
+fn positive_control_a_file_of_real_zeros_with_no_eviction_mark_uploads() {
+    let rig = Rig::new("real_zeros_still_upload");
+    let path = rig.file("Work/disk.img", &vec![0u8; 4096]);
+
+    rig.script(
+        put(item_content(MINE, "01IMG")),
+        vec![ok(drive_item("01IMG", "disk.img", 4096, "c:{G},2"))],
+    );
+
+    let mut sink = rig.sink();
+    sink.record_tag(&cloud(MINE, "01IMG"), "ct:c:{G},1");
+    let out = sink.upload(&path, Some(&cloud(MINE, "01IMG")));
+
+    assert_eq!(
+        out.expect("a file of zeros is still a file").cloud_id,
+        cloud(MINE, "01IMG")
+    );
+    let call = only_call(&rig.journal);
+    assert_eq!(call.body, vec![0u8; 4096], "and its bytes went out unchanged");
+}
+
+/// The race itself. The eviction lands between two fragments, so the session
+/// began on the user's document and continues on a hole — and every guard the
+/// sink could be carrying agrees the file is unchanged, because the placeholder
+/// has the same size and the same name and its own fresh stamp.
+///
+/// The commit is scripted to succeed. What it would commit is 320 KiB of the
+/// user's report followed by 640 KiB of nothing.
+#[test]
+fn an_eviction_that_lands_mid_session_never_commits_the_placeholders_zeros() {
+    let rig = Rig::with_cap("eviction_mid_session", 20);
+    let bytes = pattern(983_040);
+    let path = rig.file("big.bin", &bytes);
+    let u = upload_url("SEV");
+
+    let evict_at = path.clone();
+    let evict_via = rig.root.join(".big.bin.hydration-1");
+    rig.script(post(item_session(MINE, "01BIG")), vec![ok(session(&u))]);
+    rig.script(
+        get(item_url(MINE, "01BIG")),
+        vec![ok(drive_item("01BIG", "big.bin", 983_040, "c:{G},1"))],
+    );
+    rig.script(
+        put(u.clone()).range("bytes 0-327679/983040"),
+        vec![reply(202, accepted(&["327680-"])).then(effect(move || {
+            // `TmpfilePlacer::place` in miniature: a new inode, sparse to the
+            // object's size, marked before it is sized, swapped in by rename.
+            let f = std::fs::File::create(&evict_via).expect("a placeholder inode");
+            f.set_len(983_040).expect("sparse to the object's size");
+            drop(f);
+            store::set_xattr(&evict_via, xattr::DEHYDRATED, b"1").expect("the mark");
+            let _ = hydration_protocol::stamp::write(&evict_via);
+            std::fs::rename(&evict_via, &evict_at).expect("reclaim swaps the placeholder in");
+        }))],
+    );
+    // Both continuations and the commit, scripted to succeed.
+    rig.script(
+        put(u.clone()).range("bytes 327680-655359/983040"),
+        vec![reply(202, accepted(&["655360-"]))],
+    );
+    rig.script(
+        put(u.clone()).range("bytes 655360-983039/983040"),
+        vec![created(drive_item("01BIG", "big.bin", 983_040, "c:{G},9"))],
+    );
+    rig.script(del(u.clone()), vec![no_content()]);
+
+    let mut sink = rig.sink_policy(session_policy());
+    sink.record_tag(&cloud(MINE, "01BIG"), "ct:c:{G},1");
+    let out = sink.upload(&path, Some(&cloud(MINE, "01BIG")));
+
+    let frags = fragments(&rig.journal, &u);
+    for (f, body) in &frags {
+        assert!(
+            !(body.len() > 16 && body.iter().all(|b| *b == 0)),
+            "the fragment at {}-{} is the placeholder's hole, not the file: {f:?}",
+            f.start,
+            f.end
+        );
+    }
+    assert!(
+        !frags.iter().any(|(f, _)| f.end + 1 == f.total),
+        "nothing commits over a file that became a placeholder under it: {frags:#?}"
+    );
+    assert!(
+        out.is_err(),
+        "the content this session described no longer exists on this machine"
+    );
+}
+
+// ===========================================================================
+// CLASS K — §5.5, at the moment the upload *starts*
+//
+// §5.5 states the absence rule about the moment an upload finishes, and
+// `run_upload` implements it there. The moment it starts is the same fact and is
+// specified nowhere: `run_upload` resolves the path, takes
+// `std::fs::metadata(&path).ok()` — which folds `ENOENT` into `None` — and calls
+// `sink.upload` anyway. So the sink is routinely handed a path that no longer
+// exists, and the two shortest ways to write the read each turn that into a
+// commit. `fs::read(path).unwrap_or_default()` replaces the user's document with
+// an empty object; a per-path cache of what the last call sent restores the file
+// they just deleted, which is bug #51 moved one layer down.
+// ===========================================================================
+
+#[test]
+fn a_file_that_is_gone_is_never_uploaded_as_an_empty_object_or_from_a_remembered_copy() {
+    // (a) The path never existed. Every write is scripted to succeed.
+    let a = Rig::new("gone_never_existed");
+    a.script(
+        put(item_content(MINE, "01REPORT")),
+        vec![ok(drive_item("01REPORT", "report.docx", 0, "c:{G},2"))],
+    );
+    a.script(
+        put(path_content(MINE, "Work/report.docx")),
+        vec![created(drive_item("01FRESH", "report.docx", 0, "c:{G},1"))],
+    );
+
+    let mut sink = a.sink();
+    sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
+    let out = sink.upload(
+        &a.root.join("Work/report.docx"),
+        Some(&cloud(MINE, "01REPORT")),
+    );
+
+    assert!(out.is_err(), "a file that is not there has no content to send");
+    assert!(
+        a.journal.calls().is_empty(),
+        "the absence is local, and is discovered before a request rather than \
+         after a response: {:#?}",
+        a.journal.calls()
+    );
+
+    // (b) The path existed and was sent once, then deleted. A sink holding the
+    // bytes of the first call answers the second from memory, and the file the
+    // user deleted is back in the cloud with its contents.
+    let b = Rig::new("gone_after_a_send");
+    let path = b.file("Work/report.docx", b"the document");
+    b.script(
+        put(item_content(MINE, "01REPORT")),
+        vec![
+            ok(drive_item("01REPORT", "report.docx", 12, "c:{G},2")),
+            ok(drive_item("01REPORT", "report.docx", 12, "c:{G},3")),
+        ],
+    );
+
+    let mut sink = b.sink();
+    sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
+    sink.upload(&path, Some(&cloud(MINE, "01REPORT")))
+        .expect("the first send succeeds");
+    std::fs::remove_file(&path).expect("the user deletes the file");
+    b.journal.clear();
+
+    let again = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    assert!(again.is_err(), "the file is gone; there is nothing to send");
+    assert!(
+        b.journal.calls().is_empty(),
+        "not one byte of a remembered copy reached the wire: {:#?}",
+        b.journal.calls()
+    );
+
+    // (c) POSITIVE CONTROL. An empty file that *exists* is content. Refusing it
+    // leaves the pre-truncation version in the cloud permanently, and the next
+    // delta pass puts it back over the user's now-empty file.
+    let c = Rig::new("empty_file_still_uploads");
+    let empty = c.file("Work/notes.txt", b"");
+    c.script(
+        put(item_content(MINE, "01NOTES")),
+        vec![ok(drive_item("01NOTES", "notes.txt", 0, "c:{G},2"))],
+    );
+
+    let mut sink = c.sink();
+    sink.record_tag(&cloud(MINE, "01NOTES"), "ct:c:{G},1");
+    let out = sink
+        .upload(&empty, Some(&cloud(MINE, "01NOTES")))
+        .expect("an empty file is a file");
+
+    assert_eq!(out.cloud_id, cloud(MINE, "01NOTES"));
+    let call = only_call(&c.journal);
+    assert!(call.body.is_empty(), "and it is sent as zero bytes");
+}
+
+// ===========================================================================
+// CLASS L — A throttle is not a verdict
+//
+// The `Sleeper` is injected and recording and `Reply` carries `retry_after`, and
+// until this class nothing made either of them say anything: every test above
+// asserts `sleeps().is_empty()`. So the whole retry path was unspecified — and
+// the retry is where a precondition goes missing, because the first attempt is
+// built from the recorded tag and the natural loop rebuilds the request from
+// whatever is still in scope.
+// ===========================================================================
+
+/// `429 activityLimitReached` is the single most common thing a busy drive
+/// answers, so a retry that drops `if-match` is not a rare path — it is most
+/// writes, and each one destroys the remote edit the precondition existed to
+/// catch. The unconditional retry is scripted to succeed.
+#[test]
+fn a_throttled_write_is_retried_with_its_precondition_and_after_the_advertised_delay() {
+    let rig = Rig::new("throttle_keeps_the_precondition");
+    let path = rig.file("Work/report.docx", b"hello world!");
+
+    rig.script(
+        put(item_content(MINE, "01REPORT")).with("if-match"),
+        vec![
+            throttled(
+                429,
+                graph_error("activityLimitReached"),
+                Duration::from_secs(7),
+            ),
+            ok(drive_item("01REPORT", "report.docx", 12, "c:{G},2")),
+        ],
+    );
+    rig.script(
+        put(item_content(MINE, "01REPORT")).without("if-match"),
+        vec![ok(drive_item("01REPORT", "report.docx", 12, "c:{G},9"))],
+    );
+
+    let mut sink = rig.sink();
+    sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
+    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+
+    assert_eq!(
+        out.expect("a 429 is the service asking for a moment, not refusing")
+            .etag
+            .as_deref(),
+        Some("ct:c:{G},2"),
+        "and the version that landed is the conditional write's"
+    );
+    let blind: Vec<Rec> = rig
+        .journal
+        .writes()
+        .into_iter()
+        .filter(|r| r.header("if-match").is_none())
+        .collect();
+    assert!(
+        blind.is_empty(),
+        "a retry carries the precondition its first attempt did: {blind:#?}"
+    );
+
+    let sleeps = rig.journal.sleeps();
+    assert_eq!(sleeps.len(), 1, "one backoff for one throttle: {sleeps:?}");
+    assert!(
+        sleeps[0] >= Duration::from_secs(7),
+        "the service named its interval, and it is not ours to shorten: {sleeps:?}"
+    );
+
+    // The shared journal is what makes this an ordering claim rather than a
+    // presence one: a sink that sleeps *after* its last attempt has honoured
+    // nothing.
+    let events = rig.journal.all();
+    let first = events
+        .iter()
+        .position(|e| matches!(e, Ev::Call(_)))
+        .expect("a first attempt");
+    let slept = events
+        .iter()
+        .position(|e| matches!(e, Ev::Slept(_)))
+        .expect("a backoff");
+    let retry = events
+        .iter()
+        .rposition(|e| matches!(e, Ev::Call(_)))
+        .expect("a retry");
+    assert!(
+        first < slept && slept < retry,
+        "the wait falls between the attempts: {events:#?}"
+    );
+}
+
+/// `an_existing_id_the_service_no_longer_has_becomes_a_create` makes a `404` on
+/// an update become a create, and it is the only place in this file where a
+/// failed update is allowed to become one. The dangerous generalisation is one
+/// token wide — `if !reply.ok()` where `if reply.status == 404` was meant — and
+/// it passes every test written before this one. A throttle answered by a create
+/// mints a second object holding the same document under the same name; the two
+/// then chase each other, and whichever loses a pass is overwritten.
+#[test]
+fn a_transient_failure_on_an_update_never_becomes_a_create() {
+    let rig = Rig::with_cap("transient_is_not_a_missing_item", 12);
+    let path = rig.file("Work/report.docx", b"hello world!");
+
+    rig.script(
+        put(item_content(MINE, "01REPORT")),
+        vec![throttled(
+            503,
+            graph_error("serviceNotAvailable"),
+            Duration::from_secs(2),
+        )],
+    );
+    // The create, scripted to succeed and to mint the duplicate.
+    rig.script(
+        put(path_content(MINE, "Work/report.docx")),
+        vec![created(drive_item("01DUP", "report.docx", 12, "c:{G},1"))],
+    );
+
+    let mut sink = rig.sink();
+    sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
+    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+
+    assert!(out.is_err(), "the service never accepted the write");
+    let calls = rig.journal.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|r| r.path() == path_content(MINE, "Work/report.docx")),
+        "`the service is busy` is not `the object is gone`: {calls:#?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|r| r.path() == item_content(MINE, "01REPORT")),
+        "only the update itself was retried: {calls:#?}"
+    );
+    assert!(
+        calls.len() <= 6,
+        "the retry must terminate; it made {} attempts",
+        calls.len()
+    );
+    assert!(
+        !rig.journal.sleeps().is_empty(),
+        "and it waited between them rather than spinning: {:#?}",
+        rig.journal.all()
+    );
+}
+
+// ===========================================================================
+// CLASS M — The one call whose whole purpose is destruction
+// ===========================================================================
+
+/// `remove` sends `DELETE /items/{id}` and nothing else. §5.5 makes the local
+/// delete win, and it is right about the *file* it was told about; it says
+/// nothing about the *version* the object holds. The two meet on `run_upload`'s
+/// delete-during-upload path, which removes `uploaded.cloud_id` — an id this
+/// sink wrote seconds earlier and whose tag it therefore knows. If another
+/// device committed in between, an unconditional `DELETE` recycle-bins work that
+/// was never on this machine at all.
+///
+/// The positive control already exists:
+/// `positive_control_remove_deletes_once_and_an_already_gone_object_is_success`
+/// removes an id this sink has no tag for and must still succeed. A precondition
+/// the sink cannot supply is not a reason to strand the user's delete.
+#[test]
+fn remove_carries_the_tag_it_recorded_rather_than_deleting_a_version_it_never_saw() {
+    let rig = Rig::new("remove_is_conditional_when_it_can_be");
+    // The unconditional form, scripted to succeed.
+    rig.script(
+        del(item_url(MINE, "01DOOMED")).without("if-match"),
+        vec![no_content()],
+    );
+    rig.script(
+        del(item_url(MINE, "01DOOMED")).with("if-match"),
+        vec![no_content()],
+    );
+
+    let mut sink = rig.sink();
+    sink.record_tag(&cloud(MINE, "01DOOMED"), "ct:c:{G},9");
+    let out = sink.remove(&cloud(MINE, "01DOOMED"));
+
+    assert!(out.is_ok(), "the object was removed");
+    let call = only_call(&rig.journal);
+    assert_eq!(
+        call.header("if-match"),
+        Some("c:{G},9"),
+        "the delete is conditional on the version this sink last wrote"
+    );
+}
+
+/// The other half. A `412` on that delete is another device's newer version
+/// saying so, and re-issuing without the precondition is the same instinct as
+/// retrying a `412` on a write — except that a `DELETE` has no version history
+/// behind it to recover from. Re-reading and deleting again *conditionally* is a
+/// defensible answer and passes; dropping the guard is not and does not.
+#[test]
+fn a_412_on_a_conditional_remove_is_never_retried_unconditionally() {
+    let rig = Rig::with_cap("remove_412_keeps_its_guard", 8);
+    rig.script(
+        del(item_url(MINE, "01DOOMED")).with("if-match"),
+        vec![reply(412, graph_error("resourceModified"))],
+    );
+    // The escape, scripted to succeed.
+    rig.script(
+        del(item_url(MINE, "01DOOMED")).without("if-match"),
+        vec![no_content()],
+    );
+    rig.script(
+        get(item_url(MINE, "01DOOMED")),
+        vec![ok(drive_item("01DOOMED", "report.docx", 12, "c:{G},12"))],
+    );
+
+    let mut sink = rig.sink();
+    sink.record_tag(&cloud(MINE, "01DOOMED"), "ct:c:{G},9");
+    let _ = sink.remove(&cloud(MINE, "01DOOMED"));
+
+    let unconditional: Vec<Rec> = rig
+        .journal
+        .deletes()
+        .into_iter()
+        .filter(|r| r.header("if-match").is_none())
+        .collect();
+    assert!(
+        unconditional.is_empty(),
+        "a delete that lost its race went out again with no guard at all: \
+         {unconditional:#?}"
+    );
+    assert!(
+        rig.journal.calls().len() <= 4,
+        "and it terminated; it made {} attempts",
+        rig.journal.calls().len()
+    );
+}
+
+// ===========================================================================
+// CLASS N — The framework side of the same seam
+//
+// Everything above drives `GraphSink` and reads the wire. These two drive
+// `run_upload` and read the *file*, because the two rules they check are ones no
+// `Sink` can keep on its own: what the framework asks the sink to do about a
+// rename, and what it records as sent afterwards. They live here because the
+// contract they check is this file's subject seen from the other side — the
+// double below is a `Sink`, and the only thing it adds is the one property the
+// real service has and `Uploaded` does not carry: an object has a *name*.
+// ===========================================================================
+
+/// A `Sink` that models object naming exactly as Class A requires a real one to
+/// behave: a create takes its name from the path, and an update addressed by id
+/// writes content and leaves the name alone.
+#[derive(Clone, Default)]
+struct FakeCloud {
+    /// `(cloud_id, name)`, in creation order.
+    objects: Arc<Mutex<Vec<(String, String)>>>,
+    calls: Arc<Mutex<Vec<(PathBuf, Option<String>)>>>,
+    removed: Arc<Mutex<Vec<String>>>,
+    /// Run as each call returns — the same "the world moved while the bytes
+    /// were in flight" device `Wire` uses, one per call, in order.
+    on_return: Arc<Mutex<Vec<Effect>>>,
+}
+
+impl FakeCloud {
+    fn arrange(&self, f: Effect) {
+        self.on_return.lock().unwrap().push(f);
+    }
+
+    fn name_of(&self, cloud_id: &str) -> Option<String> {
+        self.objects
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, _)| id == cloud_id)
+            .map(|(_, name)| name.clone())
+    }
+}
+
+impl Sink for FakeCloud {
+    fn upload(&mut self, path: &std::path::Path, existing: Option<&str>) -> io::Result<Uploaded> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((path.to_path_buf(), existing.map(str::to_string)));
+
+        let cloud_id = match existing {
+            // An update addresses the id (Class A). The service writes the
+            // content; the object keeps the name it already had.
+            Some(id) => id.to_string(),
+            None => {
+                let name = path
+                    .file_name()
+                    .expect("a create is addressed by path")
+                    .to_string_lossy()
+                    .into_owned();
+                let id = {
+                    let mut objects = self.objects.lock().unwrap();
+                    let id = format!("b!mine|01OBJ{}", objects.len());
+                    objects.push((id.clone(), name));
+                    id
+                };
+                id
+            }
+        };
+
+        let effect = {
+            let mut queue = self.on_return.lock().unwrap();
+            (!queue.is_empty()).then(|| queue.remove(0))
+        };
+        if let Some(f) = effect {
+            f();
+        }
+
+        Ok(Uploaded {
+            cloud_id,
+            etag: Some("ct:c:{G},9".into()),
+        })
+    }
+
+    fn remove(&mut self, cloud_id: &str) -> io::Result<()> {
+        self.removed.lock().unwrap().push(cloud_id.to_string());
+        self.objects.lock().unwrap().retain(|(id, _)| id != cloud_id);
+        Ok(())
+    }
+}
+
+/// §5.4's guarantee is that no upload can succeed under a name the file does not
+/// have when the bytes are sent, and the framework's own repair path is where it
+/// is lost. `run_upload` answers a rename-mid-upload by calling
+/// `sink.upload(&moved.path, Some(&uploaded.cloud_id))`, and Class A requires
+/// that an update address the id. Both rules kept literally leave the object
+/// named whatever the atomic save's temp file was called — the bytes are right,
+/// the name is `report.docx.tmp.194149`, and bug #52 is back, reached through
+/// the code written to prevent it.
+///
+/// The sink cannot fix this on its own: `positive_control_an_ordinary_update_..`
+/// pins an update at exactly one request, so `GraphSink` never learns the remote
+/// name and has nothing to compare. The decision belongs to `run_upload`, which
+/// is the only layer that knows the name changed.
+#[test]
+fn the_object_that_ends_up_holding_the_bytes_is_named_what_the_file_is_named() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = scratch("rename_mid_upload_names_the_object");
+    let temp = root.join("report.docx.tmp.194149");
+    let real = root.join("report.docx");
+    std::fs::write(&temp, b"the document, saved atomically").expect("the temp file");
+
+    let md = std::fs::metadata(&temp).expect("the temp file");
+    let file = FileId {
+        fsid: md.dev(),
+        ino: md.ino(),
+    };
+
+    let mut store = Store::new();
+    store.scan(&root).expect("a scan of the sync root");
+
+    let service = FakeCloud::default();
+    // The rename lands while the first upload is in flight. §5.4's normal case,
+    // and what `run_upload`'s second `lookup` is there to notice.
+    let (from, to) = (temp.clone(), real.clone());
+    service.arrange(effect(move || {
+        std::fs::rename(&from, &to).expect("the atomic save completes");
+    }));
+
+    let mut sink = service.clone();
+    let outcome = run_upload(file, &mut store, &mut sink);
+
+    let RunOutcome::Sent { cloud_id } = &outcome else {
+        panic!("the resend must land the bytes somewhere: {outcome:?}");
+    };
+    assert_eq!(
+        service.name_of(cloud_id).as_deref(),
+        Some("report.docx"),
+        "the object holding the user's document is named after the temp file the \
+         save used, so every other device downloads `report.docx.tmp.194149` and \
+         `report.docx` exists nowhere in the cloud. calls: {:#?}",
+        service.calls.lock().unwrap()
+    );
+}
+
+/// The main path stamps from `sent_state`, captured before the sink read a byte,
+/// and its comment explains at length why anything else destroys an edit made
+/// during the transfer. The rename path four lines above it does the opposite:
+/// `std::fs::metadata(&moved.path)` *after* the resend returned. So an edit that
+/// lands during the resend is stamped as sent — it is never re-queued, reclaim
+/// reads it as `Clean` and is free to evict it, and the next remote change
+/// overwrites it. `stamp::write_as` documents this exact hazard in its own
+/// doc comment.
+#[test]
+fn the_stamp_written_after_a_rename_never_blesses_an_edit_that_was_not_sent() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = scratch("stamp_after_a_rename");
+    let temp = root.join("notes.txt.tmp.5089");
+    let real = root.join("notes.txt");
+    std::fs::write(&temp, b"the note as it was sent").expect("the temp file");
+
+    let md = std::fs::metadata(&temp).expect("the temp file");
+    let file = FileId {
+        fsid: md.dev(),
+        ino: md.ino(),
+    };
+
+    let mut store = Store::new();
+    store.scan(&root).expect("a scan of the sync root");
+
+    let service = FakeCloud::default();
+    let (from, to) = (temp.clone(), real.clone());
+    service.arrange(effect(move || {
+        std::fs::rename(&from, &to).expect("the atomic save completes");
+    }));
+    // The user saves again while the *resend* is in flight. A longer document,
+    // so the stamp cannot compare equal by accident at any mtime granularity.
+    let edited = real.clone();
+    service.arrange(effect(move || {
+        std::fs::write(
+            &edited,
+            b"the note, with a paragraph added while the resend was still in flight",
+        )
+        .expect("the user saved again");
+    }));
+
+    let mut sink = service.clone();
+    let outcome = run_upload(file, &mut store, &mut sink);
+    assert!(
+        matches!(outcome, RunOutcome::Sent { .. }),
+        "the resend path was taken: {outcome:?}"
+    );
+
+    assert_ne!(
+        stamp::state(&real).expect("a stamp state"),
+        stamp::State::Clean,
+        "the file reads as already sent over a paragraph that never left the \
+         machine: it is not re-queued, reclaim may evict it, and the next delta \
+         pass replaces it with a placeholder for the version without it"
+    );
+}
+
