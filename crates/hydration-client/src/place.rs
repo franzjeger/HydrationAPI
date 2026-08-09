@@ -68,6 +68,33 @@ impl TmpfilePlacer {
         &self.root
     }
 
+    /// Remove scratch names left by a crash between `linkat` and `rename`.
+    ///
+    /// The window is small and what it leaves behind is a complete, correct
+    /// placeholder rather than anything dangerous — but it is visible in the
+    /// user's sync folder and will never be cleaned up by anything else, so it
+    /// is swept at startup. Recursive, because placeholders are created at
+    /// whatever depth the cloud says.
+    pub fn sweep_scratch(root: &Path) -> io::Result<usize> {
+        let mut removed = 0;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push(e.path());
+                } else if is_scratch(&name) && std::fs::remove_file(e.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     /// An anonymous inode on the same filesystem as `dir`.
     ///
     /// Same filesystem is not a preference: `linkat` cannot cross one, so an
@@ -114,13 +141,6 @@ impl TmpfilePlacer {
         (r == 0).then_some(()).ok_or_else(io::Error::last_os_error)
     }
 
-    fn unset(fd: &OwnedFd, name: &str) -> io::Result<()> {
-        let n = std::ffi::CString::new(name)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xattr name"))?;
-        let r = unsafe { libc::fremovexattr(fd.as_raw_fd(), n.as_ptr()) };
-        (r == 0).then_some(()).ok_or_else(io::Error::last_os_error)
-    }
-
     /// Give the anonymous inode a name.
     ///
     /// `linkat` refuses to replace an existing name, which is what makes it safe
@@ -146,6 +166,24 @@ impl TmpfilePlacer {
             let _ = std::fs::remove_file(&scratch);
         })
     }
+}
+
+/// Exactly the names [`TmpfilePlacer`] creates: `.<base>.hydration-<seq>`.
+///
+/// The trailing digits are what make this specific rather than a prefix match.
+/// A looser test matched `.hydration-manifest` — the file §6d exists to produce,
+/// whose whole purpose is to survive and tell a restoring user what a backup
+/// left out. A cleanup routine that quietly deletes it is the same class of
+/// failure as everything else here: something reporting success for work it
+/// destroyed.
+fn is_scratch(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((base, seq)) = rest.rsplit_once(".hydration-") else {
+        return false;
+    };
+    !base.is_empty() && !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn linkat(proc_path: &str, target: &Path) -> io::Result<()> {
@@ -179,33 +217,29 @@ impl Materialise for TmpfilePlacer {
 
         let fd = Self::anonymous(dir)?;
 
-        // Order is load-bearing, and it is the reason this works at all.
+        // Order is load-bearing. Every xattr goes on before the file has a size
+        // and long before it has a name, so the inode is never observable in a
+        // half-built state: it is either anonymous and incomplete, or named and
+        // finished.
         //
-        // The construction mark has to be on the inode *before* the event fires,
-        // or the worker sees an unmarked file and treats it as one: it leaves a
-        // permanent ignore mark, which then follows the inode through `linkat`
-        // into the sync directory and produces a placeholder that is silently
-        // never intercepted again. That is this project's recurring trap — a
-        // write inside a marked mount by the one process that could answer the
-        // event — in its sixth disguise, and the ordering here is what disarms
-        // it.
-        Self::set(&fd, xattr::BUILDING, b"1")?;
+        // The mark in particular has to precede the sizing, or the worker sees
+        // an unmarked file, concludes its content is already present, and leaves
+        // a permanent ignore mark — which then follows the inode through
+        // `linkat` into the sync directory and produces a placeholder that is
+        // silently never intercepted again. That is this project's recurring
+        // trap (§6a-ter) in its sixth disguise.
         Self::set(&fd, xattr::DEHYDRATED, b"1")?;
         Self::set(&fd, store::XATTR_ID, cloud_id.as_bytes())?;
         if let Some(e) = etag {
             Self::set(&fd, store::XATTR_ETAG, e.as_bytes())?;
         }
 
-        // The one event. Answered by the worker's nameless rule.
+        // The one event. The worker allows it because the inode is nameless and
+        // still empty — the event precedes the truncate — and an empty file has
+        // no content anyone could be served instead of the real thing.
         if unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) } < 0 {
             return Err(io::Error::last_os_error());
         }
-
-        // Cleared before the inode has a name, so a file with a name never
-        // carries it. If this failed we would be linking in a file the worker
-        // would later allow without hydrating — a file that reads as zeros — so
-        // it is an error and not a cleanup step.
-        Self::unset(&fd, xattr::BUILDING)?;
 
         self.seq += 1;
         Self::link_into_place(&fd, path, self.seq)
@@ -259,20 +293,26 @@ mod tests {
             .is_some());
     }
 
-    /// A file carrying the construction mark is one the worker will allow
-    /// without hydrating. If one ever reached the sync directory it would read
-    /// as zeros, so its absence is the invariant, not a tidiness check.
+    /// A regression guard against a mechanism that was removed for being
+    /// exploitable.
+    ///
+    /// The first version of placeholder creation set `user.hydration.building`
+    /// and the helper trusted it to allow an event without hydrating. Any
+    /// process with the file's uid can set that xattr, so forging it on a real
+    /// placeholder made the helper serve zeros to a reader. The name is asserted
+    /// absent here so that reintroducing the mark shows up as a failing test
+    /// rather than as a passing one.
     #[test]
-    fn a_linked_placeholder_never_carries_the_construction_mark() {
-        let dir = scratch("no-building-mark");
+    fn the_placer_writes_no_xattr_the_helper_would_trust() {
+        let dir = scratch("no-trusted-xattr");
         let mut p = TmpfilePlacer::new(&dir);
         let target = dir.join("a.bin");
         p.place(&target, 128, "cloud-1", None).unwrap();
 
         assert_eq!(
-            store::get_xattr(&target, xattr::BUILDING).unwrap(),
+            store::get_xattr(&target, "user.hydration.building").unwrap(),
             None,
-            "a named file carries the construction mark: it would read as zeros"
+            "the construction mark is back; it is forgeable and must not be trusted"
         );
     }
 
@@ -307,6 +347,39 @@ mod tests {
             .filter(|n| n.contains("hydration-"))
             .collect();
         assert!(leftovers.is_empty(), "scratch names left behind: {leftovers:?}");
+    }
+
+    /// A crash between `linkat` and `rename` leaves a complete placeholder under
+    /// a scratch name. Harmless to read, but it is litter in the user's folder
+    /// and nothing else would ever remove it.
+    #[test]
+    fn scratch_names_left_by_a_crash_are_swept() {
+        let dir = scratch("sweep");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join(".a.bin.hydration-3"), b"").unwrap();
+        std::fs::write(dir.join("sub/.b.bin.hydration-9"), b"").unwrap();
+        std::fs::write(dir.join("keep.txt"), b"x").unwrap();
+        std::fs::write(dir.join(".hydration-manifest"), b"x").unwrap();
+
+        assert_eq!(TmpfilePlacer::sweep_scratch(&dir).unwrap(), 2);
+        assert!(dir.join("keep.txt").exists());
+        assert!(
+            dir.join(".hydration-manifest").exists(),
+            "the sweep took the manifest, which is not scratch"
+        );
+    }
+
+    #[test]
+    fn the_scratch_pattern_matches_only_what_the_placer_creates() {
+        assert!(is_scratch(".report.pdf.hydration-7"));
+        assert!(is_scratch(".a.hydration-12"));
+        // The manifest, and everything else a user might reasonably have.
+        assert!(!is_scratch(".hydration-manifest"));
+        assert!(!is_scratch(".hydration-manifest.tmp"));
+        assert!(!is_scratch(".hydration-"));
+        assert!(!is_scratch("report.pdf"));
+        assert!(!is_scratch(".bashrc"));
+        assert!(!is_scratch(".notes.hydration-draft"));
     }
 
     #[test]

@@ -34,9 +34,9 @@ pub enum Handled {
     Hydrated {
         bytes: u64,
     },
-    /// An anonymous inode being built into a placeholder. Allowed without
-    /// hydrating: it has no name, so nothing can be reading it.
-    Nameless,
+    /// A placeholder with no name and no content. Allowed without fetching,
+    /// because there is nothing to fetch.
+    Empty,
     /// Already had content: nothing to do but let it through.
     AlreadyPresent,
     Denied {
@@ -94,7 +94,7 @@ impl<F: Fetch> Worker<F> {
             );
         }
         let r = match &outcome {
-            Handled::Hydrated { .. } | Handled::AlreadyPresent | Handled::Nameless => {
+            Handled::Hydrated { .. } | Handled::AlreadyPresent | Handled::Empty => {
                 allow(&self.group, fd)
             }
             Handled::Denied { .. } | Handled::Failed { .. } => deny(&self.group, fd),
@@ -111,22 +111,6 @@ impl<F: Fetch> Worker<F> {
     }
 
     fn decide_and_fill(&mut self, ev: &fanotify::Event) -> Handled {
-        // A placeholder under construction, on an inode with no name.
-        //
-        // The unprivileged daemon builds placeholders on an `O_TMPFILE` inode
-        // and links them in complete. Sizing one still fires a pre-content
-        // event — measured — but the inode has no name, so no reader can have
-        // it open and there is nothing to serve wrongly. Allowing it is what
-        // keeps placeholder creation entirely on the unprivileged side, so the
-        // privileged half never accepts a destination (§6b).
-        //
-        // Both halves of the test are load-bearing. `nlink == 0` alone also
-        // describes a genuine placeholder that someone unlinked while reading
-        // it, and allowing that would hand the reader zeros.
-        if let Some(outcome) = self.nameless_under_construction(ev.fd) {
-            return outcome;
-        }
-
         let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(ev.fd) };
 
         // Everything the decision needs comes from the descriptor, not from a
@@ -157,6 +141,29 @@ impl<F: Fetch> Worker<F> {
                     reason: format!("could not read the placeholder mark: {e}"),
                 }
             }
+        }
+
+        // A marked placeholder that has neither a name nor any content.
+        //
+        // This is how a placeholder gets created at all. The unprivileged daemon
+        // builds one on an `O_TMPFILE` inode and links it in complete; sizing it
+        // fires a pre-content event (measured — `probes/tmpfile.c`) that only
+        // this process can answer, and answering it the ordinary way is
+        // impossible because an anonymous inode has no cloud object yet.
+        //
+        // What makes allowing it safe is not that the daemon says so. It is that
+        // the file is empty at the moment the event fires: the event precedes
+        // the truncate, so there are no bytes here that a reader could be served
+        // instead of real content. Allowing an empty file is not a shortcut past
+        // hydration — it is what hydrating an empty file would do.
+        //
+        // The first version of this rule trusted a `user.hydration.building`
+        // xattr instead, and that was exploitable: any process with the file's
+        // uid can set it, so an attacker could mark a real placeholder, let a
+        // reader block on it, unlink it, and have the helper serve zeros. The
+        // discriminator has to be a property of the file, not a claim about it.
+        if let Some(outcome) = self.nothing_to_serve(ev.fd) {
+            return outcome;
         }
 
         let cgroup = ev.pidfd.and_then(|pfd| {
@@ -215,19 +222,23 @@ impl<F: Fetch> Worker<F> {
         }
     }
 
-    /// `Some(Nameless)` when this event is a placeholder being constructed.
-    fn nameless_under_construction(&self, fd: i32) -> Option<Handled> {
-        use std::os::fd::{AsRawFd, BorrowedFd};
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    /// `Some(Empty)` when there is provably nothing to serve.
+    ///
+    /// Both conditions are properties the kernel reports, not assertions anyone
+    /// makes, which is the entire point:
+    ///
+    /// - `st_size == 0` — no bytes exist, so no reader can receive the wrong
+    ///   ones. This is what carries the safety argument.
+    /// - `st_nlink == 0` — no name, so nothing can even reach it. Not required
+    ///   for safety; it keeps the rule to the case that needs it, so a named
+    ///   empty placeholder still takes the ordinary path and has its mark
+    ///   cleared properly.
+    fn nothing_to_serve(&self, fd: i32) -> Option<Handled> {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(borrowed.as_raw_fd(), &mut st) } < 0 || st.st_nlink != 0 {
+        if unsafe { libc::fstat(fd, &mut st) } < 0 {
             return None;
         }
-        let name = std::ffi::CString::new(hydration_protocol::xattr::BUILDING).ok()?;
-        let present =
-            unsafe { libc::fgetxattr(borrowed.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) }
-                >= 0;
-        present.then_some(Handled::Nameless)
+        (st.st_nlink == 0 && st.st_size == 0).then_some(Handled::Empty)
     }
 
     /// Run until the deadline, answering everything that arrives.

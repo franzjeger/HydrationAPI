@@ -786,16 +786,52 @@ events during linkat:           0
 result: size=4096 blocks=0, dehydrated mark present
 ```
 
-Størrelsessettingen er altså **ikke** stille. Den ene hendelsen den utløser er
-det arbeideren svarer på med én smal regel: en inode med `nlink == 0` som bærer
-`user.hydration.building` har ingen leser som kan bli servert feil, fordi
-ingenting kan åpne den. Begge halvdelene bærer: `nlink == 0` alene beskriver
-også en ekte placeholder som noen avlinket mens den var åpen, og å slippe
-*den* gjennom ville gitt leseren nuller.
+Størrelsessettingen er altså **ikke** stille. Den ene hendelsen den utløser
+svarer arbeideren på med én smal regel — men hvilken regel er hele poenget, og
+det første forsøket var utnyttbart.
+
+**Det som ikke virket, og hvorfor det er verdt å skrive ned.** Første versjon
+slapp gjennom en inode med `nlink == 0` som bar et merke `user.hydration.building`,
+satt av daemonen mens den bygget. Argumentet var at en inode uten navn ikke kan
+åpnes, så ingen leser kan bli servert feil. Argumentet er usant: `nlink == 0`
+betyr *uoppnåelig via et nytt navn*, ikke *ingen åpne deskriptorer*. En fil som
+åpnes og så avlinkes har `nlink == 0` med en leser parkert i `read()`. Det eneste
+som skilte det trygge tilfellet fra det farlige var merket — og et `user.*`-xattr
+kan settes av enhver prosess med filens uid, som i denne trusselmodellen er
+motstanderen. Målt angrep:
+
+1. angriper setter merket på en ekte placeholder den eier — ingen privilegier
+2. offeret åpner og leser; lesingen blokkerer på pre-content-hendelsen
+3. angriper avlinker filen — ikke en innholdstilgang, så ingen hendelse
+4. arbeideren ser `nlink == 0` og merket, og slipper gjennom uten å hydrere
+5. offeret får nuller og arkiverer dem som innhold
+
+Det omgikk også §6c fullstendig, siden snarveien lå foran policy-porten: en
+backup som skulle vært nektet med `EIO` — det trygge svaret — ble i stedet
+sluppet gjennom med nuller.
+
+**Regelen som holder** bruker ingen påstand, bare en egenskap kjernen selv
+rapporterer: **`nlink == 0 && st_size == 0`.** Hendelsen fyrer *før* `ftruncate`
+tar effekt, så inoden er fortsatt tom når arbeideren ser den (målt). En tom fil
+har ingen byte noen kan bli servert i stedet for ekte innhold, så å slippe den
+gjennom er ikke en snarvei forbi hydrering — det er nøyaktig det hydrering av en
+tom fil ville gjort. `nlink == 0` bærer ikke sikkerheten; den holder bare regelen
+til tilfellet som trenger den.
+
+Forskjellen er ikke kosmetisk. Et merke er noe noen *sier*; en størrelse er noe
+filen *er*. Det finnes ingenting her for en angriper å hevde.
 
 Gevinsten er strukturell, ikke bare praktisk: **det finnes ingen destinasjon i
 protokollen i det hele tatt.** §6b er ikke lenger en regel noen må huske å følge
 på den privilegerte siden — den privilegerte siden får aldri se en sti.
+
+En presisering, siden den første formuleringen var for sjenerøs: opprettelsen
+ligger *ikke* helt på den uprivilegerte siden. `ftruncate` utløser fortsatt en
+hendelse som bare hjelperen kan svare på, så daemonen kan ikke opprette en
+placeholder alene inne i en merket montering. Det som er sant er smalere, og
+det er det som betyr noe: **hjelperen får aldri en destinasjon, og tar ikke
+imot noen instruksjon under opprettelsen.** Den svarer på det kjernen forteller
+den om en fil den selv har fd-en til.
 
 Det samme funnet tvang fram en annen retting. Arbeideren slo opp
 placeholder-merket via *stien* hendelsen løste til. En placeholder som avlinkes

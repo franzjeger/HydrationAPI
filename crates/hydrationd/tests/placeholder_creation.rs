@@ -17,7 +17,11 @@
 
 use hydration_client::delta::Materialise;
 use hydration_client::place::TmpfilePlacer;
-use hydration_protocol::{xattr, FileId};
+use hydration_protocol::FileId;
+
+/// The name of a mechanism that was removed for being exploitable. Kept here so
+/// the tests below can assert its absence.
+const REMOVED_BUILDING_MARK: &str = "user.hydration.building";
 use hydrationd::daemon::{Fetch, Worker};
 use hydrationd::fanotify::Group;
 use hydrationd::policy::Policy;
@@ -133,9 +137,8 @@ fn a_placeholder_can_be_created_inside_the_watched_mount() {
         "the placeholder is not marked dehydrated — it would never be intercepted"
     );
     assert!(
-        !has_xattr(&target, xattr::BUILDING),
-        "the construction mark survived into the sync directory: this file would \
-         be allowed without hydrating and read as zeros"
+        !has_xattr(&target, REMOVED_BUILDING_MARK),
+        "the forgeable construction mark is back and reached the sync directory"
     );
 
     let _ = std::fs::remove_file(&target);
@@ -297,4 +300,123 @@ fn has_xattr(p: &std::path::Path, name: &str) -> bool {
     let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
     let n = std::ffi::CString::new(name).unwrap();
     (unsafe { libc::getxattr(c.as_ptr(), n.as_ptr(), std::ptr::null_mut(), 0) }) >= 0
+}
+
+/// The attack that killed the first version of this rule.
+///
+/// The first rule was `nlink == 0 && carries the construction mark`, and the
+/// mark was a `user.*` xattr — which any process sharing the file's uid can set,
+/// and in this threat model the compromised sync daemon runs as exactly that
+/// uid. So the mark was not evidence of anything. Measured attack:
+///
+///   1. attacker sets the construction mark on a real placeholder it owns
+///   2. victim opens it and reads; the read blocks on the pre-content event
+///   3. attacker unlinks it — not a content access, so it fires no event
+///   4. worker sees nlink == 0 and the mark, allows without hydrating
+///   5. victim's read returns zeros and it archives them as real content
+///
+/// It also bypassed the §6c policy gate entirely, because the shortcut ran
+/// before it: a backup that policy would have refused with EIO — the safe
+/// answer — was instead allowed with zeros.
+///
+/// The discriminator is now the file's size, which is not a claim anyone makes
+/// but a property: at the moment the sizing event fires the inode is still
+/// empty (measured), and an empty file has no content that could be served
+/// wrongly. There is nothing here for an attacker to assert.
+#[test]
+fn a_forged_construction_mark_cannot_make_a_placeholder_serve_zeros() {
+    let Some(mnt) = mount() else {
+        skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
+        return;
+    };
+    let target = mnt.join("forged-building-mark.bin");
+    let _ = std::fs::remove_file(&target);
+    std::fs::write(&target, vec![0u8; 32]).expect("seed");
+    hydrationd::placeholder::dehydrate(&target).expect("dehydrate");
+
+    // Step 1, and the whole point: this needs no privilege at all.
+    set_xattr(&target, REMOVED_BUILDING_MARK, b"1");
+    assert!(
+        has_xattr(&target, REMOVED_BUILDING_MARK),
+        "could not forge the mark, so this test proves nothing"
+    );
+
+    let group = Group::new_pre_content().expect("pre-content group");
+    group.mark_mount(&mnt).expect("mark");
+    let mut worker = Worker::new(
+        group.try_clone().expect("clone"),
+        Canned(b"HYDRATED-CONTENT".to_vec()),
+        Policy::permissive(),
+        InFlight::new(),
+    );
+
+    let victim = unsafe { libc::fork() };
+    if victim == 0 {
+        use std::io::Read;
+        let f = std::fs::File::open(&target);
+        // Steps 2–3 collapsed into one process, which makes the race
+        // deterministic rather than merely likely. The separate-attacker
+        // version is the same event sequence with worse timing.
+        let _ = std::fs::remove_file(&target);
+        let code = match f {
+            Ok(mut f) => {
+                let mut buf = Vec::new();
+                let _ = f.read_to_end(&mut buf);
+                if buf.starts_with(b"HYDRATED") {
+                    0 // hydrated: correct
+                } else if buf.is_empty() {
+                    1 // refused: safe, though not ideal
+                } else {
+                    7 // served zeros: the outcome this framework exists to prevent
+                }
+            }
+            Err(_) => 1,
+        };
+        unsafe { libc::_exit(code) };
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut status = 0;
+    let mut done = false;
+    while Instant::now() < deadline {
+        let _ = worker.run(Instant::now() + Duration::from_millis(200));
+        if unsafe { libc::waitpid(victim, &mut status, libc::WNOHANG) } == victim {
+            done = true;
+            break;
+        }
+    }
+    if !done {
+        unsafe {
+            libc::kill(victim, libc::SIGKILL);
+            libc::waitpid(victim, &mut status, 0);
+        }
+        panic!("the read never completed");
+    }
+
+    assert_ne!(
+        libc::WEXITSTATUS(status),
+        7,
+        "a forged xattr made the helper serve 32 zero bytes as though they were \
+         the file's content — no privilege required"
+    );
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        0,
+        "the read did not hydrate; the content was fetchable throughout"
+    );
+}
+
+fn set_xattr(p: &std::path::Path, name: &str, v: &[u8]) {
+    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    let n = std::ffi::CString::new(name).unwrap();
+    let rc = unsafe {
+        libc::setxattr(
+            c.as_ptr(),
+            n.as_ptr(),
+            v.as_ptr() as *const libc::c_void,
+            v.len(),
+            0,
+        )
+    };
+    assert_eq!(rc, 0, "setxattr failed: {}", io::Error::last_os_error());
 }

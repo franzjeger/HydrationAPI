@@ -53,10 +53,12 @@ static int drained(int fan)
 			struct stat es;
 			int nameless = fstat(md->fd, &es) == 0 && es.st_nlink == 0;
 			int building = fgetxattr(md->fd, "user.hydration.building", NULL, 0) >= 0;
-			fprintf(stderr, "    event: nlink=%lu building=%s -> %s\n",
+			fprintf(stderr, "    event: nlink=%lu size=%lld building=%s -> %s\n",
 				(unsigned long)(fstat(md->fd, &es) == 0 ? es.st_nlink : 99),
+				(long long)es.st_size,
 				building ? "yes" : "no",
-				(nameless && building) ? "ALLOW (no reader possible)" : "would hydrate");
+				(nameless && es.st_size == 0)
+					? "ALLOW (empty: nothing to serve)" : "would hydrate");
 			struct fanotify_response r = { .fd = md->fd, .response = FAN_ALLOW };
 			if (write(fan, &r, sizeof(r)) < 0)
 				fprintf(stderr, "  (response failed: %s)\n", strerror(errno));

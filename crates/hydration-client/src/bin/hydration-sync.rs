@@ -107,6 +107,15 @@ fn main() -> io::Result<()> {
     // Opened once up front so a missing or unwritable cloud directory is a
     // startup failure rather than a surprise on the first fetch.
     FolderCloud::open(&args.cloud)?;
+
+    // A crash between linking a new placeholder and renaming it over the old one
+    // leaves a complete file under a scratch name. Nothing else would ever
+    // remove it, and the user would see it in their sync folder forever.
+    match TmpfilePlacer::sweep_scratch(&args.mount) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("hydration-sync: swept {n} leftover scratch file(s)"),
+        Err(e) => eprintln!("hydration-sync: could not sweep scratch files: {e}"),
+    }
     let queue = Arc::new(Mutex::new(Queue::new(
         args.debounce,
         SystemClock::default(),
