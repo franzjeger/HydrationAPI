@@ -9,8 +9,10 @@
 //! four methods, none of them about POSIX. Everything the framework can own, it
 //! owns.
 
+use crate::delta::{Change, Cursor, Discover};
 use crate::upload::{Sink, Uploaded};
 use crate::Provider;
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +23,12 @@ use std::path::{Path, PathBuf};
 pub struct FolderCloud {
     root: PathBuf,
     next: u64,
+    /// What the last delta pass was told about, so this one can say what
+    /// disappeared. A real service hands out a delta token and remembers this
+    /// itself; a directory cannot, so the difference has to be computed here.
+    /// Kept deliberately visible rather than hidden behind a token, because it
+    /// is the one place this stand-in is weaker than the thing it stands in for.
+    seen: BTreeMap<String, (String, u64)>,
 }
 
 impl FolderCloud {
@@ -44,6 +52,7 @@ impl FolderCloud {
         Ok(Self {
             root: root.to_path_buf(),
             next,
+            seen: BTreeMap::new(),
         })
     }
 
@@ -78,6 +87,46 @@ impl FolderCloud {
         }
         out.sort();
         Ok(out)
+    }
+}
+
+impl Discover for FolderCloud {
+    /// A full listing every time, diffed against the previous one.
+    ///
+    /// The cursor is carried and returned so callers exercise the same shape
+    /// they would against a real delta API, but it holds nothing: this backend
+    /// has no server-side change log to resume from, and pretending otherwise
+    /// by inventing a token would make a resync after a restart silently miss
+    /// everything that changed while we were down.
+    fn changes(&mut self, _cursor: &Cursor) -> io::Result<(Vec<Change>, Cursor)> {
+        let now: BTreeMap<String, (String, u64)> = self
+            .list()?
+            .into_iter()
+            .map(|(id, name, size)| (id, (name, size)))
+            .collect();
+
+        let mut out = Vec::new();
+        for (id, (name, size)) in &now {
+            // Unchanged objects are still reported. The reconciler decides what
+            // to do by looking at the disk, and a placeholder someone deleted
+            // locally has to come back — so filtering here on "the cloud side
+            // did not change" would make the sync directory drift permanently.
+            out.push(Change::Upserted {
+                cloud_id: id.clone(),
+                path: name.clone(),
+                size: *size,
+                etag: Some(size.to_string()),
+            });
+        }
+        for id in self.seen.keys() {
+            if !now.contains_key(id) {
+                out.push(Change::Removed {
+                    cloud_id: id.clone(),
+                });
+            }
+        }
+        self.seen = now;
+        Ok((out, Cursor(None)))
     }
 }
 

@@ -314,6 +314,43 @@ pub fn has_mark(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// The same question asked of an open file rather than a name.
+///
+/// This is the one the worker uses. A name is a weaker handle than it looks:
+/// it can be renamed between resolving it and using it, and a file that is
+/// unlinked while someone holds it open has no name at all — while still being
+/// a placeholder whose content is perfectly fetchable. Asking the descriptor
+/// removes both problems, because the descriptor *is* the file the event is
+/// about.
+pub fn has_mark_fd(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let n = std::ffi::CString::new(XATTR_DEHYDRATED).unwrap();
+    let rc = unsafe { libc::fgetxattr(fd.as_raw_fd(), n.as_ptr(), std::ptr::null_mut(), 0) };
+    if rc >= 0 {
+        return Ok(true);
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(false),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Identity and size of an open file, in one `fstat`.
+pub fn id_and_size_fd(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<(FileId, u64)> {
+    use std::os::fd::AsRawFd;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        FileId {
+            fsid: st.st_dev,
+            ino: st.st_ino,
+        },
+        st.st_size as u64,
+    ))
+}
+
 /// Add or remove the placeholder mark.
 pub fn mark_dehydrated(path: &Path, on: bool) -> io::Result<()> {
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())

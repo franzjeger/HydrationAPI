@@ -59,6 +59,7 @@ run hydrationd two_halves
 run hydrationd eviction
 run hydrationd no_feedback_loop
 run hydrationd exposure
+run hydrationd placeholder_creation
 run adapter-framework conformance
 
 echo

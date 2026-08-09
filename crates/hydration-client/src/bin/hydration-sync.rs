@@ -20,7 +20,9 @@
 //! the helper connects out and checks who it reached. The worst an impersonating
 //! *listener* can do is serve content for files it already had access to.
 
+use hydration_client::delta::{self, Applied, Cursor, Discover};
 use hydration_client::manifest::{BackupPolicy, Manifest};
+use hydration_client::place::TmpfilePlacer;
 use hydration_client::providers::FolderCloud;
 use hydration_client::store::Store;
 use hydration_client::upload::{run_upload, Queue, SystemClock};
@@ -163,6 +165,72 @@ fn main() -> io::Result<()> {
                     eprintln!("hydration-sync: upload {file:?} -> {outcome:?}");
                 }
                 std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+    }
+
+    // Bringing changes down. Separate from the upload driver on purpose: a held
+    // upload must not delay a delta pass, and a delta pass must not sit on the
+    // queue lock while it walks the sync directory.
+    //
+    // The placer builds each placeholder on an anonymous inode and links it in
+    // complete, so nothing here needs the privileged helper — see `place.rs`.
+    // The privileged half is never sent a destination, which is what makes §6b
+    // structural rather than a rule someone has to remember.
+    {
+        let (q, stop, mount, clouddir) = (
+            Arc::clone(&queue),
+            Arc::clone(&stop),
+            args.mount.clone(),
+            args.cloud.clone(),
+        );
+        std::thread::spawn(move || {
+            let Ok(mut cloud) = FolderCloud::open(&clouddir) else {
+                return;
+            };
+            let mut placer = TmpfilePlacer::new(&mount);
+            let mut store = Store::new();
+            let mut cursor = Cursor::default();
+            while !stop.load(Ordering::SeqCst) {
+                match cloud.changes(&cursor) {
+                    Ok((changes, next)) if !changes.is_empty() => {
+                        cursor = next;
+                        // The queue is read, never held: `apply` consults it to
+                        // find out which files have unsent edits and must be
+                        // left alone (§5.2).
+                        let applied = {
+                            let guard = q.lock().unwrap();
+                            delta::apply(&mount, &changes, &mut store, &guard, &mut placer)
+                        };
+                        match applied {
+                            Ok(a) if a != Applied::default() => {
+                                eprintln!(
+                                    "hydration-sync: delta +{} ~{} -{} kept-local {} failed {}",
+                                    a.created,
+                                    a.updated,
+                                    a.removed,
+                                    a.kept_local.len(),
+                                    a.failed.len()
+                                );
+                                // Not a log line among log lines: these are the
+                                // changes the framework deliberately refused to
+                                // apply because local work would have been lost,
+                                // and they are what a conflict UI is for.
+                                for p in &a.kept_local {
+                                    eprintln!("hydration-sync:   kept local copy of {p}");
+                                }
+                                for p in &a.failed {
+                                    eprintln!("hydration-sync:   could not apply {p}");
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("hydration-sync: delta pass failed: {e}"),
+                        }
+                    }
+                    Ok((_, next)) => cursor = next,
+                    Err(e) => eprintln!("hydration-sync: could not list the cloud: {e}"),
+                }
+                std::thread::sleep(Duration::from_secs(5));
             }
         });
     }

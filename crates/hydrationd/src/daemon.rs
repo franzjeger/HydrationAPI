@@ -34,6 +34,9 @@ pub enum Handled {
     Hydrated {
         bytes: u64,
     },
+    /// An anonymous inode being built into a placeholder. Allowed without
+    /// hydrating: it has no name, so nothing can be reading it.
+    Nameless,
     /// Already had content: nothing to do but let it through.
     AlreadyPresent,
     Denied {
@@ -91,7 +94,9 @@ impl<F: Fetch> Worker<F> {
             );
         }
         let r = match &outcome {
-            Handled::Hydrated { .. } | Handled::AlreadyPresent => allow(&self.group, fd),
+            Handled::Hydrated { .. } | Handled::AlreadyPresent | Handled::Nameless => {
+                allow(&self.group, fd)
+            }
             Handled::Denied { .. } | Handled::Failed { .. } => deny(&self.group, fd),
         };
         self.in_flight.released();
@@ -106,27 +111,50 @@ impl<F: Fetch> Worker<F> {
     }
 
     fn decide_and_fill(&mut self, ev: &fanotify::Event) -> Handled {
-        let path = match path_of(ev.fd) {
-            Ok(p) => p,
-            Err(e) => {
-                return Handled::Failed {
-                    reason: format!("could not resolve the event fd: {e}"),
-                }
-            }
-        };
+        // A placeholder under construction, on an inode with no name.
+        //
+        // The unprivileged daemon builds placeholders on an `O_TMPFILE` inode
+        // and links them in complete. Sizing one still fires a pre-content
+        // event — measured — but the inode has no name, so no reader can have
+        // it open and there is nothing to serve wrongly. Allowing it is what
+        // keeps placeholder creation entirely on the unprivileged side, so the
+        // privileged half never accepts a destination (§6b).
+        //
+        // Both halves of the test are load-bearing. `nlink == 0` alone also
+        // describes a genuine placeholder that someone unlinked while reading
+        // it, and allowing that would hand the reader zeros.
+        if let Some(outcome) = self.nameless_under_construction(ev.fd) {
+            return outcome;
+        }
 
-        match placeholder::is_dehydrated(&path) {
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(ev.fd) };
+
+        // Everything the decision needs comes from the descriptor, not from a
+        // name.
+        //
+        // The path is still resolved, because an ignore mark and a denial log
+        // entry both need one — but it is no longer what the answer depends on.
+        // A name is a weaker handle than it looks: it can change between
+        // resolving it and using it, and a placeholder that someone unlinked
+        // while holding it open has no name at all. The path-first version of
+        // this function refused that read with EIO, which fails safe but still
+        // fails: the content was fetchable the whole time.
+        let path = path_of(ev.fd).ok();
+
+        match placeholder::has_mark_fd(borrowed) {
             Ok(false) => {
                 // Content is already there. Suppress future events for it —
                 // this is the zero-cost claim in §2.4, and without it every
                 // read of every hydrated file pays a round trip forever.
-                let _ = self.group.ignore(&path);
+                if let Some(p) = &path {
+                    let _ = self.group.ignore(p);
+                }
                 return Handled::AlreadyPresent;
             }
             Ok(true) => {}
             Err(e) => {
                 return Handled::Failed {
-                    reason: format!("could not stat {}: {e}", path.display()),
+                    reason: format!("could not read the placeholder mark: {e}"),
                 }
             }
         }
@@ -139,15 +167,15 @@ impl<F: Fetch> Worker<F> {
 
         if let Decision::Deny { rule } = self.policy.decide(cgroup.as_deref()) {
             self.log
-                .record(cgroup.as_deref().unwrap_or("?"), &rule, Some(&path));
+                .record(cgroup.as_deref().unwrap_or("?"), &rule, path.as_deref());
             return Handled::Denied { rule };
         }
 
-        let (id, size) = match (placeholder::id_of(&path), std::fs::metadata(&path)) {
-            (Ok(id), Ok(md)) => (id, md.len()),
-            _ => {
+        let (id, size) = match placeholder::id_and_size_fd(borrowed) {
+            Ok(v) => v,
+            Err(e) => {
                 return Handled::Failed {
-                    reason: format!("could not read {}", path.display()),
+                    reason: format!("could not stat the event fd: {e}"),
                 }
             }
         };
@@ -169,18 +197,37 @@ impl<F: Fetch> Worker<F> {
         //
         // The whole object or nothing (§5.7): a refusal leaves the placeholder
         // exactly as it was found.
-        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(ev.fd) };
         match placeholder::hydrate_fd(borrowed, &content, size) {
             Ok(()) => {
                 // The mark is cleared inside `hydrate_fd`, in the same operation
                 // that wrote the content — one owner, so the two cannot disagree.
-                let _ = self.group.ignore(&path);
+                //
+                // No path, no ignore mark: an unlinked file has no name to mark
+                // and will not be opened again anyway.
+                if let Some(p) = &path {
+                    let _ = self.group.ignore(p);
+                }
                 Handled::Hydrated { bytes: size }
             }
             Err(e) => Handled::Failed {
                 reason: format!("hydration refused: {e}"),
             },
         }
+    }
+
+    /// `Some(Nameless)` when this event is a placeholder being constructed.
+    fn nameless_under_construction(&self, fd: i32) -> Option<Handled> {
+        use std::os::fd::{AsRawFd, BorrowedFd};
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(borrowed.as_raw_fd(), &mut st) } < 0 || st.st_nlink != 0 {
+            return None;
+        }
+        let name = std::ffi::CString::new(hydration_protocol::xattr::BUILDING).ok()?;
+        let present =
+            unsafe { libc::fgetxattr(borrowed.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) }
+                >= 0;
+        present.then_some(Handled::Nameless)
     }
 
     /// Run until the deadline, answering everything that arrives.

@@ -40,6 +40,19 @@ pub mod xattr {
     pub const ETAG: &str = "user.hydration.etag";
     /// A mode the cloud has nowhere to store.
     pub const MODE: &str = "user.hydration.mode";
+    /// Set only while a placeholder is being constructed on an anonymous inode.
+    ///
+    /// Sizing a file fires a pre-content event even when the file has no name,
+    /// and the process doing the sizing is not the one answering events. This
+    /// marks the one case where the helper may allow an event without
+    /// hydrating: an inode with no name has no reader that could be served
+    /// wrong data, because nothing can open it.
+    ///
+    /// The mark matters as well as the missing name. `nlink == 0` alone also
+    /// describes a real placeholder someone unlinked while holding it open —
+    /// and allowing *that* without hydrating would hand the reader zeros, which
+    /// is the one outcome this framework exists to prevent.
+    pub const BUILDING: &str = "user.hydration.building";
 }
 
 /// Identifies a file without naming it.

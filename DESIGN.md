@@ -731,8 +731,8 @@ monteringen så frisk ut, `mountpoint` sa ja, `touch` virket, og alt annet hang.
 
 ## 6a-ter. Å skrive inn i en merket montering er prosjektets skarpeste kant
 
-Samme feil har oppstått **fire ganger, i fire forkledninger**, hver gang av noen
-som visste om de tre foregående:
+Samme feil har oppstått **seks ganger, i seks forkledninger**, hver gang av noen
+som visste om de foregående:
 
 | Hvor | Hva som ble skrevet |
 |---|---|
@@ -740,6 +740,8 @@ som visste om de tre foregående:
 | Dehydrering | punchet hull uten et ignore-merke |
 | Utkastelsestesten | fylte filen etter at monteringen var merket |
 | `eventtrace`-proben | laget placeholderen etter markeringen |
+| Delta-synk | måtte gi en ny placeholder størrelse inne i monteringen |
+| `placeholder_creation`-testen | dehydrerte *etter* markeringen — i testen som finnes for å fange nettopp dette, og den låste hele suiten i 300 s |
 
 Formen er alltid den samme: **en skriving inne i en merket montering, utført av
 den eneste prosessen som kunne besvart hendelsen den utløser.** Resultatet er en
@@ -755,6 +757,53 @@ gjøre den umulig å treffe framfor å advare mot den:
   to skal ligge inne i samme funksjon. `evict()` gjør det; ingen skal kunne
   sekvensere det selv.
 - Testrigger skal opprette og fylle filer **før** monteringen merkes.
+
+### Den sjette forkledningen, og hvorfor den fikk et eget svar
+
+De fem første var feil. Den sjette var et krav: delta-synk **må** opprette
+placeholdere, og å opprette en placeholder er å gi en fil størrelse. Den kunne
+altså ikke bare unngås.
+
+De to åpenbare utveiene var begge dårligere enn de så ut:
+
+- **La hjelperen opprette filen på en sti daemonen velger.** Det er en ekte
+  privilegieeskalering, ikke en teoretisk: root går en sti den uprivilegerte
+  siden kontrollerer (symlink/TOCTOU), resultatet eies av root, og siden
+  `mode` settes av den som oppretter, blir `06755` til en setuid-root-binær hvis
+  innhold *den samme daemonen* leverer etterpå.
+- **La hjelperen låne ut et ignore-merke** på en inode daemonen peker ut. Det er
+  evnen til å få en vilkårlig fil til å lese som nuller — nøyaktig feilen
+  rammeverket finnes for å hindre.
+
+`O_TMPFILE` fjerner dilemmaet i stedet for å forvalte det. Placeholderen bygges
+på en **anonym inode uten navn**, og `linkat` gir den navn først når den er
+ferdig. Målt på 6.17 (`probes/tmpfile.c`):
+
+```
+events after create:            0
+events observed while sizing:   1   <- nlink=0, byggemerket satt
+events during linkat:           0
+result: size=4096 blocks=0, dehydrated mark present
+```
+
+Størrelsessettingen er altså **ikke** stille. Den ene hendelsen den utløser er
+det arbeideren svarer på med én smal regel: en inode med `nlink == 0` som bærer
+`user.hydration.building` har ingen leser som kan bli servert feil, fordi
+ingenting kan åpne den. Begge halvdelene bærer: `nlink == 0` alene beskriver
+også en ekte placeholder som noen avlinket mens den var åpen, og å slippe
+*den* gjennom ville gitt leseren nuller.
+
+Gevinsten er strukturell, ikke bare praktisk: **det finnes ingen destinasjon i
+protokollen i det hele tatt.** §6b er ikke lenger en regel noen må huske å følge
+på den privilegerte siden — den privilegerte siden får aldri se en sti.
+
+Det samme funnet tvang fram en annen retting. Arbeideren slo opp
+placeholder-merket via *stien* hendelsen løste til. En placeholder som avlinkes
+mens den er åpen har ingen sti, og ble derfor nektet med `EIO` selv om innholdet
+var fullt hentbart. Arbeideren jobber nå fra hendelsens fd (`fgetxattr`/`fstat`),
+og stien brukes bare til det den faktisk trengs til: ignore-merket og
+avslagsloggen. Det fjerner samtidig en TOCTOU, siden en sti kan endres mellom
+oppslag og bruk.
 
 ---
 
