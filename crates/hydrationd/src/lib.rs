@@ -9,6 +9,7 @@
 //! module docs and `probes/` for which one.
 
 pub mod daemon;
+pub mod evict;
 pub mod fanotify;
 pub mod placeholder;
 pub mod policy;
