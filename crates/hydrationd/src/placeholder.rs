@@ -107,6 +107,10 @@ pub fn create_under(
 /// makes a dehydrated file indistinguishable from a hydrated one to everything
 /// except `st_blocks` -- which is the point, and also why §5.8 requires
 /// `st_blocks` to be honest.
+/// Note: like [`evict`](crate::evict::evict), this re-stamps afterwards.
+/// Punching a hole moves mtime, and a placeholder left looking
+/// changed-by-someone-else is refused by the delta pass and queued for upload by
+/// a resync walk — where uploading it reads it, and reading it hydrates it.
 pub fn dehydrate(path: &Path) -> io::Result<()> {
     let file = fs::OpenOptions::new().write(true).open(path)?;
     let len = file.metadata()?.len();
@@ -125,6 +129,7 @@ pub fn dehydrate(path: &Path) -> io::Result<()> {
     // agreeing, and this is the direction where a crash in between leaves a file
     // that is empty and known to be empty.
     mark_dehydrated(path, true)?;
+    let _ = hydration_protocol::stamp::write(path);
     Ok(())
 }
 
@@ -221,6 +226,11 @@ pub fn hydrate_fd(
             let e = io::Error::last_os_error();
             // Nothing partial may survive a failure: it would look hydrated.
             let _ = punch_fd(fd, expected);
+            // And the rollback is a write of ours too. Left unstamped, the
+            // failed hydration reads as a local edit and a resync walk queues it
+            // for upload, which reads it, which hydrates it — a loop started by
+            // a failure.
+            let _ = hydration_protocol::stamp::write_fd(fd);
             return Err(e);
         }
         written += n as usize;
@@ -229,6 +239,7 @@ pub fn hydrate_fd(
     if unsafe { libc::fsync(fd.as_raw_fd()) } < 0 {
         let e = io::Error::last_os_error();
         let _ = punch_fd(fd, expected);
+        let _ = hydration_protocol::stamp::write_fd(fd);
         return Err(e);
     }
 

@@ -429,3 +429,83 @@ fn a_fetcher_that_recovers_is_used_again() {
         let _ = std::fs::remove_file(p);
     }
 }
+
+/// A peer that has gone away must not be mistaken for a peer that is refusing.
+///
+/// The give-up clock counted missed deadlines, and a dead socket fails
+/// instantly rather than slowly — so it never started. The helper connects out
+/// once and has no reconnect path, which meant a routine client restart left the
+/// worker serving instant `EIO` forever, under two units that both looked
+/// healthy. §6a-bis says that state must come down.
+///
+/// The second half matters as much as the first: an ordinary per-file refusal —
+/// "there is no cloud object for this inode" — is an answer, not a fault, and
+/// counting it would tear the mount down over one unsyncable file.
+#[test]
+fn a_lost_connection_counts_towards_giving_up_and_a_refusal_does_not() {
+    let Some(mnt) = mount() else {
+        skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
+        return;
+    };
+
+    struct Fails(io::ErrorKind);
+    impl Fetch for Fails {
+        fn fetch(&mut self, _f: FileId, _size: u64) -> io::Result<Vec<u8>> {
+            Err(io::Error::new(self.0, "measured failure"))
+        }
+    }
+
+    for (label, kind, expect_wedged) in [
+        ("connection lost", io::ErrorKind::UnexpectedEof, true),
+        ("per-file refusal", io::ErrorKind::NotFound, false),
+    ] {
+        let paths: Vec<PathBuf> = (0..4)
+            .map(|i| placeholder_at(&mnt, &format!("lost-{}-{i}.bin", expect_wedged as u8), 32))
+            .collect();
+        let group = Group::new_pre_content().expect("group");
+        group.mark_mount(&mnt).expect("mark");
+        let mut worker = Worker::with_deadline(
+            group.try_clone().expect("clone"),
+            Fails(kind),
+            Policy::permissive(),
+            InFlight::new(),
+            Duration::from_secs(5),
+        );
+
+        for path in &paths {
+            let reader = unsafe { libc::fork() };
+            if reader == 0 {
+                let _ = std::fs::read(path);
+                unsafe { libc::_exit(0) };
+            }
+            let mut status = 0;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut done = false;
+            while Instant::now() < deadline {
+                let _ = worker.run(Instant::now() + Duration::from_millis(100));
+                if unsafe { libc::waitpid(reader, &mut status, libc::WNOHANG) } == reader {
+                    done = true;
+                    break;
+                }
+            }
+            if !done {
+                unsafe {
+                    libc::kill(reader, libc::SIGKILL);
+                    libc::waitpid(reader, &mut status, 0);
+                }
+                panic!("[{label}] a reader was left blocked");
+            }
+        }
+
+        assert_eq!(
+            worker.fetcher_wedged(),
+            expect_wedged,
+            "[{label}] wedged={} after four failures; a lost connection must \
+             eventually bring the mount down, and a per-file refusal must never",
+            worker.fetcher_wedged()
+        );
+        for p in &paths {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}

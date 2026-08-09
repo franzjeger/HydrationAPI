@@ -86,7 +86,9 @@ fn upserted(path: &str, size: u64, id: &str) -> Change {
 
 fn run(root: &Path, changes: &[Change], q: &Queue<TestClock>, m: &mut Recorder) -> Applied {
     let mut store = Store::new();
-    apply(root, changes, &mut store, q, m).expect("apply")
+    // Snapshotted here exactly as the binary does it, so the tests exercise the
+    // same shape rather than a friendlier one.
+    apply(root, changes, &mut store, &q.waiting_set(), m).expect("apply")
 }
 
 #[test]
@@ -325,6 +327,80 @@ fn a_file_the_framework_last_wrote_is_still_refreshed() {
     hydration_protocol::stamp::write(&p).expect("stamp");
 
     let out = run(&dir, &[upserted("a.bin", 250, "cloud-1")], &q, &mut m);
+    assert_eq!(out.updated, 1, "{out:?}");
+    assert_eq!(std::fs::metadata(&p).unwrap().len(), 250);
+}
+
+/// A delta pass that changes nothing must do nothing.
+///
+/// `apply` had no "already current" check: an upsert for a path that exists
+/// locally fell through every guard and landed unconditionally in `place()`. A
+/// real delta feed echoes your own uploads back on the next page, and
+/// `Discover`'s own contract promises a full listing and an incremental one
+/// behave the same — so this is not an exotic input, it is the normal one.
+///
+/// The consequence is not churn. It is that a file the user just wrote, and
+/// which was uploaded successfully, is converted into a placeholder seconds
+/// later — a hole where their content was, on a laptop that may be offline by
+/// the time they open it again.
+#[test]
+fn a_pass_that_brings_no_news_leaves_the_file_alone() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = scratch("idempotent");
+    let mut m = Recorder::default();
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+
+    // A local file that has been uploaded: it has content, an id and an etag.
+    let p = dir.join("mine.txt");
+    std::fs::write(&p, b"content the user wrote and we uploaded").unwrap();
+    store::set_xattr(&p, store::XATTR_ID, b"cloud-1").unwrap();
+    store::set_xattr(&p, store::XATTR_ETAG, b"etag-1").unwrap();
+    hydration_protocol::stamp::write(&p).unwrap();
+    let before = std::fs::metadata(&p).unwrap();
+
+    // The cloud lists what it has, including the object we just sent it.
+    let out = run(&dir, &[upserted("mine.txt", 38, "cloud-1")], &q, &mut m);
+
+    let after = std::fs::metadata(&p).unwrap();
+    assert_eq!(
+        after.ino(),
+        before.ino(),
+        "a pass with no news replaced the file: {out:?}"
+    );
+    assert_ne!(
+        after.blocks(),
+        0,
+        "the user's content was turned into a hole by a delta pass that had \
+         nothing new to say"
+    );
+    assert_eq!(out.updated, 0, "{out:?}");
+    assert!(m.placed.is_empty(), "placed: {:?}", m.placed);
+}
+
+/// And the other side of it: news is still applied.
+#[test]
+fn a_pass_with_a_new_version_still_refreshes() {
+    let dir = scratch("still-refreshes");
+    let mut m = Recorder::default();
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+
+    run(&dir, &[upserted("a.bin", 100, "cloud-1")], &q, &mut m);
+    let p = dir.join("a.bin");
+    hydration_protocol::stamp::write(&p).unwrap();
+
+    // Same object, different version.
+    let out = run(
+        &dir,
+        &[Change::Upserted {
+            cloud_id: "cloud-1".into(),
+            path: "a.bin".into(),
+            size: 250,
+            etag: Some("etag-2".into()),
+        }],
+        &q,
+        &mut m,
+    );
     assert_eq!(out.updated, 1, "{out:?}");
     assert_eq!(std::fs::metadata(&p).unwrap().len(), 250);
 }

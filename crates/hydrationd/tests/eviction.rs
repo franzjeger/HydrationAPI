@@ -310,3 +310,42 @@ fn including_a_placeholder_in_backups_leaves_the_flag_alone() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// Eviction is the framework writing, so it must leave the file looking clean.
+///
+/// Punching a hole moves mtime (measured, `probes/nodump.c`'s sibling
+/// measurement), so a placeholder that was not re-stamped reads as
+/// changed-by-someone-else. That breaks both directions at once: a delta pass
+/// refuses to refresh it, and a resync walk queues it for upload — and uploading
+/// a placeholder means *reading* it, which hydrates the very file whose disk we
+/// just reclaimed. One overflow after an eviction sweep would re-download
+/// everything that was evicted.
+#[test]
+fn an_evicted_placeholder_still_looks_like_our_own_work() {
+    let Some(mnt) = mount() else {
+        skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
+        return;
+    };
+    use hydration_protocol::stamp::{self, State};
+
+    let path = mnt.join("evicted-stamp.bin");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, vec![b'x'; 16384]).expect("seed");
+    stamp::write(&path).expect("stamp");
+
+    let group = Group::new_pre_content().expect("group");
+    group.mark_mount(&mnt).expect("mark");
+    group.ignore(&path).expect("ignore");
+
+    evict(&group, &path, Backup::Exclude, || true)
+        .expect("evict")
+        .expect("refused");
+
+    assert_eq!(
+        stamp::state(&path).unwrap(),
+        State::Clean,
+        "eviction left the placeholder looking edited: a resync would queue it \
+         for upload, and uploading it would read it back down"
+    );
+    let _ = std::fs::remove_file(&path);
+}

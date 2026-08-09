@@ -202,6 +202,17 @@ pub mod stamp {
         set(path, of(&md).as_bytes())
     }
 
+    /// Record a state observed earlier as clean.
+    ///
+    /// The stamp must describe content **no newer** than what was actually
+    /// sent or written. Stamping from the file as it is *now*, after a transfer,
+    /// blesses whatever landed during it — so an edit made mid-upload reads as
+    /// Clean, is never re-sent, and is destroyed by the next remote change. A
+    /// stale stamp costs a redundant upload; a fresh one costs the edit.
+    pub fn write_as(path: &Path, md: &std::fs::Metadata) -> io::Result<()> {
+        set(path, of(md).as_bytes())
+    }
+
     /// As [`write`], through a descriptor.
     ///
     /// What hydration uses: re-opening a path inside a marked mount is the trap

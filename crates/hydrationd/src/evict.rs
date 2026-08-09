@@ -98,6 +98,14 @@ pub fn evict(
     placeholder::punch_fd(std::os::fd::AsFd::as_fd(&file), len)?;
     drop(file);
 
+    // Punching moves mtime (measured), so a placeholder that stopped here would
+    // read as changed-by-someone-else. That breaks both directions at once: a
+    // delta pass would refuse to refresh it, and a resync walk would queue it
+    // for upload — and uploading a placeholder means *reading* it, which
+    // hydrates the very file we just reclaimed the disk from. Eviction is the
+    // framework writing, so it has to end clean.
+    let _ = hydration_protocol::stamp::write(path);
+
     // Step 2, and only now. Between these two lines the file is empty and not
     // intercepted, so a read landing here would see zeros — the window is why
     // this is two syscalls and not two functions a caller sequences themselves.

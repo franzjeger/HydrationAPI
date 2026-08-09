@@ -16,7 +16,6 @@
 //! version they did not ask for, with no error and nothing to point at.
 
 use crate::store::Store;
-use crate::upload::Queue;
 use hydration_protocol::FileId;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -86,14 +85,18 @@ pub struct Applied {
 
 /// Apply a set of changes to the sync directory.
 ///
-/// `queue` is consulted rather than modified: a file with an edit waiting to go
-/// up is one whose local copy is newer than anything the cloud can tell us
-/// about, and the delta pass leaves it alone.
-pub fn apply<M: Materialise, C: crate::upload::Clock>(
+/// `waiting` is a *snapshot* of the upload queue, taken before the pass and not
+/// a handle onto it. A file with an edit waiting to go up is one whose local
+/// copy is newer than anything the cloud can tell us about, and the delta pass
+/// leaves it alone — but reading that from the live queue would mean holding its
+/// lock for the length of the pass, which blocks the thread that delivers change
+/// notifications and makes every edit made *during* the pass invisible to the
+/// very check meant to protect it.
+pub fn apply<M: Materialise>(
     root: &Path,
     changes: &[Change],
     store: &mut Store,
-    queue: &Queue<C>,
+    waiting: &std::collections::HashSet<FileId>,
     mat: &mut M,
 ) -> io::Result<Applied> {
     let mut out = Applied::default();
@@ -128,7 +131,7 @@ pub fn apply<M: Materialise, C: crate::upload::Clock>(
                         // cloud has to say. Replacing it with a placeholder
                         // would throw away work that exists nowhere else — the
                         // one outcome this framework must never produce.
-                        if queue.is_waiting(&id) {
+                        if waiting.contains(&id) {
                             out.kept_local.push(path.clone());
                             continue;
                         }
@@ -161,6 +164,21 @@ pub fn apply<M: Materialise, C: crate::upload::Clock>(
                             out.kept_local.push(path.clone());
                             continue;
                         }
+                        // Nothing to do is the common case, and doing something
+                        // anyway is destructive.
+                        //
+                        // A real delta feed echoes your own uploads back on the
+                        // next page, and `Discover`'s contract promises a full
+                        // listing behaves like an incremental one — so most
+                        // upserts describe a file that is already exactly right.
+                        // Without this check every one of them was re-placed:
+                        // a file the user had just written and successfully
+                        // uploaded became a placeholder seconds later, which on
+                        // a laptop that is offline by morning is their content
+                        // gone.
+                        if is_current(&abs, cloud_id, etag.as_deref(), *size) {
+                            continue;
+                        }
                         match mat.place(&abs, *size, cloud_id, etag.as_deref()) {
                             Ok(()) => out.updated += 1,
                             Err(_) => out.failed.push(path.clone()),
@@ -182,7 +200,7 @@ pub fn apply<M: Materialise, C: crate::upload::Clock>(
                 // Same rule from the other side: a local edit outlives a remote
                 // delete, because the edit is the newer intention *here* and
                 // nothing else has a copy of it.
-                if queue.is_waiting(&id) {
+                if waiting.contains(&id) {
                     out.kept_local.push(entry.path.display().to_string());
                     continue;
                 }
@@ -204,6 +222,44 @@ pub fn apply<M: Materialise, C: crate::upload::Clock>(
         }
     }
     Ok(out)
+}
+
+/// Whether the local file already is what the change describes.
+///
+/// Identity first: a different object at this path is news whatever else
+/// matches. Then the version.
+///
+/// When the cloud supplies no etag there is nothing authoritative to compare, so
+/// size stands in. That is weaker — a same-size remote edit is missed — but the
+/// alternative is to treat every listing as news, which is the failure this
+/// function exists to prevent, and a provider that wants edits noticed reliably
+/// has to supply an etag.
+fn is_current(abs: &Path, cloud_id: &str, etag: Option<&str>, size: u64) -> bool {
+    let local_id = crate::store::get_xattr(abs, crate::store::XATTR_ID)
+        .ok()
+        .flatten();
+    if local_id.as_deref() != Some(cloud_id.as_bytes()) {
+        return false;
+    }
+    let local_etag = crate::store::get_xattr(abs, crate::store::XATTR_ETAG)
+        .ok()
+        .flatten();
+    // Size is checked whatever the etags say. A provider that reports the same
+    // version with a different size is contradicting itself, and believing the
+    // etag over the bytes would leave a placeholder promising a length the
+    // object no longer has — §5.7's failure, arrived at by agreeing with the
+    // cloud too readily. Erring towards a refresh costs a round trip; erring the
+    // other way is silent.
+    if !std::fs::metadata(abs).is_ok_and(|md| md.len() == size) {
+        return false;
+    }
+    match (etag, local_etag.as_deref()) {
+        (Some(remote), Some(local)) => remote.as_bytes() == local,
+        (None, _) => true,
+        // The cloud has a version and we recorded none: we cannot claim to be
+        // current.
+        (Some(_), None) => false,
+    }
 }
 
 fn file_id(md: &std::fs::Metadata) -> FileId {

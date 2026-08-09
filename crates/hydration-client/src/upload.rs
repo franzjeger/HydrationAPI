@@ -193,6 +193,17 @@ impl<C: Clock> Queue<C> {
         self.waiting.len()
     }
 
+    /// The files with an edit waiting, as of now.
+    ///
+    /// Exists so a delta pass can consult the queue without holding its lock.
+    /// Holding it across the pass is worse than slow: the thread that receives
+    /// change notifications blocks on the same lock, so no edit made *during*
+    /// the pass can reach the queue — `is_waiting` becomes structurally false
+    /// for exactly the edits most at risk of being overwritten by it.
+    pub fn waiting_set(&self) -> std::collections::HashSet<FileId> {
+        self.waiting.keys().copied().collect()
+    }
+
     /// Run one upload, start to finish, applying rules 2 and 3.
     pub fn run_one<S: Sink>(&mut self, file: FileId, store: &mut Store, sink: &mut S) -> Outcome {
         self.begin(file);
@@ -233,6 +244,10 @@ pub fn run_upload<S: Sink>(file: FileId, store: &mut Store, sink: &mut S) -> Out
         let path: PathBuf = entry.path.clone();
         let existing = entry.cloud_id.clone();
 
+        // Observed before the sink reads a byte, so the stamp written on success
+        // can never describe content newer than what was sent.
+        let sent_state = std::fs::metadata(&path).ok();
+
         let uploaded = match sink.upload(&path, existing.as_deref()) {
             Ok(u) => u,
             Err(e) => return Outcome::Failed(e.to_string()),
@@ -264,9 +279,18 @@ pub fn run_upload<S: Sink>(file: FileId, store: &mut Store, sink: &mut S) -> Out
         // The third moment the framework makes content clean, and the reason
         // this is not merely bookkeeping: without it, every file that has ever
         // been uploaded looks unstamped, and a resync walk would queue the whole
-        // directory. Stamped from the file as it is *now*, so an edit that
-        // landed during the upload still reads as dirty and gets sent again.
-        let _ = hydration_protocol::stamp::write(&path);
+        // directory.
+        //
+        // Stamped from the state observed *before* the sink read the file, not
+        // from the file as it is now. An upload takes time, and an edit that
+        // landed during it is not covered by the bytes that went out — stamping
+        // afterwards would bless that edit as sent, so it would never be
+        // re-queued and the next remote change would destroy it. Stamping the
+        // earlier state means the file simply reads as dirty and goes again,
+        // which costs one redundant upload.
+        if let Some(md) = &sent_state {
+            let _ = hydration_protocol::stamp::write_as(&path, md);
+        }
 
         Outcome::Sent {
             cloud_id: uploaded.cloud_id,

@@ -6,7 +6,7 @@
 //! time is that reproducing them by sleeping does not work.
 
 use hydration_client::store::{self, Store};
-use hydration_client::upload::{Outcome, Queue, Sink, TestClock, Uploaded};
+use hydration_client::upload::{run_upload, Outcome, Queue, Sink, TestClock, Uploaded};
 use hydration_protocol::FileId;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -337,5 +337,55 @@ fn learning_the_cloud_id_does_not_change_the_inode() {
     assert_eq!(
         store.lookup(&before).unwrap().cloud_id.as_deref(),
         Some("cloud-1")
+    );
+}
+
+/// An edit made while the upload is in flight must not be blessed as sent.
+///
+/// The stamp says "this content is what the framework last wrote", and a delta
+/// pass refuses to overwrite a file whose stamp disagrees with it. Stamping from
+/// the file *after* the transfer records whatever landed during it — so an edit
+/// made mid-upload reads as clean, is never re-queued, and is destroyed by the
+/// next remote change. The bytes that went out were the older ones.
+#[test]
+fn an_edit_during_the_upload_is_not_recorded_as_sent() {
+    use hydration_protocol::stamp::{self, State};
+
+    /// Edits the file while "uploading" it, which is what a slow transfer plus
+    /// an impatient user amounts to.
+    struct EditsMidFlight;
+    impl Sink for EditsMidFlight {
+        fn upload(&mut self, path: &Path, _existing: Option<&str>) -> io::Result<Uploaded> {
+            let sent = std::fs::read(path)?;
+            // The user saves again before the transfer finishes.
+            std::fs::write(path, b"a much later version written during the upload")?;
+            Ok(Uploaded {
+                cloud_id: "cloud-1".into(),
+                etag: Some(format!("{}", sent.len())),
+            })
+        }
+        fn remove(&mut self, _cloud_id: &str) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let dir = scratch("edit-mid-upload");
+    let p = dir.join("doc.txt");
+    std::fs::write(&p, b"the version that gets sent").unwrap();
+
+    let mut store = Store::new();
+    store.scan(&dir).unwrap();
+    let id = file_id(&p);
+    let outcome = run_upload(id, &mut store, &mut EditsMidFlight);
+    assert!(
+        matches!(outcome, Outcome::Sent { .. }),
+        "unexpected: {outcome:?}"
+    );
+
+    assert_eq!(
+        stamp::state(&p).unwrap(),
+        State::Dirty,
+        "the edit that landed during the upload was recorded as sent; it will \
+         never be re-queued and the next remote change will destroy it"
     );
 }

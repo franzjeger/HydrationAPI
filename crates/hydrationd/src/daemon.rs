@@ -83,6 +83,18 @@ struct Timed {
 /// deadline first would be the same outage, slower.
 const WEDGED_AFTER: u32 = 3;
 
+/// Whether this error means the socket is gone rather than the request refused.
+fn is_connection_lost(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NotConnected
+    )
+}
+
 /// How long a fetcher may stay unresponsive before the unit gives up on itself.
 ///
 /// §6a-bis's third requirement, reached by the other road. A worker that denies
@@ -181,7 +193,21 @@ impl Timed {
             }
             match self.rep.recv_timeout(left) {
                 Ok((got, r)) if got == want => {
-                    self.answered();
+                    // A dead peer fails *instantly*, not slowly, so counting
+                    // only missed deadlines would never notice one. The helper
+                    // connects out once and has no reconnect path, so a routine
+                    // client restart — an upgrade, `Restart=on-failure`, a
+                    // logout that clears the runtime directory along with the
+                    // socket — would otherwise leave this worker serving instant
+                    // EIO forever, under two units that both look healthy.
+                    //
+                    // Only connection-terminal errors count. A per-file refusal
+                    // ("no cloud id for this inode") is an ordinary answer and
+                    // must not bring the mount down.
+                    match &r {
+                        Err(e) if is_connection_lost(e) => self.missed_one(),
+                        _ => self.answered(),
+                    }
                     return r;
                 }
                 Ok(_) => continue,

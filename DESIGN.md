@@ -1206,6 +1206,35 @@ det nettopp produserte (`user.hydration.stamp`). Alt annet som skriver flytter
 mtime, og uenigheten er synlig uten å ha blitt fortalt om. Delta-passet nekter nå
 å skrive over en fil som er `Dirty`, uavhengig av hva køen sier.
 
+**To regler kom ut av gjennomgangen etterpå, begge fordi den første versjonen
+brøt dem.**
+
+*Et pass uten nyheter må ikke gjøre noe.* `apply` hadde ingen «allerede
+oppdatert»-sjekk, så en upsert for en sti som fantes lokalt falt gjennom alle
+vaktene og landet ubetinget i `place()`. En ekte delta-strøm ekkoer dine egne
+opplastinger tilbake på neste side, og `Discover` lover selv at en full listing
+oppfører seg som en inkrementell — så det er ikke et eksotisk inndata, det er det
+normale. Konsekvensen var ikke churn, men at en fil brukeren nettopp hadde
+skrevet og fått lastet opp ble gjort om til en placeholder sekunder senere. På en
+maskin som er offline neste morgen er det innholdet deres, borte. Identitet
+sjekkes nå først, så størrelse, så versjon — og størrelse uansett hva etag-ene
+sier, fordi en leverandør som melder samme versjon med annen størrelse motsier
+seg selv, og å tro etag-en framfor bytene ville etterlatt en placeholder som
+lover en lengde objektet ikke har.
+
+*Stempelet må beskrive innhold som ikke er nyere enn det som faktisk ble sendt.*
+Opplastingen stemplet fra filen slik den var *etterpå*. En redigering som landet
+under overføringen ble dermed velsignet som sendt — den ville aldri blitt lagt i
+kø igjen, og neste endring fra skyen ville ødelagt den. Et foreldet stempel
+koster en overflødig opplasting; et ferskt koster redigeringen. Tilstanden
+observeres nå før senderen leser en eneste byte.
+
+Av samme grunn stempler rammeverket etter *sine egne* punsjinger — utkastelse,
+dehydrering og tilbakerullingen i en mislykket hydrering. Punsjing flytter mtime,
+og en placeholder som ble stående som `Dirty` ville blitt nektet oppfrisking av
+delta-passet *og* lagt i opplastingskø av en resync-vandring — der opplasting
+betyr å lese den, og å lese den hydrerer den tilbake.
+
 `Unstamped` er bevisst ikke det samme som `Dirty`: en fil rammeverket aldri har
 skrevet er brukerens egen, og å kalle den «endret» ville lagt hele katalogen i
 opplastingskø ved første resync.

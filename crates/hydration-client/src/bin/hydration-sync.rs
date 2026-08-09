@@ -301,13 +301,17 @@ fn main() -> io::Result<()> {
                 match cloud.changes(&cursor) {
                     Ok((changes, next)) if !changes.is_empty() => {
                         cursor = next;
-                        // The queue is read, never held: `apply` consults it to
-                        // find out which files have unsent edits and must be
-                        // left alone (§5.2).
-                        let applied = {
-                            let guard = q.lock().unwrap();
-                            delta::apply(&mount, &changes, &mut store, &guard, &mut placer)
-                        };
+                        // Snapshotted, then released — not held across the pass.
+                        //
+                        // The lock is the same one the change-notification
+                        // thread takes, so holding it here would stop any edit
+                        // made during the pass from ever reaching the queue,
+                        // and `apply` would then find those exact files
+                        // unprotected. The snapshot can go stale, which is what
+                        // the stamp check inside `apply` is for.
+                        let waiting = q.lock().unwrap().waiting_set();
+                        let applied =
+                            delta::apply(&mount, &changes, &mut store, &waiting, &mut placer);
                         match applied {
                             Ok(a) if a != Applied::default() => {
                                 eprintln!(
