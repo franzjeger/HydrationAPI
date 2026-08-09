@@ -1,0 +1,157 @@
+//! A cloud the harness can steer.
+//!
+//! Lives on the unprivileged side, which is the point: the privileged helper
+//! reaches it only through the socket, so anything the harness makes it do is
+//! also something a compromised sync daemon could do.
+
+use hydration_client::upload::{Sink, Uploaded};
+use hydration_client::Provider;
+use hydration_conformance::{CloudObject, CloudOp, FetchBehaviour};
+use std::collections::HashMap;
+use std::io;
+use std::sync::{Arc, Condvar, Mutex};
+
+#[derive(Default)]
+pub struct State {
+    pub objects: HashMap<String, CloudObject>,
+    pub ops: Vec<CloudOp>,
+    pub next_id: u32,
+    pub fetch: HashMap<String, FetchBehaviour>,
+    /// Uploads are let in but not let out, so a rename or unlink can be made to
+    /// land strictly inside the window.
+    pub holding: bool,
+    /// Set the moment an upload enters, so the harness can wait for the race to
+    /// be arranged rather than sleeping and hoping.
+    pub upload_entered: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct Cloud {
+    pub state: Arc<Mutex<State>>,
+    pub gate: Arc<Condvar>,
+}
+
+impl Cloud {
+    pub fn seed(&self, name: &str, content: &[u8], etag: &str) -> String {
+        let mut st = self.state.lock().unwrap();
+        st.next_id += 1;
+        let id = format!("cloud-{}", st.next_id);
+        st.objects.insert(
+            id.clone(),
+            CloudObject {
+                id: id.clone(),
+                name: name.to_string(),
+                content: content.to_vec(),
+                etag: etag.to_string(),
+            },
+        );
+        id
+    }
+
+    pub fn by_name(&self, name: &str) -> Option<CloudObject> {
+        self.state
+            .lock()
+            .unwrap()
+            .objects
+            .values()
+            .find(|o| o.name == name)
+            .cloned()
+    }
+
+    pub fn ops(&self) -> Vec<CloudOp> {
+        self.state.lock().unwrap().ops.clone()
+    }
+
+    pub fn hold(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.holding = true;
+        st.upload_entered = false;
+    }
+
+    pub fn release(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.holding = false;
+        self.gate.notify_all();
+        drop(st);
+    }
+
+    pub fn upload_started(&self) -> bool {
+        self.state.lock().unwrap().upload_entered
+    }
+
+    pub fn set_behaviour(&self, name: &str, b: FetchBehaviour) {
+        self.state.lock().unwrap().fetch.insert(name.to_string(), b);
+    }
+}
+
+impl Provider for Cloud {
+    fn fetch(&mut self, cloud_id: &str, size: u64) -> io::Result<Vec<u8>> {
+        let mut st = self.state.lock().unwrap();
+        st.ops.push(CloudOp::Get {
+            id: cloud_id.to_string(),
+        });
+        let Some(obj) = st.objects.get(cloud_id).cloned() else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such object"));
+        };
+        match st.fetch.get(&obj.name) {
+            Some(FetchBehaviour::Short { bytes }) => {
+                Ok(obj.content[..(*bytes).min(obj.content.len())].to_vec())
+            }
+            Some(FetchBehaviour::Stale { .. }) => Ok(vec![b'!'; size as usize]),
+            _ => Ok(obj.content),
+        }
+    }
+}
+
+impl Sink for Cloud {
+    fn upload(&mut self, path: &std::path::Path, existing: Option<&str>) -> io::Result<Uploaded> {
+        // The name is read here, at send time — never captured when the job was
+        // queued. That is rule 2, and this is the line where an atomic save
+        // either works or does not.
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let content = std::fs::read(path)?;
+
+        let mut st = self.state.lock().unwrap();
+        st.upload_entered = true;
+        self.gate.notify_all();
+        // In flight from here until the harness lets go.
+        while st.holding {
+            st = self.gate.wait(st).unwrap();
+        }
+
+        st.ops.push(CloudOp::Put {
+            name: name.clone(),
+            content: content.clone(),
+        });
+        let id = match existing {
+            Some(e) if st.objects.contains_key(e) => e.to_string(),
+            _ => {
+                st.next_id += 1;
+                format!("cloud-{}", st.next_id)
+            }
+        };
+        let etag = format!("etag-{}", st.next_id);
+        st.objects.insert(
+            id.clone(),
+            CloudObject {
+                id: id.clone(),
+                name,
+                content,
+                etag: etag.clone(),
+            },
+        );
+        Ok(Uploaded {
+            cloud_id: id,
+            etag: Some(etag),
+        })
+    }
+
+    fn remove(&mut self, cloud_id: &str) -> io::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        st.ops.push(CloudOp::Delete {
+            id: cloud_id.to_string(),
+        });
+        st.objects.remove(cloud_id);
+        Ok(())
+    }
+}

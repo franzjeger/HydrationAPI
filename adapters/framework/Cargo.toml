@@ -1,0 +1,13 @@
+[package]
+name = "adapter-framework"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Runs the conformance suite against this framework"
+
+[dependencies]
+hydration-conformance = { path = "../../conformance" }
+hydration-protocol = { path = "../../crates/hydration-protocol" }
+hydration-client = { path = "../../crates/hydration-client" }
+hydrationd = { path = "../../crates/hydrationd" }
+libc = "0.2"

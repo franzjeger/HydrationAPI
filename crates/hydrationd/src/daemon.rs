@@ -82,6 +82,14 @@ impl<F: Fetch> Worker<F> {
         self.in_flight.holding(fd);
         let outcome = self.decide_and_fill(ev);
 
+        if std::env::var_os("HYDRATIOND_TRACE").is_some() {
+            eprintln!(
+                "[worker] {} -> {outcome:?}",
+                path_of(fd)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| format!("fd {fd}"))
+            );
+        }
         let r = match &outcome {
             Handled::Hydrated { .. } | Handled::AlreadyPresent => allow(&self.group, fd),
             Handled::Denied { .. } | Handled::Failed { .. } => deny(&self.group, fd),
@@ -164,6 +172,10 @@ impl<F: Fetch> Worker<F> {
         let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(ev.fd) };
         match placeholder::hydrate_fd(borrowed, &content, size) {
             Ok(()) => {
+                // The mark and the content change together. Clearing it after
+                // the write and before the ignore mark means a reader arriving
+                // in between still sees a file that is intercepted and full.
+                let _ = placeholder::mark_dehydrated(&path, false);
                 let _ = self.group.ignore(&path);
                 Handled::Hydrated { bytes: size }
             }
@@ -175,6 +187,9 @@ impl<F: Fetch> Worker<F> {
 
     /// Run until the deadline, answering everything that arrives.
     pub fn run(&mut self, until: std::time::Instant) -> io::Result<Vec<Handled>> {
+        if std::env::var_os("HYDRATIOND_TRACE").is_some() {
+            eprintln!("[worker] loop start, group fd={}", self.group.as_raw());
+        }
         let mut seen = Vec::new();
         let mut buf = vec![0u8; 64 * 1024];
 
@@ -189,6 +204,9 @@ impl<F: Fetch> Worker<F> {
                 continue;
             }
             let len = self.group.read_events(&mut buf)?;
+            if std::env::var_os("HYDRATIOND_TRACE").is_some() {
+                eprintln!("[worker] read {len} bytes of events");
+            }
             for ev in fanotify::events(&buf, len) {
                 seen.push(self.handle(&ev));
             }

@@ -52,6 +52,12 @@ pub fn evict(
         return Ok(Err(Refused::NotUploaded));
     }
 
+    // Marked before the content goes, not after: between the punch and the mark
+    // the file would be empty and unmarked, which is exactly a plain local file
+    // with no content — and a reader arriving there would be given zeros and
+    // told they were real.
+    placeholder::mark_dehydrated(path, true)?;
+
     // Step 1. Still under the ignore mark the file got when it was hydrated, so
     // this write does not generate an event nobody is going to answer.
     let file = std::fs::OpenOptions::new().write(true).open(path)?;

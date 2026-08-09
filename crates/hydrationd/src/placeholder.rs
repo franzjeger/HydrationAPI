@@ -14,6 +14,20 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+/// Marks a file as holding no content *on purpose*.
+///
+/// `st_blocks == 0` is not enough to recognise a placeholder, and assuming it
+/// was cost a conformance run: a file that has just been created has no blocks
+/// either, so the very first `write()` into a new file was taken for a read of
+/// an empty placeholder, sent to the cloud, and refused. Creating a file inside
+/// the sync directory failed with `EIO`.
+///
+/// A legitimately sparse local file — `truncate -s 100 notes.txt` — has the same
+/// shape again, and no amount of looking at size and blocks separates the three
+/// cases. The distinction is not observable; it is a fact the framework knows
+/// and therefore has to write down.
+pub const XATTR_DEHYDRATED: &str = "user.hydration.dehydrated";
+
 /// `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`.
 const PUNCH_HOLE: i32 = 0x02;
 const KEEP_SIZE: i32 = 0x01;
@@ -26,6 +40,7 @@ pub fn create(path: &Path, size: u64, mode: u32) -> io::Result<FileId> {
         .open(path)?;
     file.set_len(size)?;
     fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+    mark_dehydrated(path, true)?;
     id_of(path)
 }
 
@@ -49,6 +64,10 @@ pub fn dehydrate(path: &Path) -> io::Result<()> {
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
+    // Set after the content is gone, never before: the two have to end up
+    // agreeing, and this is the direction where a crash in between leaves a file
+    // that is empty and known to be empty.
+    mark_dehydrated(path, true)?;
     Ok(())
 }
 
@@ -98,6 +117,9 @@ pub fn hydrate(path: &Path, content: &[u8], expected: u64) -> io::Result<()> {
             format!("placeholder became {after} bytes while being filled"),
         ));
     }
+    // The mark is the state, so filling the file has to clear it. Leaving it set
+    // would leave a full file that every reader is told is empty.
+    mark_dehydrated(path, false)?;
     Ok(())
 }
 
@@ -172,9 +194,71 @@ pub fn punch_fd(fd: std::os::fd::BorrowedFd<'_>, len: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// True when the file holds no content.
+/// True when the file is a placeholder.
+///
+/// The mark alone, deliberately. `st_blocks == 0` was part of this test until a
+/// conformance run showed why it cannot be: btrfs stores small files *inline* in
+/// metadata, so punching a hole in a 21-byte file leaves its blocks unchanged.
+/// A dehydrated script reported blocks, was taken for a file that already had
+/// content, and was served as zeros.
+///
+/// Sparseness is an observation, and on a real filesystem it is one that can
+/// disagree with the truth in both directions. Whether a file is a placeholder
+/// is not an observation at all — it is a fact the framework decided, so it is
+/// the framework that has to record it.
 pub fn is_dehydrated(path: &Path) -> io::Result<bool> {
-    Ok(fs::metadata(path)?.blocks() == 0)
+    has_mark(path)
+}
+
+/// Whether the file occupies disk. Distinct from [`is_dehydrated`] on purpose:
+/// this is the observation, that is the state, and §5.8 is about the two
+/// agreeing for files large enough that they can.
+pub fn occupies_disk(path: &Path) -> io::Result<bool> {
+    Ok(fs::metadata(path)?.blocks() > 0)
+}
+
+/// True when the file carries the placeholder mark, whatever its blocks say.
+pub fn has_mark(path: &Path) -> io::Result<bool> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has an interior nul"))?;
+    let n = std::ffi::CString::new(XATTR_DEHYDRATED).unwrap();
+    let rc = unsafe { libc::getxattr(c.as_ptr(), n.as_ptr(), std::ptr::null_mut(), 0) };
+    if rc >= 0 {
+        return Ok(true);
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(false),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Add or remove the placeholder mark.
+pub fn mark_dehydrated(path: &Path, on: bool) -> io::Result<()> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has an interior nul"))?;
+    let n = std::ffi::CString::new(XATTR_DEHYDRATED).unwrap();
+    let rc = if on {
+        unsafe {
+            libc::setxattr(
+                c.as_ptr(),
+                n.as_ptr(),
+                b"1".as_ptr() as *const libc::c_void,
+                1,
+                0,
+            )
+        }
+    } else {
+        let r = unsafe { libc::removexattr(c.as_ptr(), n.as_ptr()) };
+        if r < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENODATA) {
+            0
+        } else {
+            r
+        }
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub fn id_of(path: &Path) -> io::Result<FileId> {

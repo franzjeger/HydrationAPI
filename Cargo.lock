@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "adapter-framework"
+version = "0.1.0"
+dependencies = [
+ "hydration-client",
+ "hydration-conformance",
+ "hydration-protocol",
+ "hydrationd",
+ "libc",
+]
+
+[[package]]
 name = "adapter-onedrive-reference"
 version = "0.1.0"
 dependencies = [

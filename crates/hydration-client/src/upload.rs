@@ -187,14 +187,33 @@ impl<C: Clock> Queue<C> {
 
     /// Run one upload, start to finish, applying rules 2 and 3.
     pub fn run_one<S: Sink>(&mut self, file: FileId, store: &mut Store, sink: &mut S) -> Outcome {
-        self.waiting.remove(&file);
-        self.in_flight += 1;
-        let outcome = Self::send(file, store, sink);
-        self.in_flight -= 1;
+        self.begin(file);
+        let outcome = run_upload(file, store, sink);
+        self.finish();
         outcome
     }
 
-    fn send<S: Sink>(file: FileId, store: &mut Store, sink: &mut S) -> Outcome {
+    /// Claim a due file for upload.
+    ///
+    /// Split out from [`Queue::run_one`] so a caller can hold the queue lock
+    /// only long enough to claim the work, and not for the whole network round
+    /// trip. Holding it across the upload would make every status query wait on
+    /// the slowest transfer -- and the count is the one number the user is asked
+    /// to trust, so it must not be the thing that stops responding.
+    pub fn begin(&mut self, file: FileId) {
+        self.waiting.remove(&file);
+        self.in_flight += 1;
+    }
+
+    /// Release a claim taken by [`Queue::begin`].
+    pub fn finish(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+}
+
+/// One upload, with rules 2 and 3 applied. See [`Queue::run_one`].
+pub fn run_upload<S: Sink>(file: FileId, store: &mut Store, sink: &mut S) -> Outcome {
+    {
         // Rule 2: the name is resolved here, not when the job was queued. By now
         // an atomic save has already renamed the temp file into place, so this
         // is the name the file actually has.

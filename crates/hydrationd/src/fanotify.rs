@@ -181,6 +181,18 @@ impl Group {
         Ok(())
     }
 
+    /// Another handle on the *same* group.
+    ///
+    /// Not a new group: a second group with its own mark receives its own copy
+    /// of every event, and every copy has to be answered. Two groups where one
+    /// was intended means the first write into the watched mount blocks forever,
+    /// with the serving process sitting in `poll()` looking healthy.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            fd: self.fd.try_clone()?,
+        })
+    }
+
     /// Read whatever events are queued. Returns the raw buffer and its length;
     /// use [`events`] to walk it.
     pub fn read_events(&self, buf: &mut [u8]) -> io::Result<usize> {
