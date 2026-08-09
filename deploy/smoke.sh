@@ -61,7 +61,31 @@ GOT=$(timeout 15 cat "$MOUNT/notes.txt") || fail "reading the placeholder failed
 [ "$(stat -c %b "$MOUNT/notes.txt")" != "0" ] || fail "the file still occupies no disk"
 echo "PASS: a placeholder hydrated on first read"
 
-# 2. With the worker gone, a read fails rather than returning zeros.
+# 2. The framework creates its own placeholder for a new cloud object.
+#
+# This is the part the manual setup above cannot demonstrate: the placeholder
+# for notes.txt was made before the mount was marked, because a shell cannot
+# create one afterwards. The daemon can — it builds it on an anonymous inode and
+# links it in complete — and doing so inside a marked mount, live, is the whole
+# claim.
+printf 'arrived from the cloud after we started\n' > "$CLOUD/obj-9"
+printf 'arrived.txt' > "$CLOUD/obj-9.name"
+chown "$SYNC_USER" "$CLOUD/obj-9" "$CLOUD/obj-9.name"
+for _ in $(seq 30); do
+  [ -e "$MOUNT/arrived.txt" ] && break
+  sleep 1
+done
+[ -e "$MOUNT/arrived.txt" ] || fail "the delta pass never created a placeholder (see /tmp/smoke-sync.log)"
+[ "$(stat -c %b "$MOUNT/arrived.txt")" = "0" ] || fail "the new placeholder occupies disk"
+getfattr -n user.hydration.building "$MOUNT/arrived.txt" >/dev/null 2>&1 \
+  && fail "the construction mark reached the sync directory: this file would read as zeros"
+echo "delta: placeholder created live, $(stat -c %s "$MOUNT/arrived.txt") bytes, 0 blocks"
+
+GOT2=$(timeout 15 cat "$MOUNT/arrived.txt") || fail "reading the created placeholder failed"
+[ "$GOT2" = "arrived from the cloud after we started" ] || fail "wrong content: $GOT2"
+echo "PASS: a placeholder the framework created hydrated on first read"
+
+# 3. With the worker gone, a read fails rather than returning zeros.
 printf 'second object\n' > "$CLOUD/obj-2"; printf 'other.txt' > "$CLOUD/obj-2.name"
 kill -9 "$WORKER"; sleep 2
 SIZE2=$(stat -c %s "$CLOUD/obj-2")
