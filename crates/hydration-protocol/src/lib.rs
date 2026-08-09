@@ -33,7 +33,7 @@ pub mod transport;
 /// clears it when the content comes back, and the unprivileged side reports what
 /// a backup will therefore miss.
 ///
-/// Measured (`probes/nodump.c`, 6.17, btrfs), and all three answers shape the
+/// Measured (`probes/nodump.c`, 7.1.6, btrfs), and all three answers shape the
 /// code that uses this:
 ///
 /// ```text

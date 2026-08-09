@@ -18,7 +18,7 @@
 //! `O_TMPFILE` removes the dilemma rather than managing it. The placeholder is
 //! built on an anonymous inode — one with no name, that nothing can traverse to
 //! — and `linkat` gives it its name only once it is already complete. Measured
-//! on 6.17 (`probes/tmpfile.c`):
+//! on 7.1.6 (`probes/tmpfile.c`):
 //!
 //! ```text
 //!   events after create:            0

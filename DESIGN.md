@@ -782,6 +782,8 @@ som visste om de foregående:
 | `eventtrace`-proben | laget placeholderen etter markeringen |
 | Delta-synk | måtte gi en ny placeholder størrelse inne i monteringen |
 | `placeholder_creation`-testen | dehydrerte *etter* markeringen — i testen som finnes for å fange nettopp dette, og den låste hele suiten i 300 s |
+| `nodump`- og `mmapread`-probene | åpnet filen inne i monteringen fra prosessen som svarer |
+| **Delvis fylling** | å svare `FAN_ALLOW` etter å ha skrevet mindre enn `count` — se §8d |
 
 Formen er alltid den samme: **en skriving inne i en merket montering, utført av
 den eneste prosessen som kunne besvart hendelsen den utløser.** Resultatet er en
@@ -817,7 +819,7 @@ De to åpenbare utveiene var begge dårligere enn de så ut:
 
 `O_TMPFILE` fjerner dilemmaet i stedet for å forvalte det. Placeholderen bygges
 på en **anonym inode uten navn**, og `linkat` gir den navn først når den er
-ferdig. Målt på 6.17 (`probes/tmpfile.c`):
+ferdig. Målt på 7.1.6 (`probes/tmpfile.c`):
 
 ```
 events after create:            0
@@ -1133,7 +1135,7 @@ og fire kopier av det er hvordan de blir uenige.
 ## 6f. `nodump` har en eier
 
 Flagget hadde en setter og ingen livssyklus. Målt først (`probes/nodump.c`,
-6.17, btrfs), fordi alle tre svarene former koden:
+7.1.6, btrfs), fordi alle tre svarene former koden:
 
 ```
 set nodump: completed, events fired: 0
@@ -1389,7 +1391,7 @@ risikoprofil enn `ksmbd`-sammenligningen.
 ## 8a. En lesing forbi EOF utløser en hendelse
 
 Verdt å skrive ned fordi antagelsen om det motsatte er nærliggende og feil.
-`probes/emptyread.c`, 6.17:
+`probes/emptyread.c`, 7.1.6:
 
 ```
 empty (0)      size=0     events=1  read completed
@@ -1445,7 +1447,7 @@ frist. Å heve det betyr å fylle placeholderen mens bytene kommer, og det skape
 en tilstand som ikke finnes i dag: en placeholder som er *delvis* fylt, fortsatt
 merket, med leseren sin parkert inne i pre-content-hendelsen.
 
-Fire spørsmål avgjorde om den tilstanden er trygg. `probes/stream.c`, 6.17,
+Fire spørsmål avgjorde om den tilstanden er trygg. `probes/stream.c`, 7.1.6,
 btrfs:
 
 ```
@@ -1473,6 +1475,54 @@ streaming i det hele tatt er en mulig vei.
 
 ---
 
+## 8d. `count` er et krav, ikke et hint — og det endrer hva streaming kan love
+
+Dette sto feil i dokumentet. §8 sa at `count` er readahead-vinduet framfor det
+appen ba om, og brukte det som argument for å hente hele filen. Det første er
+sant; det andre fulgte ikke, og forskjellen er farlig.
+
+`probes/demand.c`, 7.1.6, btrfs — arbeideren fyller nøyaktig det hendelsen ber
+om, eller halvparten, og svarer `FAN_ALLOW`:
+
+```
+case                                     events    first off  first cnt  reader
+read(), fill exactly what was asked           1        36864       4096  real content
+read(), fill HALF of what was asked           1        36864       4096  ZEROS
+mmap(), fill exactly what was asked           1            0    4194304  real content
+mmap(), fill HALF of what was asked           1            0    4194304  ZEROS
+```
+
+**Å svare `FAN_ALLOW` etter å ha skrevet mindre enn `count` gir leseren nuller.**
+Stille: ingen ny hendelse, ingen feil, ingenting å se i en logg. Det er §6a-ters
+felle i sin sjuende forkledning, og den mest fristende hittil — den ser ut som en
+optimalisering («vi har første del, la leseren begynne») framfor en snarvei.
+
+To ting følger, og de peker i motsatt retning:
+
+- **`read()` krever bare siden sin.** En lesing på offset 40000 ga
+  `off=36864 count=4096`. En 10 GB fil lest sekvensielt er altså titusener av
+  små, avgrensede krav — ikke ett stort. For lesing forsvinner størrelsestaket
+  helt hvis hydreringen blir *områdebasert*, uten at vakten, fristene eller
+  §6a-bis må røres, og med en leser som kan drepes mellom områder.
+- **`mmap()` krever hele objektet i én hendelse.** Det kan ingen streaming
+  dekomponere. Én hendelse, holdt gjennom hele overføringen. Og mmap er ikke et
+  hjørnetilfelle: det er enhver ELF-laster, ethvert språkruntime som laster et
+  bibliotek, sqlite, `grep` på en stor fil.
+
+Streaming **fjerner** derfor ikke taket. Den flytter det, fra «hele objektet
+innen 30 sekunder» til «hele objektet innen en frist rammeverket velger», og for
+mappede lesinger er det fortsatt ett krav holdt gjennom hele overføringen. Det er
+en ekte forbedring på et par tiere i størrelsesorden, og det er *ikke* det samme
+som at grensen er borte. §8 og PROVIDER.md skal si det tallet, ikke påstå at
+taket er fjernet.
+
+Områdebasert hydrering er den egentlige løsningen for lesing, og den er bevisst
+ikke bundtet med denne endringen: den innfører en tredje filtilstand — delvis
+til stede — som butikken, manifestet, delta-passet, utkastelsen og §5.8 alle
+er tostilte om i dag.
+
+---
+
 ## 9. Det jeg ikke fikk verifisert
 
 Det finnes ingen gjentilkobling i prosessen. En klientomstart overlever ved at
@@ -1492,7 +1542,7 @@ I ærlighetens navn, siden dette skal være beslutningsgrunnlag:
 - ~~`FAN_MARK_IGNORE_SURV`~~ — **lukket.** `probes/ignoremark.c`: godtatt, undertrykker,
   og overlever endring. Ytelsespåstanden står.
 - ~~mmap- og `truncate`-hydrering~~ — **lukket, og begge svarene var de gode.**
-  `probes/mmapread.c`, 6.17: en *mappet* lesing av en placeholder utløser én hendelse og
+  `probes/mmapread.c`, 7.1.6: en *mappet* lesing av en placeholder utløser én hendelse og
   leseren får hydrert innhold. Det var det farligste åpne punktet her — de fleste
   språkruntimer, databaser og enhver ELF-laster mapper framfor å lese, og en udekket
   mmap ville gitt dem hullet uten feilmelding. `truncate` fyrer også, og det som
