@@ -77,6 +77,9 @@ pub struct Applied {
     pub created: usize,
     pub updated: usize,
     pub removed: usize,
+    /// Objects that arrived under a new path and were renamed locally rather
+    /// than duplicated.
+    pub moved: usize,
     /// Changes deliberately not applied because local content would have been
     /// lost. Not an error, and not silent: these are what a conflict UI is for.
     pub kept_local: Vec<String>,
@@ -118,6 +121,41 @@ pub fn apply<M: Materialise>(
                     out.failed.push(path.clone());
                     continue;
                 };
+
+                // The object may already be here under a different name.
+                //
+                // Every real service renames — a user drags a file into another
+                // folder, and the next delta reports the same object at a new
+                // path. Treating that as a new object leaves *two* local files
+                // recording one cloud id, and that is not untidy, it is
+                // dangerous: a later remote delete removes an arbitrary one of
+                // them, and an edit to the other is uploaded over the object the
+                // first still points at.
+                //
+                // A local rename is the honest translation. It preserves the
+                // inode, so the upload queue, the stamp and anything holding the
+                // file open all stay correct — and it is the only handling that
+                // cannot end with two claimants.
+                if let Some(existing) = by_cloud_id.get(cloud_id) {
+                    if existing.path != abs && existing.path.exists() {
+                        if abs.exists() {
+                            // Something else is already at the destination.
+                            // Placing anyway would produce the two-claimant state
+                            // this branch exists to prevent, so it is reported
+                            // rather than resolved by guessing.
+                            out.failed.push(path.clone());
+                            continue;
+                        }
+                        if let Some(parent) = abs.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if std::fs::rename(&existing.path, &abs).is_err() {
+                            out.failed.push(path.clone());
+                            continue;
+                        }
+                        out.moved += 1;
+                    }
+                }
 
                 match std::fs::metadata(&abs) {
                     // Nothing there: this is the ordinary case, a new object.

@@ -449,10 +449,12 @@ fn main() -> io::Result<()> {
                         match applied {
                             Ok(a) if a != Applied::default() => {
                                 eprintln!(
-                                    "hydration-sync: delta +{} ~{} -{} kept-local {} failed {}",
+                                    "hydration-sync: delta +{} ~{} -{} moved {} \
+                                     kept-local {} failed {}",
                                     a.created,
                                     a.updated,
                                     a.removed,
+                                    a.moved,
                                     a.kept_local.len(),
                                     a.failed.len()
                                 );
