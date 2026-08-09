@@ -1,0 +1,29 @@
+# The unprivileged sync daemon: credentials, cloud access, sync logic.
+#
+# A user unit. It has no capabilities, and losing it is not dangerous — with no
+# daemon to fetch content, hydration fails with EIO, which is a correct answer.
+# That is the whole point of the split: the process that can be compromised is
+# the one that cannot do damage.
+[Unit]
+Description=Hydration sync daemon (unprivileged)
+Documentation=https://github.com/franzjeger/HydrationAPI
+After=hydrationd.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hydration-sync --mount %h/OneDrive
+Restart=on-failure
+RestartSec=5
+
+# Deliberately NOT BindsTo the mount. This one may come and go; the helper is
+# what must not outlive it silently.
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=%h/OneDrive %h/.local/state/hydration
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target

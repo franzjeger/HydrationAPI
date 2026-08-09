@@ -1,0 +1,57 @@
+# The privileged hydration helper.
+#
+# Holds CAP_SYS_ADMIN and nothing else. It never opens a network socket, never
+# sees a credential, and never accepts a path from the unprivileged side — the
+# protocol between them carries an inode and bytes, and has no field that could
+# name a destination.
+[Unit]
+Description=Hydration helper (privileged)
+Documentation=https://github.com/franzjeger/HydrationAPI
+
+# The load-bearing line, and the reason this unit file matters at all.
+#
+# Two of the three ways hydration can fail are handled inside the process: the
+# supervisor answers for a worker that dies, including one that dies holding an
+# event. The third — both halves going at once, an OOM kill of the whole cgroup,
+# a panic — cannot be. Nothing that is dead can deny a read.
+#
+# So the mount goes with the helper. With no helper the files are *unreachable*,
+# which is a bad afternoon; without this line they are readable and full of
+# zeros, which is a restore from backup.
+BindsTo=hydration-mount.mount
+After=hydration-mount.mount
+StopPropagatedFrom=hydration-mount.mount
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hydrationd --mount /home/CHANGE-ME/OneDrive
+Restart=always
+RestartSec=1
+
+# Everything a helper this small does not need.
+User=root
+AmbientCapabilities=CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_SYS_ADMIN
+NoNewPrivileges=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+# PrivateNetwork is not hardening theatre here: this process has no business
+# reaching a network, and if it ever tries, that is the incident.
+
+# The supervisor exists to outlive the worker. Letting the kernel choose it as
+# an OOM victim would remove the thing that makes failures safe, at exactly the
+# moment things are going wrong.
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target

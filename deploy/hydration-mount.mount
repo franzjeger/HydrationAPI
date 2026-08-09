@@ -1,0 +1,17 @@
+# The sync volume.
+#
+# Its own mount, not a bind and not a directory: a directory mark delivers no
+# events at all, and every bind arrangement has a path that bypasses it. See
+# DESIGN.md §6.4 and §6.4a — both measured, not assumed.
+[Unit]
+Description=Hydration sync volume
+Before=hydrationd.service
+
+[Mount]
+What=/dev/disk/by-uuid/CHANGE-ME
+Where=/home/CHANGE-ME/OneDrive
+Type=btrfs
+Options=subvol=@onedrive,noatime
+
+[Install]
+WantedBy=multi-user.target
