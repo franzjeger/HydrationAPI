@@ -181,6 +181,14 @@ impl<C: Clock> Queue<C> {
         self.waiting.len() + self.in_flight
     }
 
+    /// Whether this file has an edit that has not been sent.
+    ///
+    /// Consulted by the delta pass: a waiting edit is newer than anything the
+    /// cloud can say, and exists nowhere else.
+    pub fn is_waiting(&self, file: &FileId) -> bool {
+        self.waiting.contains_key(file)
+    }
+
     pub fn waiting(&self) -> usize {
         self.waiting.len()
     }

@@ -87,6 +87,24 @@ impl Store {
         Ok(found)
     }
 
+    /// Index by cloud id, for the removal half of a delta pass.
+    ///
+    /// A remote deletion names an *object*, not a path — the file may have been
+    /// renamed locally since, and looking it up by name would then miss it and
+    /// leave a file the cloud no longer has.
+    pub fn by_cloud_id(&self) -> HashMap<String, Entry> {
+        let mut out = HashMap::new();
+        for (id, path) in &self.index {
+            if let Some(e) = self.lookup(id) {
+                if let Some(cid) = e.cloud_id.clone() {
+                    out.insert(cid, e);
+                }
+            }
+            let _ = path;
+        }
+        out
+    }
+
     pub fn remember(&mut self, id: FileId, path: &Path) {
         self.index.insert(id, path.to_path_buf());
     }
