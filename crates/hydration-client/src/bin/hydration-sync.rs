@@ -450,6 +450,14 @@ fn main() -> io::Result<()> {
             let mut placer = TmpfilePlacer::new(&mount);
             let mut store = Store::new();
             let mut cursor = Cursor::default();
+            // Set when a pass deliberately left something for a later one.
+            //
+            // Without it the *next* pass undoes the decision: a delta feed with
+            // nothing new returns an empty batch, and the empty-batch arm below
+            // advanced the cursor unconditionally — so the refusal that was
+            // held back on purpose was consumed by silence, and the service
+            // never mentions those objects again.
+            let mut unfinished = false;
             while !stop.load(Ordering::SeqCst) {
                 match cloud.changes(&cursor) {
                     Ok((changes, next)) if !changes.is_empty() => {
@@ -473,14 +481,18 @@ fn main() -> io::Result<()> {
                         // pass and would succeed on the next, if there were one.
                         match &applied {
                             Ok(a) if a.retryable => {
+                                unfinished = true;
                                 eprintln!(
                                     "hydration-sync: delta pass incomplete ({} deferred); \
                                      not advancing",
                                     a.failed.len()
                                 );
                             }
-                            Ok(_) => cursor = next,
-                            Err(_) => {}
+                            Ok(_) => {
+                                unfinished = false;
+                                cursor = next;
+                            }
+                            Err(_) => unfinished = true,
                         }
                         match applied {
                             Ok(a) if a != Applied::default() => {
@@ -509,7 +521,11 @@ fn main() -> io::Result<()> {
                             Err(e) => eprintln!("hydration-sync: delta pass failed: {e}"),
                         }
                     }
-                    Ok((_, next)) => cursor = next,
+                    // Nothing new. Only meaningful if the last pass finished:
+                    // silence must not be read as permission to move past work
+                    // that was deliberately deferred.
+                    Ok((_, next)) if !unfinished => cursor = next,
+                    Ok(_) => {}
                     Err(e) => eprintln!("hydration-sync: could not list the cloud: {e}"),
                 }
                 std::thread::sleep(Duration::from_secs(5));

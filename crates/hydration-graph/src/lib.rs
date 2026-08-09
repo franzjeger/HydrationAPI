@@ -19,6 +19,7 @@
 use hydration_client::delta::Change;
 use hydration_client::namespace::{Item, Namespace, Problem, Kind};
 use serde::Deserialize;
+use std::io;
 
 // ---------------------------------------------------------------------------
 // Ids
@@ -1144,6 +1145,11 @@ pub enum Escalation {
     ShapeFlipWithChildren { key: ObjectKey, children: usize },
     /// A second root arrived with a different id.
     ForeignRoot { key: ObjectKey },
+    /// The same cursor has come back too many times: the framework cannot apply
+    /// what it is being given, and repeating it forever is not progress.
+    StalledRetryable { passes: u32, failed: Vec<String> },
+    /// A round would remove more than a mistake should be able to.
+    BlastRadius { removals: usize, known: usize },
     /// The round did not account for everything it was given.
     ///
     /// Not a fault in the data — a refused item, or one still waiting on a
@@ -1262,4 +1268,249 @@ impl Round {
             report: self.report,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// The transport seam, persisted state, and the driver
+//
+// Skeleton. Every body below is `unimplemented!()`, and `tests/discover.rs`
+// is written against it — 54 tests that must all fail until it is filled in.
+// The seam exists so that everything above HTTP is testable with no socket, no
+// credentials and no clock: a suite with a real seven-second floor is a suite
+// nobody runs.
+// ---------------------------------------------------------------------------
+
+/// One HTTP reply, before anything reads it as a page.
+///
+/// `retry_after` is the header already parsed, because parsing it belongs below
+/// this line and nothing above should have an opinion about HTTP-dates.
+#[derive(Clone, Debug)]
+pub struct RawPage {
+    pub status: u16,
+    pub retry_after: Option<std::time::Duration>,
+    pub body: Vec<u8>,
+}
+
+/// Where pages come from. The only thing the `http` feature implements.
+pub trait PageSource: Send {
+    /// Start an enumeration from the beginning.
+    fn first(&mut self, scope: &DriveScope) -> io::Result<RawPage>;
+    fn next(&mut self, link: &NextLink) -> io::Result<RawPage>;
+    /// Resume from a saved token.
+    fn resume(&mut self, link: &DeltaLink) -> io::Result<RawPage>;
+    /// The token for "everything from now on", without enumerating what is
+    /// already there. Graph's `delta?token=latest`.
+    fn latest(&mut self, scope: &DriveScope) -> io::Result<RawPage>;
+}
+
+/// Waiting, injected so a test can assert on the duration rather than live it.
+pub trait Sleeper: Send {
+    fn sleep(&mut self, how_long: std::time::Duration);
+}
+
+/// The fields a delta enumeration must ask for.
+///
+/// A mapper that reads a facet nobody added here sees `None` on every item and
+/// silently maps the whole drive wrong, so the list and the reader have to be
+/// checked against each other.
+pub const REQUIRED_SELECT: &[&str] = &[
+    "id",
+    "name",
+    "size",
+    "eTag",
+    "cTag",
+    "file",
+    "folder",
+    "package",
+    "root",
+    "deleted",
+    "malware",
+    "pendingOperations",
+    "remoteItem",
+    "parentReference",
+];
+
+/// The URL an enumeration starts at.
+///
+/// Not behind the `http` feature: which origin a link may point at is transport
+/// *policy*, and policy has to be testable without a socket.
+pub fn delta_url(scope: &DriveScope) -> String {
+    let _ = scope;
+    unimplemented!()
+}
+
+/// The tree, encoded for storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeBlob {
+    bytes: Vec<u8>,
+}
+
+impl TreeBlob {
+    pub fn encode(drive: &DriveId, tags: TagSource, items: &[Item]) -> TreeBlob {
+        let _ = (drive, tags, items);
+        unimplemented!()
+    }
+    pub fn from_bytes(bytes: Vec<u8>) -> TreeBlob {
+        TreeBlob { bytes }
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn drive(&self) -> io::Result<DriveId> {
+        unimplemented!()
+    }
+    pub fn tag_source(&self) -> io::Result<TagSource> {
+        unimplemented!()
+    }
+    pub fn items(&self) -> io::Result<Vec<Item>> {
+        unimplemented!()
+    }
+    pub fn mounts(&self) -> io::Result<Vec<MountPoint>> {
+        unimplemented!()
+    }
+    pub fn with_mounts(self, mounts: &[MountPoint]) -> TreeBlob {
+        let _ = mounts;
+        unimplemented!()
+    }
+}
+
+/// One delta token per drive: a fan-out has several, and one string cannot
+/// stand for all of them.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct TokenBlob {
+    per_drive: std::collections::BTreeMap<String, String>,
+}
+
+impl TokenBlob {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn one(drive: &DriveId, link: &str) -> Self {
+        let mut t = Self::new();
+        t.set(drive, link);
+        t
+    }
+    pub fn set(&mut self, drive: &DriveId, link: &str) {
+        self.per_drive
+            .insert(drive.as_str().to_string(), link.to_string());
+    }
+    pub fn get(&self, drive: &DriveId) -> Option<&str> {
+        self.per_drive.get(drive.as_str()).map(|s| s.as_str())
+    }
+    pub fn drives(&self) -> Vec<DriveId> {
+        self.per_drive
+            .keys()
+            .filter_map(|d| DriveId::parse(d).ok())
+            .collect()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.per_drive.is_empty()
+    }
+    pub fn as_bytes(&self) -> Vec<u8> {
+        unimplemented!()
+    }
+}
+
+/// A tree and a token, and whether they agree.
+pub struct PersistedState {
+    tree: Option<TreeBlob>,
+    token: Option<TokenBlob>,
+}
+
+impl PersistedState {
+    /// A pair a completed round would have written.
+    pub fn consistent(
+        drive: &DriveId,
+        tags: TagSource,
+        items: &[Item],
+        token: &TokenBlob,
+    ) -> Self {
+        let _ = (drive, tags, items, token);
+        unimplemented!()
+    }
+    pub fn tree_only(drive: &DriveId, tags: TagSource, items: &[Item]) -> Self {
+        let _ = (drive, tags, items);
+        unimplemented!()
+    }
+    /// Deliberately unbound, for the tests that make a mismatched pair.
+    pub fn raw(tree: Option<TreeBlob>, token: Option<TokenBlob>) -> Self {
+        Self { tree, token }
+    }
+    pub fn tree(&self) -> Option<&TreeBlob> {
+        self.tree.as_ref()
+    }
+    pub fn token(&self) -> Option<&TokenBlob> {
+        self.token.as_ref()
+    }
+}
+
+/// Where the tree and the token live.
+///
+/// Two writes, never one, because the order between them is the whole rule: a
+/// tree newer than its token is harmless, and a token newer than its tree is
+/// unrecoverable.
+pub trait StateStore: Send {
+    fn load(&mut self) -> io::Result<Option<PersistedState>>;
+    fn save_tree(&mut self, tree: &TreeBlob) -> io::Result<()>;
+    fn save_token(&mut self, token: &TokenBlob) -> io::Result<()>;
+}
+
+/// A ceiling on one round, so an endless `nextLink` chain is a bounded failure
+/// rather than a daemon that never returns.
+pub const MAX_PAGES_PER_ROUND: usize = 1024;
+
+/// How many times the same cursor may be handed back before the round stops
+/// believing progress is possible.
+pub const STALL_LIMIT: u32 = 3;
+
+pub struct GraphDiscover<P: PageSource, S: StateStore, K: Sleeper> {
+    scope: DriveScope,
+    pages: P,
+    store: S,
+    sleeper: K,
+}
+
+impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
+    pub fn new(scope: DriveScope, pages: P, store: S, sleeper: K) -> Self {
+        Self {
+            scope,
+            pages,
+            store,
+            sleeper,
+        }
+    }
+
+    /// `Escalation` has no channel through `Discover`'s `io::Result`, so the
+    /// last one is readable here rather than flattened into an error string.
+    pub fn last_escalation(&self) -> Option<Escalation> {
+        unimplemented!()
+    }
+}
+
+impl<P: PageSource, S: StateStore, K: Sleeper> hydration_client::delta::Discover
+    for GraphDiscover<P, S, K>
+{
+    fn changes(
+        &mut self,
+        cursor: &hydration_client::delta::Cursor,
+    ) -> io::Result<(Vec<Change>, hydration_client::delta::Cursor)> {
+        let _ = cursor;
+        unimplemented!()
+    }
+}
+
+/// Refuse a round that would remove more than a deployment could survive.
+pub fn guard_blast_radius(removals: usize, known: usize) -> Result<(), Escalation> {
+    let _ = (removals, known);
+    unimplemented!()
+}
+
+/// What a full enumeration cannot say on its own.
+///
+/// A listing names what exists, never what stopped existing — so after a token
+/// expiry the only way to find a remote deletion is to diff a fresh enumeration
+/// against the tree from before it.
+pub fn deletions_since(before: &[Item], after: &Namespace) -> Result<Vec<Change>, Escalation> {
+    let _ = (before, after);
+    unimplemented!()
 }
