@@ -3801,3 +3801,117 @@ fn the_pinned_tag_source_is_persisted_and_never_re_probed() {
         }
     }
 }
+
+// ===========================================================================
+// CLASS I — An unacknowledged batch and a restart
+//
+// `a_removal_the_framework_could_not_apply_is_re_served_not_forgotten` proves
+// the removal survives a repeat *within one process*. The copy it survives in is
+// `self.served` — a `Vec<Change>` in RAM. This class asks the only question that
+// is left: what happens when the process does not live long enough to be asked
+// again.
+// ===========================================================================
+
+/// The delta thread is spawned bare (`hydration-sync.rs:446`), so a stalled
+/// drive is one `SIGTERM`, one panic in a sibling thread or one laptop lid away
+/// from a restart, and the daemon restarts on a five-second loop.
+///
+/// The window is exactly this: round one consumed 01X's tombstone from the D9
+/// feed and returned the `Removed`. `hydration-sync.rs:483-490` held the cursor
+/// because the pass was retryable, so `changes` is never called with the cursor
+/// round one minted — the batch was never applied. Then the process dies.
+///
+/// Whether the removal is recoverable is decided entirely by which token is on
+/// disk at that moment, and that is the whole of decision 3 in
+/// `docs/GRAPH-DISCOVER-GROUNDWORK.md`:
+///
+///   * token still at **D9** — the position the batch was read from — and the
+///     fresh instance re-asks Graph from there and is handed the tombstone
+///     again;
+///   * token already at **D10** and the tombstone is unreachable forever. Graph
+///     does not replay a consumed tombstone, `Namespace::listing()` cannot
+///     express a deletion, and the tree written alongside that token already
+///     agrees 01X is gone — so no diff can rediscover it either. The user keeps
+///     a placeholder for a deleted object, and an edit to it uploads content
+///     back into that object.
+///
+/// Both branches are scripted to succeed, so the wrong one is quiet: a provider
+/// that advanced to D10 resumes D10 and is answered with a well-formed, entirely
+/// ordinary empty page. Nothing errors. The only thing that distinguishes right
+/// from wrong is whether 01X is in the batch.
+#[test]
+fn a_removal_a_restart_interrupted_before_it_was_applied_is_still_reported() {
+    let rig = Rig::new();
+    rig.store.preload(primed(
+        &[
+            root_item(MINE, ROOT),
+            file_item(MINE, "01A", ROOT, "a.txt", 10, "c:{G},1"),
+            file_item(MINE, "01B", ROOT, "b.txt", 11, "c:{G},2"),
+            file_item(MINE, "01X", ROOT, "x.txt", 12, "c:{G},3"),
+        ],
+        Some("D9"),
+    ));
+    // The tombstone lives on the D9 token and nowhere else. The last reply for a
+    // key repeats forever, so this is also "Graph replays it for as long as D9 is
+    // the position" — which is what makes the surviving-token branch recoverable.
+    rig.script(
+        resume_req("D9"),
+        vec![Reply::ok(body_delta(
+            &[tomb_json(MINE, "01X", "x.txt", ROOT)],
+            &lnk("D10"),
+        ))],
+    );
+    // Past the tombstone the feed is quiet: Graph has nothing further to say,
+    // because it already said it once, on the earlier token.
+    rig.script(
+        resume_req("D10"),
+        vec![Reply::ok(body_delta(&[], &lnk("D11")))],
+    );
+
+    let mut one = rig.provider();
+    let (b1, _c1) = one.changes(&Cursor::default()).expect("round one");
+    assert_eq!(
+        removed(&b1),
+        set(&[cloud(MINE, "01X")]),
+        "round one consumed the tombstone and must report it"
+    );
+
+    // What the dying process left behind.
+    let token_after_one = rig
+        .store
+        .stored_token()
+        .map(|t| render_token(&t))
+        .unwrap_or_else(|| "<none>".into());
+    let tree_after_one_holds_x = rig
+        .store
+        .stored_tree()
+        .map(|t| tree_ids(&t).contains(&cloud(MINE, "01X")))
+        .unwrap_or(false);
+
+    // The framework never applied the batch, so `changes` is never called again
+    // with the cursor round one returned. The process dies here.
+    drop(one);
+    rig.journal.clear();
+
+    // A restart: a fresh instance over the same state directory, handed the
+    // empty cursor the framework hands after every restart.
+    let mut two = rig.provider();
+    let (b2, _c2) = two
+        .changes(&Cursor::default())
+        .expect("a restart with good state must not fail");
+
+    assert_eq!(
+        removed(&b2),
+        set(&[cloud(MINE, "01X")]),
+        "the only copy of this removal was a Vec<Change> in the dead process's \
+         memory.\n  round one left the token at {token_after_one}\n  round one's \
+         tree {} 01X\n  the restart issued {:?}\n  and got back removals {:?}",
+        if tree_after_one_holds_x {
+            "still holds"
+        } else {
+            "no longer holds"
+        },
+        rig.journal.calls(),
+        removed(&b2),
+    );
+}
