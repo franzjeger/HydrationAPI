@@ -38,6 +38,56 @@ suite's own weaknesses. Three tests cannot discriminate what they claim, and the
 stall path stops at the moment it is declared — what happens on the fourth repeat
 is undefined, and both live behaviours pass everything written.
 
+## The three decisions, taken before the implementation
+
+The falsification found three places where both live behaviours passed
+everything written. They are design choices, so they are made here rather than
+by whichever branch got written first.
+
+### 1. The fourth repeat of a stalled cursor: keep serving it
+
+After `STALL_LIMIT` repeats the round records `Escalation::StalledRetryable` and
+**keeps serving the same batch**. It does not re-enumerate.
+
+Re-enumeration is the tempting answer and it is lossy. The tombstone that is
+stuck was consumed from the feed on the first pass, so the provider's tree
+already agrees the file is gone — a fresh enumeration diffs against that tree and
+finds nothing to remove. The removal the framework could not apply would be
+dropped by the very mechanism meant to recover it, and the placeholder for a
+deleted object would be permanent.
+
+So the provider keeps saying the same true thing. No progress is the honest
+report when nothing can progress; the escalation is what makes it visible.
+
+### 2. An empty cursor with persisted state means "resume", not "start over"
+
+The framework does not persist the cursor and hands `Cursor::default()` after
+every restart. Read as "start over" that is a full enumeration of a hundred
+thousand items on every daemon restart, against an endpoint that throttles.
+
+`Cursor::default()` therefore means *the framework does not know where we are*,
+and the provider does: it resumes from its stored token. The framework's cursor
+is a round-trip token for detecting a **repeat**, not a position — a *same
+instance* handed back the same input cursor it was just given is a repeat, and
+gets the remembered batch with no request and no sleep.
+
+### 3. The token is persisted only once the framework has moved on
+
+A provider is never told that a batch was applied. The one observable signal is
+being called again with a *different* cursor than the one it was handed — which
+only happens after `hydration-sync` accepted the pass and advanced.
+
+So the token is written when that happens, not when the page was fetched. Until
+then the stored token is the older one, and a restart re-asks Graph from there
+and receives the same changes again — including the tombstone that was stuck.
+Nothing depends on the framework acknowledging anything it does not already do.
+
+This is the answer to "is an unacknowledged batch lost on restart": it is not,
+because the position it was read from is still the saved one. It also settles the
+contradiction the falsification found between `token_writes().len() == 1` and the
+proposed restart test — the token write moves to the *next* call, and the tests
+that assert otherwise are the ones that change.
+
 ---
 
 # API sketch and merge notes
