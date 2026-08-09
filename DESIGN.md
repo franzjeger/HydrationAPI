@@ -717,15 +717,38 @@ tilgjengelig svar.
 Det skjedde flere ganger under utviklingen, og hver gang var symptomet det samme:
 monteringen så frisk ut, `mountpoint` sa ja, `touch` virket, og alt annet hang.
 
-**Hva som må inn i v1:**
+**Hva som måtte inn i v1 — nå bygget og testfestet** (`tests/deadlines.rs`):
 
-- Arbeideren må ha en **tidsfrist per hendelse**. Går fetch over den, svarer den
-  `EIO` og går videre. En treg sky er ikke en grunn til å låse et filsystem.
-- Vakten må overvåke *fremdrift*, ikke bare liv. En arbeider som ikke har svart
-  på noe på N sekunder skal behandles som død: vakten svarer på det som står i
-  `InFlight` og tar over.
-- Monteringen må rives ned når enheten ikke kan gjenopprettes. `BindsTo=` fra §6a
-  dekker dette, og er nå begrunnet av to ting i stedet for én.
+- **Tidsfrist per hendelse.** Hentingen kjører på egen tråd og arbeideren venter
+  på en kanal, så en `Fetch` som aldri returnerer koster leseren `EIO` etter
+  fristen framfor å holde den for alltid. Fristen kan ikke håndheves ved å be
+  klienter respektere en — det er nettopp den slags regel rammeverket finnes for
+  å slippe. Standard 30 s.
+- **Vakten overvåker fremdrift, ikke liv.** Den delte siden bærer nå en teller
+  arbeideren øker for hver besvarte hendelse. Holder arbeideren en hendelse uten
+  at telleren har flyttet seg på 90 s, behandles den som død. Bare en arbeider
+  som *holder noe* kan stå fast; en ledig arbeider gjør heller ingen fremdrift,
+  og å rive ned monteringen hver gang ingen leser ville vært verre enn feilen.
+- **Rekkefølgen ved nedrivning er selve poenget.** Signal først: en arbeider som
+  står i en nettverkshenting dør der. Gjør den ikke det, står den i en
+  pre-content-hendelse den selv utløste (§6a-ter), og da når ingen signaler den —
+  den slippes først når hendelsen besvares. Derfor kommer svaret *etter* drapet,
+  ikke før.
+- **Monteringen rives ned uten å feile åpent.** Å avslutte prosessen ville lukket
+  gruppen, og en montering uten gruppe feiler *åpent*: hver placeholder blir en
+  kilde til nuller. Så monteringen kobles fra med `MNT_DETACH` mens prosessen
+  blir stående og nekter alt som allerede er underveis, og avslutter først når
+  det har vært stille i 10 s. `BindsTo=` dekker det samme fra systemds side;
+  hjelperen gjør det selv i tillegg, så garantien ikke avhenger av å ha blitt
+  utrullet med de medfølgende enhetene.
+
+**Én begrensning som står igjen, målt og bevisst.** Hentinger er serialisert —
+én forbindelse til synk-daemonen, én utestående forespørsel. En henting som har
+gått over fristen holder derfor køen til den faktisk returnerer, og lesinger bak
+den får `EIO` framfor innhold. Det er en *degradering*, ikke en låsing, og det er
+skillet §6a-bis handler om: hver leser besvares raskt. Å fjerne det krever
+pipelining, som protokollens `id`-felt allerede åpner for og transporten ennå
+ikke implementerer.
 
 ---
 

@@ -13,7 +13,7 @@
 //! writes what it is told into the user's files.
 
 use hydration_protocol::transport::HelperConn;
-use hydrationd::daemon::Worker;
+use hydrationd::daemon::{Worker, DEFAULT_STALL};
 use hydrationd::exposure::ExposureWatch;
 use hydrationd::fanotify::Group;
 use hydrationd::policy::Policy;
@@ -162,11 +162,54 @@ fn main() -> io::Result<()> {
         args.mount.display()
     );
 
-    // The supervisor. It does nothing at all until the worker is gone, and then
-    // it denies everything — because a read that cannot be served must fail, not
-    // return the zeros a placeholder is made of.
+    // The supervisor. It does nothing at all while the worker is healthy, and
+    // then it denies everything — because a read that cannot be served must
+    // fail, not return the zeros a placeholder is made of.
+    //
+    // "Healthy" means *answering*, not merely alive. §6a-bis: a worker that has
+    // stopped answering is worse than one that has died, because the reader it
+    // is holding cannot be killed by a signal and every later operation on the
+    // mount queues behind it.
     let mut status = 0;
-    unsafe { libc::waitpid(child, &mut status, 0) };
+    let mut beat = in_flight.progress();
+    let mut moved = Instant::now();
+    let mut stalled = false;
+    loop {
+        if unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) } == child {
+            break;
+        }
+        let now = in_flight.progress();
+        if now != beat {
+            beat = now;
+            moved = Instant::now();
+        }
+        // An idle worker makes no progress either; only one that is holding an
+        // event can be stalling.
+        if in_flight.current().is_some() && moved.elapsed() >= DEFAULT_STALL {
+            stalled = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    if stalled {
+        eprintln!(
+            "hydrationd: worker {child} has not answered anything in {}s while holding \
+             an event — treating it as dead",
+            DEFAULT_STALL.as_secs()
+        );
+        // Signal first, answer second. A worker stuck in a network fetch dies
+        // here; one stuck inside a pre-content event of its own making cannot be
+        // signalled at all, and is released only by the answer below.
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        let grace = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < grace {
+            if unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) } == child {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     let signal = if libc::WIFSIGNALED(status) {
         Some(libc::WTERMSIG(status))
     } else {
@@ -180,9 +223,46 @@ fn main() -> io::Result<()> {
         let _ = deny(&group, stranded);
         eprintln!("hydrationd: answered stranded event fd {stranded} with EIO");
     }
+    if stalled {
+        unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+    }
 
+    // Take the mount out of the namespace, but keep denying.
+    //
+    // §6a-bis's third requirement. The order is the point: exiting here would
+    // close the group, and a mount with no group fails *open* — every
+    // placeholder becomes a source of zeros, which is the failure this whole
+    // design exists to prevent. So the mount is detached lazily, which stops any
+    // new access, while this process stays alive to answer everything already in
+    // flight with EIO.
+    //
+    // `BindsTo=` in the unit covers the same ground from systemd's side. Doing it
+    // here too means the guarantee does not depend on having been deployed with
+    // the supplied units.
+    let detached = unsafe {
+        let c = std::ffi::CString::new(args.mount.as_os_str().as_encoded_bytes()).unwrap();
+        libc::umount2(c.as_ptr(), libc::MNT_DETACH) == 0
+    };
+    eprintln!(
+        "hydrationd: {} — denying everything still in flight, then exiting non-zero",
+        if detached {
+            "mount detached"
+        } else {
+            "could not detach the mount (see the unit's BindsTo=)"
+        }
+    );
+
+    // Denying until the mount has gone quiet. Not forever: a process that never
+    // exits is one systemd never restarts, and the whole point of detaching
+    // above was to reach a state the unit can recover from. Quiet means nothing
+    // has arrived for long enough that nothing is left waiting on us.
     let mut buf = vec![0u8; 64 * 1024];
+    let mut quiet_since = Instant::now();
     loop {
+        if quiet_since.elapsed() >= Duration::from_secs(10) {
+            eprintln!("hydrationd: nothing left in flight; exiting so the unit can restart");
+            std::process::exit(if stalled { 75 } else { 1 });
+        }
         let mut pfd = libc::pollfd {
             fd: group.as_raw(),
             events: libc::POLLIN,
@@ -191,6 +271,7 @@ fn main() -> io::Result<()> {
         if unsafe { libc::poll(&mut pfd, 1, 500) } <= 0 {
             continue;
         }
+        quiet_since = Instant::now();
         let len = group.read_events(&mut buf)?;
         for ev in hydrationd::fanotify::events(&buf, len) {
             if ev.fd >= 0 {

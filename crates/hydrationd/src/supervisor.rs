@@ -33,7 +33,22 @@
 
 use crate::fanotify::{self, Group};
 use std::io;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+
+/// The two words the halves share. Laid out explicitly because it is mapped, not
+/// allocated, and both processes have to agree on where each field lives.
+#[repr(C)]
+struct Shared {
+    /// The event fd the worker is currently holding, or -1.
+    slot: AtomicI32,
+    _pad: u32,
+    /// Incremented every time the worker finishes answering an event.
+    ///
+    /// A counter rather than a timestamp, so the shared page needs no clock and
+    /// the supervisor's judgement is "did this move" rather than "is this recent
+    /// enough" — which cannot be fooled by a clock stepping.
+    beat: AtomicU64,
+}
 
 /// Where the worker records the event it currently holds.
 ///
@@ -50,7 +65,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 pub struct InFlight {
     /// Points into the shared mapping. Cloned by value across `fork`, which is
     /// exactly what we want: both processes address the same page.
-    slot: *mut AtomicI32,
+    shared: *mut Shared,
     /// Only the process that created the mapping unmaps it.
     owner: bool,
 }
@@ -68,7 +83,7 @@ impl Default for InFlight {
 
 impl InFlight {
     pub fn new() -> Self {
-        let len = std::mem::size_of::<AtomicI32>();
+        let len = std::mem::size_of::<Shared>();
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -84,15 +99,21 @@ impl InFlight {
             "could not map the in-flight slot: {}",
             std::io::Error::last_os_error()
         );
-        let slot = p as *mut AtomicI32;
-        unsafe { (*slot).store(-1, Ordering::SeqCst) };
-        Self { slot, owner: true }
+        let shared = p as *mut Shared;
+        unsafe {
+            (*shared).slot.store(-1, Ordering::SeqCst);
+            (*shared).beat.store(0, Ordering::SeqCst);
+        }
+        Self {
+            shared,
+            owner: true,
+        }
     }
 
     /// A handle onto the same slot, for the other side of the fork.
     pub fn share(&self) -> Self {
         Self {
-            slot: self.slot,
+            shared: self.shared,
             owner: false,
         }
     }
@@ -100,19 +121,37 @@ impl InFlight {
     /// Called by the worker before anything that can block: a network fetch, a
     /// lock, a write to a socket the other end may never read.
     pub fn holding(&self, fd: i32) {
-        unsafe { (*self.slot).store(fd, Ordering::SeqCst) };
+        unsafe { (*self.shared).slot.store(fd, Ordering::SeqCst) };
     }
 
     /// Called by the worker once the event has been answered.
+    ///
+    /// Bumps the progress counter as well as clearing the slot, and in that
+    /// order: the supervisor's test is "holding something, and the counter has
+    /// not moved", so clearing first would let a worker that answers steadily
+    /// look momentarily stalled.
     pub fn released(&self) {
-        unsafe { (*self.slot).store(-1, Ordering::SeqCst) };
+        unsafe {
+            (*self.shared).beat.fetch_add(1, Ordering::SeqCst);
+            (*self.shared).slot.store(-1, Ordering::SeqCst);
+        }
     }
 
     pub fn current(&self) -> Option<i32> {
-        match unsafe { (*self.slot).load(Ordering::SeqCst) } {
+        match unsafe { (*self.shared).slot.load(Ordering::SeqCst) } {
             -1 => None,
             fd => Some(fd),
         }
+    }
+
+    /// How many events the worker has answered.
+    ///
+    /// Only ever compared with itself. §6a-bis: the supervisor has to watch
+    /// *progress*, because a worker that is alive and stuck is worse than one
+    /// that is dead — a process blocked in a pre-content event cannot be killed
+    /// by a signal, so nothing recovers on its own.
+    pub fn progress(&self) -> u64 {
+        unsafe { (*self.shared).beat.load(Ordering::SeqCst) }
     }
 }
 
@@ -127,8 +166,8 @@ impl Drop for InFlight {
         if self.owner {
             unsafe {
                 libc::munmap(
-                    self.slot as *mut libc::c_void,
-                    std::mem::size_of::<AtomicI32>(),
+                    self.shared as *mut libc::c_void,
+                    std::mem::size_of::<Shared>(),
                 )
             };
         }

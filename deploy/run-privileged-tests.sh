@@ -60,6 +60,7 @@ run hydrationd eviction
 run hydrationd no_feedback_loop
 run hydrationd exposure
 run hydrationd placeholder_creation
+run hydrationd deadlines
 run adapter-framework conformance
 
 echo

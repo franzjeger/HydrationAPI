@@ -47,23 +47,159 @@ pub enum Handled {
     },
 }
 
+/// A [`Fetch`] you can give up on.
+///
+/// §6a-bis, first requirement: **the worker must have a per-event deadline.** A
+/// `Fetch` is client code talking to a network, and it may never return. If the
+/// worker waits inside it, the pre-content event goes unanswered — and a process
+/// blocked in one cannot be killed by a signal, so every later operation on the
+/// mount blocks too and nothing recovers on its own. A slow cloud must not be
+/// able to lock a filesystem.
+///
+/// The deadline cannot be enforced by asking implementors to respect one; that
+/// is the kind of rule this framework exists to stop needing. So the fetch runs
+/// on its own thread and the worker waits on a channel instead. When the wait
+/// expires the worker answers `EIO` and moves on, and the abandoned fetch is
+/// left to finish or not — its reply is discarded either way.
+///
+/// The thread is created after `spawn_split`'s `fork`, never before: forking a
+/// process that already has threads gives the child one thread and any locks the
+/// others held, which is its own class of hang.
+struct Timed {
+    req: std::sync::mpsc::Sender<(u64, FileId, u64)>,
+    rep: std::sync::mpsc::Receiver<(u64, io::Result<Vec<u8>>)>,
+    seq: u64,
+    /// Consecutive deadlines missed. A single slow object is not a verdict on
+    /// the fetcher; a run of them is.
+    missed: u32,
+}
+
+/// After this many consecutive misses the fetcher is treated as wedged and no
+/// longer waited on, so each event costs a denial rather than a full timeout.
+/// Denying promptly is the fail-closed answer; making every reader wait out the
+/// deadline first would be the same outage, slower.
+const WEDGED_AFTER: u32 = 3;
+
+impl Timed {
+    fn new<F: Fetch + 'static>(mut fetch: F) -> Self {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<(u64, FileId, u64)>();
+        let (rep_tx, rep_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok((seq, file, size)) = req_rx.recv() {
+                // A send failure means the worker is gone; there is nobody left
+                // to answer for, so stop rather than fetching into the void.
+                if rep_tx.send((seq, fetch.fetch(file, size))).is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            req: req_tx,
+            rep: rep_rx,
+            seq: 0,
+            missed: 0,
+        }
+    }
+
+    fn wedged(&self) -> bool {
+        self.missed >= WEDGED_AFTER
+    }
+
+    fn fetch(&mut self, file: FileId, size: u64, within: std::time::Duration) -> io::Result<Vec<u8>> {
+        if self.wedged() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("fetcher unresponsive after {WEDGED_AFTER} consecutive deadlines"),
+            ));
+        }
+        self.seq += 1;
+        let want = self.seq;
+        if self.req.send((want, file, size)).is_err() {
+            return Err(io::Error::other("the fetch thread is gone"));
+        }
+
+        // Replies from abandoned fetches are still in the channel and are not
+        // answers to this question — matching on the sequence number is what
+        // keeps a late reply from being delivered as the wrong file's content,
+        // which would be silent corruption rather than a visible failure.
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                self.missed += 1;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("fetch exceeded {within:?}"),
+                ));
+            }
+            match self.rep.recv_timeout(left) {
+                Ok((got, r)) if got == want => {
+                    self.missed = 0;
+                    return r;
+                }
+                Ok(_) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.missed += 1;
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("fetch exceeded {within:?}"),
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other("the fetch thread stopped"))
+                }
+            }
+        }
+    }
+}
+
 pub struct Worker<F: Fetch> {
     group: Group,
-    fetch: F,
+    fetch: Timed,
     policy: Policy,
     pub log: DenialLog,
     in_flight: InFlight,
+    /// How long any one event may take before the reader is told `EIO`.
+    ///
+    /// Bounded, and bounded low: this is not a network timeout but the longest a
+    /// filesystem operation anywhere on the mount may be stalled by us. §6a-bis.
+    event_deadline: std::time::Duration,
+    _fetch: std::marker::PhantomData<F>,
 }
 
-impl<F: Fetch> Worker<F> {
+/// A read must not be held longer than a user would wait before assuming the
+/// machine is broken. Overridable, because a client with large objects and a
+/// slow link may reasonably choose differently — but never unbounded.
+pub const DEFAULT_EVENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl<F: Fetch + 'static> Worker<F> {
     pub fn new(group: Group, fetch: F, policy: Policy, in_flight: InFlight) -> Self {
+        Self::with_deadline(group, fetch, policy, in_flight, DEFAULT_EVENT_DEADLINE)
+    }
+
+    pub fn with_deadline(
+        group: Group,
+        fetch: F,
+        policy: Policy,
+        in_flight: InFlight,
+        event_deadline: std::time::Duration,
+    ) -> Self {
         Self {
             group,
-            fetch,
+            fetch: Timed::new(fetch),
             policy,
             log: DenialLog::default(),
             in_flight,
+            event_deadline,
+            _fetch: std::marker::PhantomData,
         }
+    }
+
+    /// True once the fetcher has missed enough deadlines to be treated as
+    /// unresponsive. The mount is still answered — with `EIO` — but the unit
+    /// cannot recover on its own from here, and §6a-bis says it must come down.
+    pub fn fetcher_wedged(&self) -> bool {
+        self.fetch.wedged()
     }
 
     /// Handle one event, start to finish, and answer it.
@@ -221,7 +357,7 @@ impl<F: Fetch> Worker<F> {
             }
         };
 
-        let content = match self.fetch.fetch(id, size) {
+        let content = match self.fetch.fetch(id, size, self.event_deadline) {
             Ok(c) => c,
             Err(e) => {
                 return Handled::Failed {
@@ -328,7 +464,7 @@ impl<F: Fetch> Worker<F> {
 /// `fork` and its own loop but run code in this crate, so the usual
 /// async-signal-safety concerns do not apply. That ordering is load-bearing: a
 /// multi-threaded fork here would be a bug, not a style question.
-pub fn spawn_split<F: Fetch>(
+pub fn spawn_split<F: Fetch + 'static>(
     mount: &Path,
     fetch: F,
     policy: Policy,
@@ -373,18 +509,88 @@ impl SplitHandle {
         self.worker
     }
 
-    /// Wait for the worker, then answer whatever it left stranded and deny
+    /// Watch the worker, then answer whatever it left stranded and deny
     /// everything from then on.
     ///
     /// This is the whole reason the process is split. Without it, killing the
     /// worker turns every dehydrated file into a source of zeros — measured, and
     /// worse than the FUSE client this replaces.
+    ///
+    /// It watches **progress**, not just liveness, which §6a-bis added after a
+    /// hung worker wedged the mount several times during development. A worker
+    /// that has died is recoverable: the supervisor still holds the group and
+    /// denies. A worker that is *alive and stuck* holding an event is not, and
+    /// it is worse — the reader it is holding cannot be killed by a signal, so
+    /// every later operation on the mount blocks behind it and "restart the
+    /// daemon" is not an available answer.
     pub fn supervise(&self, until: std::time::Instant) -> io::Result<SuperviseReport> {
+        self.supervise_with_stall(until, DEFAULT_STALL)
+    }
+
+    /// As [`supervise`](Self::supervise), with the stall window given explicitly.
+    pub fn supervise_with_stall(
+        &self,
+        until: std::time::Instant,
+        stall_after: std::time::Duration,
+    ) -> io::Result<SuperviseReport> {
         let mut status = 0i32;
-        unsafe { libc::waitpid(self.worker, &mut status, 0) };
+        let mut stalled = false;
+        let mut beat = self.in_flight.progress();
+        let mut moved = std::time::Instant::now();
+
+        loop {
+            if unsafe { libc::waitpid(self.worker, &mut status, libc::WNOHANG) } == self.worker {
+                break;
+            }
+            let now = self.in_flight.progress();
+            if now != beat {
+                beat = now;
+                moved = std::time::Instant::now();
+            }
+            // Only a worker that is *holding something* can be stalling. An idle
+            // worker makes no progress either, and treating that as a fault
+            // would tear the mount down every time nobody is reading.
+            if self.in_flight.current().is_some() && moved.elapsed() >= stall_after {
+                stalled = true;
+                break;
+            }
+            if std::time::Instant::now() >= until {
+                return Ok(SuperviseReport {
+                    worker_signal: None,
+                    stranded_answered: None,
+                    denied_after: 0,
+                    stalled: false,
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        if stalled {
+            // Order matters, and it is the one thing §6a-bis is really about.
+            // Signal first: a worker stuck in a network fetch dies here and its
+            // event is then answered below. If it does *not* die, it is stuck
+            // inside a pre-content event of its own making — the trap in
+            // §6a-ter — and no signal will ever reach it. Answering the stranded
+            // event is what releases it, so that comes second rather than first.
+            unsafe { libc::kill(self.worker, libc::SIGKILL) };
+            let grace = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while std::time::Instant::now() < grace {
+                if unsafe { libc::waitpid(self.worker, &mut status, libc::WNOHANG) } == self.worker {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
 
         let mut stranded = None;
         take_over(&self.group, &self.in_flight, |fd| stranded = Some(fd))?;
+
+        if stalled {
+            // Reap whatever the answer above freed. Not fatal if it is still
+            // there: the group is ours, every event gets EIO, and the unit is
+            // coming down regardless.
+            unsafe { libc::waitpid(self.worker, &mut status, libc::WNOHANG) };
+        }
 
         // From here on the group still exists, so events keep arriving — and
         // every one of them gets EIO rather than being allowed through to a
@@ -418,9 +624,18 @@ impl SplitHandle {
             },
             stranded_answered: stranded,
             denied_after: denied,
+            stalled,
         })
     }
 }
+
+/// How long a worker may hold one event without answering anything before the
+/// supervisor stops believing it will.
+///
+/// Comfortably longer than [`DEFAULT_EVENT_DEADLINE`], so a worker that is
+/// merely waiting out a slow fetch is never mistaken for a stuck one — the
+/// deadline should fire first and let the worker answer `EIO` itself.
+pub const DEFAULT_STALL: std::time::Duration = std::time::Duration::from_secs(90);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuperviseReport {
@@ -430,4 +645,8 @@ pub struct SuperviseReport {
     /// its behalf. `None` means it died between events.
     pub stranded_answered: Option<i32>,
     pub denied_after: usize,
+    /// The worker was alive but had stopped answering. §6a-bis: this is the
+    /// unrecoverable case, and the mount has to come down — the binary turns it
+    /// into a non-zero exit so `BindsTo=` tears the mount unit down with it.
+    pub stalled: bool,
 }
