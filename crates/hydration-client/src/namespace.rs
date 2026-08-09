@@ -330,7 +330,7 @@ impl Namespace {
         out: &mut Vec<Change>,
     ) -> Option<String> {
         if let Some(why) = bad_name(&name) {
-            self.problems.insert(id, Problem::BadName(why));
+            self.refuse(id, Problem::BadName(why));
             return None;
         }
         match self.nodes.get(&parent) {
@@ -348,8 +348,15 @@ impl Namespace {
                 );
                 return None;
             }
-            Some(p) if !matches!(p.kind, Kind::Folder) => {
-                self.problems.insert(id, Problem::ParentCannotContain);
+            // A package is a container, just one nothing is emitted from.
+            // Refusing its contents would be a refusal nothing can clear —
+            // `problems` is cleared only by a successful upsert or a delete of
+            // that id, and for a package's internals neither ever comes. One
+            // notebook would block a provider's cursor forever. They belong in
+            // the tree: pathing needs them, and a package that later turns out
+            // to be an ordinary folder must already have its children.
+            Some(p) if matches!(p.kind, Kind::File { .. }) => {
+                self.refuse(id, Problem::ParentCannotContain);
                 return None;
             }
             Some(_) => {}
@@ -358,7 +365,7 @@ impl Namespace {
             // Refused *and recorded*. Following it hangs a path computation;
             // dropping it silently strands every file beneath as a placeholder
             // no later pass can repair.
-            self.problems.insert(id, Problem::Cycle);
+            self.refuse(id, Problem::Cycle);
             return None;
         }
 
@@ -465,6 +472,28 @@ impl Namespace {
         if self.root.as_deref() == Some(id) {
             self.root = None;
         }
+    }
+
+    /// Refuse an item, and everything that was waiting for it.
+    ///
+    /// A refused folder is a parent that will never exist, so anything held for
+    /// it is held for good. Leaving those in `pending_ids` says "not yet", which
+    /// is untrue and unfalsifiable — a caller watching for a pending set to
+    /// drain would wait forever. They carry the reason the container was
+    /// refused, because that is why they cannot be placed.
+    fn refuse(&mut self, id: String, why: Problem) {
+        let mut stack = vec![(id, why)];
+        while let Some((id, why)) = stack.pop() {
+            if let Some(held) = self.waiting.remove(&id) {
+                for item in held {
+                    if let Item::Upsert { id: child, .. } = item {
+                        stack.push((child, why.clone()));
+                    }
+                }
+            }
+            self.problems.insert(id, why);
+        }
+        self.waiting.retain(|_, v| !v.is_empty());
     }
 
     /// Forget anything to do with an id that has just ceased to exist.
@@ -860,6 +889,62 @@ mod tests {
         let mut ns = tree();
         assert!(ns.apply(file("c", "a", "c.txt", 1)).is_empty());
         assert_eq!(ns.problems().get("c"), Some(&Problem::ParentCannotContain));
+    }
+
+    /// A refused folder must not leave its contents waiting for it forever.
+    ///
+    /// They are waiting for a parent that will never exist, and reporting them
+    /// as pending says "not yet" — which is untrue, and which a caller watching
+    /// the pending set to drain would wait on indefinitely.
+    #[test]
+    fn refusing_a_folder_refuses_what_was_waiting_for_it() {
+        let mut ns = Namespace::new();
+        ns.apply(Item::Root { id: "R".into() });
+        // Two files arrive before the folder that will turn out to be unusable.
+        ns.apply(file("a", "BAD", "a.txt", 1));
+        ns.apply(file("b", "BAD", "b.txt", 1));
+        assert_eq!(ns.pending(), 2);
+
+        ns.apply(folder("BAD", "R", ".."));
+        assert_eq!(
+            ns.pending(),
+            0,
+            "items waiting on a refused folder are still reported as pending: {:?}",
+            ns.pending_ids()
+        );
+        for id in ["BAD", "a", "b"] {
+            assert!(
+                ns.problems().contains_key(id),
+                "{id} was neither placed nor recorded"
+            );
+        }
+    }
+
+    /// A package's contents are tracked, not refused.
+    ///
+    /// They must be *in* the tree — a package that later turns out to be an
+    /// ordinary folder has to have its children, and pathing needs them — while
+    /// never being emitted as files. Recording them as problems instead would
+    /// be a refusal that nothing can ever clear: the entry is dropped only by a
+    /// successful upsert or a delete, and neither will come. One OneNote
+    /// notebook on the drive would then block a provider's cursor forever.
+    #[test]
+    fn a_packages_contents_are_tracked_without_being_refused() {
+        let mut ns = Namespace::new();
+        ns.apply(Item::Root { id: "R".into() });
+        ns.apply(Item::Upsert {
+            id: "P".into(),
+            parent: "R".into(),
+            name: "Notebook".into(),
+            kind: Kind::Opaque,
+        });
+        ns.apply(file("inner", "P", "section.one", 10));
+        assert!(
+            ns.problems().is_empty(),
+            "a package's contents were refused: {:?}",
+            ns.problems()
+        );
+        assert_eq!(ns.pending(), 0, "they were left waiting instead");
     }
 
     /// A package is tracked for pathing and never walked into.
