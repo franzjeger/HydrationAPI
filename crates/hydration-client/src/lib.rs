@@ -10,6 +10,7 @@
 //! destination.
 
 pub mod manifest;
+pub mod providers;
 pub mod store;
 pub mod upload;
 

@@ -26,7 +26,7 @@ use std::path::Path;
 /// shape again, and no amount of looking at size and blocks separates the three
 /// cases. The distinction is not observable; it is a fact the framework knows
 /// and therefore has to write down.
-pub const XATTR_DEHYDRATED: &str = "user.hydration.dehydrated";
+pub use hydration_protocol::xattr::DEHYDRATED as XATTR_DEHYDRATED;
 
 /// `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`.
 const PUNCH_HOLE: i32 = 0x02;
@@ -230,6 +230,31 @@ pub fn hydrate_fd(
         let e = io::Error::last_os_error();
         let _ = punch_fd(fd, expected);
         return Err(e);
+    }
+
+    // The mark is the state, so filling the file clears it — here, in the same
+    // function that did the filling, rather than as a separate step the caller
+    // has to remember. `hydrate` and `hydrate_fd` behaving differently about
+    // this is the shape of every bug in this project: two ways in, one of them
+    // leaving the state disagreeing with the content.
+    //
+    // Cleared through the fd rather than the path: re-opening a path inside a
+    // marked mount is the trap this whole module is arranged to avoid.
+    unmark_fd(fd)?;
+    Ok(())
+}
+
+/// Clear the placeholder mark through an already-open descriptor.
+fn unmark_fd(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let n = std::ffi::CString::new(XATTR_DEHYDRATED).unwrap();
+    let rc = unsafe { libc::fremovexattr(fd.as_raw_fd(), n.as_ptr()) };
+    if rc < 0 {
+        let e = io::Error::last_os_error();
+        // Not marked is the state we wanted.
+        if e.raw_os_error() != Some(libc::ENODATA) {
+            return Err(e);
+        }
     }
     Ok(())
 }

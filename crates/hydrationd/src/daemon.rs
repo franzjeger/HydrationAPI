@@ -172,10 +172,8 @@ impl<F: Fetch> Worker<F> {
         let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(ev.fd) };
         match placeholder::hydrate_fd(borrowed, &content, size) {
             Ok(()) => {
-                // The mark and the content change together. Clearing it after
-                // the write and before the ignore mark means a reader arriving
-                // in between still sees a file that is intercepted and full.
-                let _ = placeholder::mark_dehydrated(&path, false);
+                // The mark is cleared inside `hydrate_fd`, in the same operation
+                // that wrote the content — one owner, so the two cannot disagree.
                 let _ = self.group.ignore(&path);
                 Handled::Hydrated { bytes: size }
             }

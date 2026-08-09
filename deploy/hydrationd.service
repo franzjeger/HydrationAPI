@@ -24,7 +24,7 @@ StopPropagatedFrom=hydration-mount.mount
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/hydrationd --mount /home/CHANGE-ME/OneDrive
+ExecStart=/usr/local/bin/hydrationd --mount /home/CHANGE-ME/OneDrive --socket /run/user/CHANGE-ME/hydration-sync.sock --peer-uid CHANGE-ME
 Restart=always
 RestartSec=1
 

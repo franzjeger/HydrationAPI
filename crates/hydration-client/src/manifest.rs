@@ -20,7 +20,6 @@
 use crate::store::{self, Store};
 use std::fmt::Write as _;
 use std::io;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// Lives in the sync root. Named so it sorts early and reads as what it is.
@@ -40,6 +39,9 @@ pub struct Entry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Manifest {
     pub entries: Vec<Entry>,
+    /// Dehydrated, but with no cloud object to fetch. Nothing can restore these
+    /// — which is exactly why they are named rather than quietly dropped.
+    pub unrecoverable: Vec<String>,
 }
 
 impl Manifest {
@@ -51,6 +53,7 @@ impl Manifest {
     /// would be worse than none.
     pub fn build(root: &Path) -> io::Result<Self> {
         let mut entries = Vec::new();
+        let mut unrecoverable = Vec::new();
         let mut stack = vec![root.to_path_buf()];
 
         while let Some(dir) = stack.pop() {
@@ -65,13 +68,31 @@ impl Manifest {
                 if !md.is_file() || path.file_name().is_some_and(|n| n == MANIFEST_NAME) {
                     continue;
                 }
-                // A file with content is in the backup already.
-                if md.blocks() > 0 {
+                // The dehydrated mark, not `st_blocks`.
+                //
+                // Using blocks here would repeat the project's own measured
+                // mistake in the place it hurts most: btrfs stores small files
+                // inline, so a dehydrated script or config still reports blocks
+                // and would be silently left out of the manifest — and small
+                // text files are exactly what a restoring user misses first. It
+                // over-reports too: a hydrated file that is legitimately sparse
+                // keeps its cloud id, and would be listed as missing when the
+                // backup has all of it.
+                if string_xattr(&path, hydration_protocol::xattr::DEHYDRATED).is_none() {
                     continue;
                 }
                 let Some(cloud_id) = string_xattr(&path, store::XATTR_ID) else {
-                    // No remote copy: this is a local file that happens to be
-                    // empty or sparse, and the backup has all there is of it.
+                    // Dehydrated with no remote copy: there is no content
+                    // anywhere, and no instruction that would get it back.
+                    // Listing it would be a promise we cannot keep, and skipping
+                    // it silently is how the count stops being true — so it is
+                    // recorded as unrecoverable.
+                    unrecoverable.push(
+                        path.strip_prefix(root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .to_string(),
+                    );
                     continue;
                 };
                 let rel = path
@@ -88,7 +109,11 @@ impl Manifest {
             }
         }
         entries.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(Self { entries })
+        unrecoverable.sort();
+        Ok(Self {
+            entries,
+            unrecoverable,
+        })
     }
 
     /// Write it into the sync root.
@@ -130,6 +155,17 @@ impl Manifest {
                 e.size,
                 e.etag.as_deref().unwrap_or("-")
             );
+        }
+        if !self.unrecoverable.is_empty() {
+            let _ = writeln!(
+                out,
+                "#\n# WARNING: {} file(s) below have no content locally AND no cloud object.\n\
+                 # Nothing can restore them. This should not happen; please report it.",
+                self.unrecoverable.len()
+            );
+            for p in &self.unrecoverable {
+                let _ = writeln!(out, "# UNRECOVERABLE\t{p}");
+            }
         }
         out
     }

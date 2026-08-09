@@ -44,6 +44,26 @@ fn skip(why: &str) {
     eprintln!("SKIPPED: {why}");
 }
 
+/// A directory that is not a mount point is an error, never "healthy".
+///
+/// Reporting no exposures there would be the check telling the user they are
+/// safe at the moment it stopped being able to tell.
+#[test]
+fn a_non_mountpoint_is_an_error_not_an_all_clear() {
+    let Some((mount, _)) = env() else {
+        skip("needs root, HYDRATIOND_TEST_MOUNT and HYDRATIOND_TEST_IMAGE");
+        return;
+    };
+    let plain = mount.parent().unwrap().join("not-a-mount");
+    let _ = std::fs::create_dir_all(&plain);
+
+    let w = ExposureWatch::new(&plain).expect("watch");
+    let err = w
+        .current()
+        .expect_err("a plain directory reported an all-clear it could not know");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
 /// A healthy machine reports nothing.
 #[test]
 fn our_own_mount_is_not_an_exposure() {

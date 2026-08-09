@@ -20,6 +20,28 @@ use serde::{Deserialize, Serialize};
 
 pub mod transport;
 
+/// Extended attributes both halves agree on.
+///
+/// Here rather than in either half because they are the shared vocabulary: the
+/// privileged side writes the dehydrated mark, the unprivileged side reads it to
+/// decide what a backup is missing. Duplicating the string in two crates is how
+/// they drift.
+pub mod xattr {
+    /// Set while a file is a placeholder, cleared when it is filled.
+    ///
+    /// This — not `st_blocks` — is what "is a placeholder" means. btrfs stores
+    /// small files inline, so a dehydrated 21-byte script still reports blocks;
+    /// and a newly created file reports none. Neither size nor blocks separates
+    /// the cases, so the framework records the fact instead of inferring it.
+    pub const DEHYDRATED: &str = "user.hydration.dehydrated";
+    /// The cloud object this file is.
+    pub const ID: &str = "user.hydration.id";
+    /// The version we believe we have.
+    pub const ETAG: &str = "user.hydration.etag";
+    /// A mode the cloud has nowhere to store.
+    pub const MODE: &str = "user.hydration.mode";
+}
+
 /// Identifies a file without naming it.
 ///
 /// A path would be a destination, and destinations are the privileged side's

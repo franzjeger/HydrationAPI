@@ -18,7 +18,11 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
-/// A placeholder: right size, no content, known to the cloud.
+/// A placeholder: right size, no content, known to the cloud, and *marked*.
+///
+/// The mark is not decoration — it is what "is a placeholder" means, because
+/// neither size nor `st_blocks` can tell a dehydrated file from a new one or a
+/// legitimately sparse one.
 fn placeholder(dir: &Path, name: &str, size: u64, id: &str) -> PathBuf {
     let p = dir.join(name);
     if let Some(parent) = p.parent() {
@@ -26,8 +30,18 @@ fn placeholder(dir: &Path, name: &str, size: u64, id: &str) -> PathBuf {
     }
     let f = fs::File::create(&p).unwrap();
     f.set_len(size).unwrap();
+    store::set_xattr(&p, hydration_protocol::xattr::DEHYDRATED, b"1").unwrap();
     store::set_xattr(&p, store::XATTR_ID, id.as_bytes()).unwrap();
     store::set_xattr(&p, store::XATTR_ETAG, b"etag-1").unwrap();
+    p
+}
+
+/// A dehydrated file small enough that btrfs stores it inline, so it still
+/// reports blocks. The case a `st_blocks == 0` predicate silently omits.
+fn small_placeholder(dir: &Path, name: &str, id: &str) -> PathBuf {
+    let p = placeholder(dir, name, 21, id);
+    fs::write(&p, b"#!/bin/sh\necho hello\n").unwrap();
+    store::set_xattr(&p, hydration_protocol::xattr::DEHYDRATED, b"1").unwrap();
     p
 }
 
@@ -48,6 +62,50 @@ fn it_lists_what_the_backup_will_not_contain() {
     );
     assert_eq!(m.entries[0].size, 4096, "the real size has to be recorded");
     assert_eq!(m.entries[0].cloud_id, "cloud-1");
+}
+
+/// The case a blocks-based predicate loses, and the one users notice first.
+///
+/// btrfs stores small files inline, so a dehydrated script still reports
+/// allocated blocks. Judging by blocks would leave every small text file out of
+/// the manifest — and small text files are what a restoring user misses first.
+#[test]
+fn a_small_dehydrated_file_is_listed_even_though_it_reports_blocks() {
+    let dir = scratch("inline");
+    let p = small_placeholder(&dir, "run.sh", "cloud-7");
+    assert!(
+        fs::metadata(&p).unwrap().blocks() > 0,
+        "this filesystem did not inline the file, so the test proves nothing"
+    );
+
+    let m = Manifest::build(&dir).expect("build");
+    assert_eq!(
+        m.entries
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run.sh"],
+        "a dehydrated file was omitted because it still reported blocks"
+    );
+}
+
+/// Dehydrated with no cloud object: nothing can restore it, so it is named
+/// rather than quietly dropped from the count.
+#[test]
+fn a_dehydrated_file_with_no_cloud_object_is_reported_as_unrecoverable() {
+    let dir = scratch("orphan");
+    let p = dir.join("orphan.bin");
+    fs::File::create(&p).unwrap().set_len(64).unwrap();
+    store::set_xattr(&p, hydration_protocol::xattr::DEHYDRATED, b"1").unwrap();
+
+    let m = Manifest::build(&dir).expect("build");
+    assert!(m.entries.is_empty(), "it was listed as recoverable");
+    assert_eq!(m.unrecoverable, vec!["orphan.bin".to_string()]);
+    assert!(
+        m.render().contains("UNRECOVERABLE"),
+        "the file the user cannot get back is not mentioned: {}",
+        m.render()
+    );
 }
 
 /// A file the cloud has never heard of has no remote copy to point at, so
@@ -161,8 +219,12 @@ fn nodump_can_be_set_and_cleared() {
         .arg(&p)
         .output()
         .expect("lsattr");
+    // The flags field only. Asserting over the whole line matched the scratch
+    // directory's own name ("nodump") and passed with the flag absent — a test
+    // that could not fail.
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains('d'), "nodump not visible in lsattr: {s}");
+    let flags = s.split_whitespace().next().unwrap_or("");
+    assert!(flags.contains('d'), "nodump not visible in lsattr: {s}");
 
     manifest::set_nodump(&p, false).expect("clear nodump");
     let out = std::process::Command::new("lsattr")

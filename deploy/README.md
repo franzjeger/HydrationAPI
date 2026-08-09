@@ -53,16 +53,35 @@ it, and the files become *unreachable* rather than readable-as-zeros.
 `hydration-sync.service` may come and go freely. Losing it means hydration fails
 with `EIO`, which is a correct answer.
 
-## Not runnable yet
+## Try it without a cloud account
 
-`hydrationd` and `hydration-sync` are libraries. There is no `main` for either,
-so the `ExecStart=` lines above point at binaries that do not exist and
-`systemd-analyze verify` says so.
+```bash
+cargo build --bins
+sudo ./deploy/smoke.sh /mnt/scratch     # ext4, btrfs or xfs — not tmpfs
+```
 
-The units are here anyway, because the part of them that matters is not the
-command line — it is the `BindsTo=`/`StopPropagatedFrom=` pair, which is the
-only answer to a failure the code cannot handle. That belongs in the repository
-next to the reasoning, not in someone's notes until the binaries land.
+That runs both real binaries against a directory standing in for a cloud, and
+checks the two things that matter: a placeholder hydrates on first read, and
+with the worker killed a read fails rather than returning the zeros a
+placeholder is made of.
+
+A real client replaces `FolderCloud` with an implementation of `Provider` and
+`Sink` — four methods, none of them about POSIX.
+
+## Which end listens, and why
+
+The sync daemon listens; the helper connects out. That is a security decision,
+not a convenience.
+
+If the privileged helper accepted connections, any local process could connect
+and impersonate the sync daemon — and the helper's whole job is to write what it
+is told into the user's files. An impersonator would choose the content of any
+placeholder. With the direction reversed, the socket is user-owned and mode
+0600, and the helper checks the peer's uid with `SO_PEERCRED` rather than
+trusting the path it connected to.
+
+Pass `--peer-uid` so that check has something to compare against. Without it the
+socket path is the only authentication, and a path is not a credential.
 
 ## Installing
 

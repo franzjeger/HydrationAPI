@@ -11,7 +11,7 @@ After=hydrationd.service
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/hydration-sync --mount %h/OneDrive
+ExecStart=%h/.local/bin/hydration-sync --mount %h/OneDrive --socket %t/hydration-sync.sock
 Restart=on-failure
 RestartSec=5
 

@@ -11,3 +11,7 @@ libc = "0.2"
 
 [dev-dependencies]
 hydration-client = { path = "../hydration-client" }
+
+[[bin]]
+name = "hydrationd"
+path = "src/bin/hydrationd.rs"

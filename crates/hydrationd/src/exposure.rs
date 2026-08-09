@@ -14,6 +14,23 @@
 //! So it is detected instead. A hazard that cannot be prevented is one that must
 //! not be silent.
 //!
+//! # What this does not see
+//!
+//! Only mounts in **our own mount namespace**. A container runtime, or a
+//! `systemd` unit with `PrivateMounts=`, creates its bypass in a namespace of
+//! its own: no event reaches our group, and the mount is absent from
+//! `/proc/self/mountinfo`, so a re-scan finds nothing either. Those are exactly
+//! the cases §6.4a names, and this module does not cover them.
+//!
+//! It is detectable in principle — walking `/proc/*/mountinfo` as root, or
+//! `listmount()` with namespace ids — and is not implemented. Worth stating
+//! plainly rather than leaving a reader to assume the check is total: a
+//! detection that covers less than it appears to is its own kind of silence.
+//!
+//! There is a deployment trap in the same family: if `hydrationd` is itself run
+//! under sandboxing that implies a private namespace, even host mounts become
+//! invisible to it.
+//!
 //! Two measurements shape this module:
 //!
 //! * **`FAN_REPORT_MNT` cannot coexist with `FAN_CLASS_PRE_CONTENT`** — the call
@@ -94,7 +111,19 @@ impl ExposureWatch {
         // for the mount it lives on (0:110). Comparing them finds nothing, ever,
         // and the exposure warning silently never fires.
         let Some(ours) = rows.iter().find(|r| r.point == self.ours) else {
-            return Ok(Vec::new());
+            // Never the healthy answer. If our own mount is not in the table the
+            // situation is worse, not better: the sync directory is not a mount
+            // point, or it has been unmounted or shadowed under us. Returning
+            // "no exposures" here would be the module telling the user they are
+            // safe at precisely the moment it has stopped being able to tell.
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "{} is not a mount point in this namespace; exposure cannot be \
+                     checked",
+                    self.ours
+                ),
+            ));
         };
 
         let mut out = Vec::new();
@@ -107,7 +136,13 @@ impl ExposureWatch {
             // this mount's root *contains* ours — the same subtree, or an
             // ancestor of it. That is the mount through which our files can be
             // reached by another path.
-            if covers(&r.root, &ours.root) {
+            // Symmetric on purpose. Two subtrees of one filesystem overlap if
+            // *either* contains the other, and both directions are real
+            // bypasses: a mount of an ancestor reaches our files, and so does
+            // `mount --bind ~/OneDrive/Documents /srv/docs`. Testing one
+            // direction left the second case silently unreported — which is the
+            // failure this module exists to prevent, in the module itself.
+            if covers(&r.root, &ours.root) || covers(&ours.root, &r.root) {
                 out.push(r.point.clone());
             }
         }
@@ -146,9 +181,16 @@ impl ExposureWatch {
 }
 
 /// `/proc/self/mountinfo` escapes space, tab, newline and backslash as octal.
+///
+/// Rebuilt byte by byte rather than character by character. `out.push(b as char)`
+/// looks equivalent and is not: it reinterprets each byte as a code point, so a
+/// UTF-8 path the kernel does *not* escape — `/home/frank/Pärm` — comes back as
+/// mojibake and never compares equal to the caller's real path. The mount would
+/// then never be found, and every exposure check would quietly answer "healthy"
+/// for the rest of the process's life.
 fn unescape(s: &str) -> String {
     let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'\\' && i + 3 < b.len() {
@@ -156,15 +198,15 @@ fn unescape(s: &str) -> String {
                 .ok()
                 .and_then(|o| u8::from_str_radix(o, 8).ok())
             {
-                out.push(c as char);
+                out.push(c);
                 i += 4;
                 continue;
             }
         }
-        out.push(b[i] as char);
+        out.push(b[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -188,6 +230,31 @@ mod tests {
             !covers("/@srv", "/@onedrive"),
             "a sibling reaches nothing of ours"
         );
+    }
+
+    #[test]
+    fn a_bind_of_a_subdirectory_is_an_exposure_too() {
+        // The direction that was missing. `mount --bind ~/OneDrive/Documents
+        // /srv/docs` reaches our files through a mount we do not cover, and
+        // testing only "is an ancestor" left it unreported.
+        let ours = "/@onedrive";
+        let sub = "/@onedrive/Documents";
+        assert!(
+            covers(sub, ours) || covers(ours, sub),
+            "a bind of a subdirectory of the sync tree was not treated as an exposure"
+        );
+        // And a genuine sibling still is not one, in either direction.
+        assert!(!covers("/@srv", ours) && !covers(ours, "/@srv"));
+    }
+
+    #[test]
+    fn a_non_ascii_mount_point_survives_unescaping() {
+        // Byte-preserving, not char-by-char. The kernel does not escape UTF-8,
+        // so reinterpreting bytes as code points produced mojibake that never
+        // matched the caller's path — and the check then answered "healthy"
+        // forever without ever having looked.
+        assert_eq!(unescape("/home/frank/Pärm"), "/home/frank/Pärm");
+        assert_eq!(unescape("/mnt/my\\040drive"), "/mnt/my drive");
     }
 
     #[test]

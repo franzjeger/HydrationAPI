@@ -24,13 +24,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-/// The cloud object's identifier.
-pub const XATTR_ID: &str = "user.hydration.id";
-/// The version we believe we have. §5.7 checks hydration against it.
-pub const XATTR_ETAG: &str = "user.hydration.etag";
-/// The mode, so it survives a dehydrate/rehydrate round trip on a cloud that
-/// has nowhere to put one.
-pub const XATTR_MODE: &str = "user.hydration.mode";
+pub use hydration_protocol::xattr::ETAG as XATTR_ETAG;
+pub use hydration_protocol::xattr::MODE as XATTR_MODE;
+pub use hydration_protocol::xattr::{DEHYDRATED as XATTR_DEHYDRATED, ID as XATTR_ID};
 
 /// What the daemon knows about one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
