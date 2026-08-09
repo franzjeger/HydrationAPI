@@ -742,6 +742,23 @@ monteringen så frisk ut, `mountpoint` sa ja, `touch` virket, og alt annet hang.
   hjelperen gjør det selv i tillegg, så garantien ikke avhenger av å ha blitt
   utrullet med de medfølgende enhetene.
 
+**En feil den første versjonen innførte, verdt å skrive ned fordi den var
+usynlig.** Telleren over bomskudd kortsluttet *før* forespørselen ble sendt, så
+ingen svar kunne komme, så telleren kunne aldri nullstilles. Tre bomskudd gjorde
+monteringen til øyeblikkelig `EIO` for alltid — servert av to prosesser som så
+helt friske ut, med vaktens stallvakt som aldri ville fyre, fordi en arbeider som
+nekter raskt ikke står fast. Et avbrudd som ser ut som et fungerende system.
+
+To ting rettet det:
+
+- **Fastlåsingen er reversibel.** Forlatte hentinger kjører videre, og et svar
+  fra en av dem er bevis på liv. Det dreneres nå der kortslutningen står, så en
+  henter som kommer tilbake blir brukt igjen.
+- **Den er tidsbegrenset.** Blir den værende ubesvart i fem minutter, stopper
+  arbeideren. Hver leser er allerede besvart — løkken kommer bare hit mellom
+  hendelser — så ingenting henger, og vakten river ned monteringen derfra. Det er
+  §6a-bis' tredje krav nådd via den andre veien.
+
 **Én begrensning som står igjen, målt og bevisst.** Hentinger er serialisert —
 én forbindelse til synk-daemonen, én utestående forespørsel. En henting som har
 gått over fristen holder derfor køen til den faktisk returnerer, og lesinger bak

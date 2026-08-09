@@ -152,9 +152,14 @@ fn main() -> io::Result<()> {
     if child == 0 {
         let fetch = SocketFetch::new(HelperConn::new(stream).unwrap(), &args.mount);
         let mut w = Worker::new(group, fetch, Policy::default(), worker_view);
-        // No deadline: this is the service, not a test.
+        // No deadline on the loop itself: this is the service, not a test. The
+        // per-event deadline is what bounds any single reader's wait.
         let _ = w.run(Instant::now() + Duration::from_secs(60 * 60 * 24 * 365 * 10));
-        unsafe { libc::_exit(0) };
+        // Reached only when the worker has given up on its fetcher. Exiting is
+        // the point: the supervisor is watching, and it detaches the mount and
+        // exits non-zero so the unit restarts. Staying alive here would mean
+        // denying every read forever while looking perfectly healthy.
+        unsafe { libc::_exit(if w.fetcher_wedged() { 1 } else { 0 }) };
     }
 
     eprintln!(

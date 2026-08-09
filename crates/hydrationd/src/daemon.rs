@@ -72,6 +72,9 @@ struct Timed {
     /// Consecutive deadlines missed. A single slow object is not a verdict on
     /// the fetcher; a run of them is.
     missed: u32,
+    /// When the run started, so an unresponsive fetcher is bounded in time and
+    /// not only in count.
+    since: Option<std::time::Instant>,
 }
 
 /// After this many consecutive misses the fetcher is treated as wedged and no
@@ -79,6 +82,15 @@ struct Timed {
 /// Denying promptly is the fail-closed answer; making every reader wait out the
 /// deadline first would be the same outage, slower.
 const WEDGED_AFTER: u32 = 3;
+
+/// How long a fetcher may stay unresponsive before the unit gives up on itself.
+///
+/// §6a-bis's third requirement, reached by the other road. A worker that denies
+/// promptly is not stuck, so the supervisor's stall watch will never fire — the
+/// mount would go on serving instant `EIO` forever, healthily, which is an
+/// outage that looks like a working system. Past this point the worker stops,
+/// the supervisor takes over, and the mount comes down so the unit can restart.
+pub const WEDGED_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl Timed {
     fn new<F: Fetch + 'static>(mut fetch: F) -> Self {
@@ -98,6 +110,7 @@ impl Timed {
             rep: rep_rx,
             seq: 0,
             missed: 0,
+            since: None,
         }
     }
 
@@ -105,12 +118,46 @@ impl Timed {
         self.missed >= WEDGED_AFTER
     }
 
+    /// How long it has been unresponsive, if it is.
+    fn wedged_for(&self) -> std::time::Duration {
+        match self.since {
+            Some(t) if self.wedged() => t.elapsed(),
+            _ => std::time::Duration::ZERO,
+        }
+    }
+
+    fn missed_one(&mut self) {
+        self.missed += 1;
+        self.since.get_or_insert_with(std::time::Instant::now);
+    }
+
+    fn answered(&mut self) {
+        self.missed = 0;
+        self.since = None;
+    }
+
     fn fetch(&mut self, file: FileId, size: u64, within: std::time::Duration) -> io::Result<Vec<u8>> {
         if self.wedged() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("fetcher unresponsive after {WEDGED_AFTER} consecutive deadlines"),
-            ));
+            // Abandoned fetches keep running, and a reply from one is proof the
+            // fetcher is alive again. Draining for it here is what keeps this
+            // from being a one-way door: the short-circuit below skips the send,
+            // so without this nothing could ever arrive, nothing could reset the
+            // counter, and three missed deadlines would turn the mount into
+            // instant `EIO` for good — served by two healthy-looking processes,
+            // with nothing to tear anything down. That is the state §6a-bis says
+            // must not persist, reached quietly.
+            let mut recovered = false;
+            while self.rep.try_recv().is_ok() {
+                recovered = true;
+            }
+            if recovered {
+                self.answered();
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("fetcher unresponsive after {WEDGED_AFTER} consecutive deadlines"),
+                ));
+            }
         }
         self.seq += 1;
         let want = self.seq;
@@ -126,7 +173,7 @@ impl Timed {
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
-                self.missed += 1;
+                self.missed_one();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("fetch exceeded {within:?}"),
@@ -134,12 +181,12 @@ impl Timed {
             }
             match self.rep.recv_timeout(left) {
                 Ok((got, r)) if got == want => {
-                    self.missed = 0;
+                    self.answered();
                     return r;
                 }
                 Ok(_) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    self.missed += 1;
+                    self.missed_one();
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!("fetch exceeded {within:?}"),
@@ -200,6 +247,12 @@ impl<F: Fetch + 'static> Worker<F> {
     /// cannot recover on its own from here, and §6a-bis says it must come down.
     pub fn fetcher_wedged(&self) -> bool {
         self.fetch.wedged()
+    }
+
+    /// The fetcher has been unresponsive long enough that this unit cannot
+    /// recover on its own, and should stop rather than serve denials forever.
+    pub fn should_give_up(&self) -> bool {
+        self.fetch.wedged_for() >= WEDGED_LIMIT
     }
 
     /// Handle one event, start to finish, and answer it.
@@ -433,6 +486,17 @@ impl<F: Fetch + 'static> Worker<F> {
         let mut buf = vec![0u8; 64 * 1024];
 
         while std::time::Instant::now() < until {
+            // Stop rather than go on denying. Every reader has been answered —
+            // the loop only reaches here between events — so nothing is left
+            // hanging, and the supervisor takes the mount down from here.
+            if self.should_give_up() {
+                eprintln!(
+                    "[worker] the fetcher has been unresponsive for {}s; stopping so the \
+                     mount comes down rather than serving EIO indefinitely",
+                    WEDGED_LIMIT.as_secs()
+                );
+                break;
+            }
             let mut pfd = libc::pollfd {
                 fd: self.group.as_raw(),
                 events: libc::POLLIN,

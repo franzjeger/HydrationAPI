@@ -340,3 +340,92 @@ fn a_prompt_fetch_is_unaffected() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// A fetcher that stops answering must not be a one-way door.
+///
+/// The deadline machinery counts consecutive misses and stops waiting after a
+/// few, so that a genuinely unresponsive client costs each reader a prompt
+/// denial rather than a full timeout. The first version of that made the state
+/// permanent: the short-circuit ran before the request was sent, so no reply
+/// could ever arrive, so the counter could never reset. Three missed deadlines
+/// turned the mount into instant `EIO` forever — served by two healthy-looking
+/// processes, with nothing to tear anything down, which is precisely the state
+/// §6a-bis says must not persist.
+///
+/// A fetcher that answers again is working again, however long it took.
+#[test]
+fn a_fetcher_that_recovers_is_used_again() {
+    let Some(mnt) = mount() else {
+        skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
+        return;
+    };
+
+    /// Blocks for longer than several deadlines, then serves normally.
+    struct SlowStart(std::sync::atomic::AtomicUsize);
+    impl Fetch for SlowStart {
+        fn fetch(&mut self, _f: FileId, size: u64) -> io::Result<Vec<u8>> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            Ok(vec![b'H'; size as usize])
+        }
+    }
+
+    let group = Group::new_pre_content().expect("group");
+    let paths: Vec<PathBuf> = (0..5)
+        .map(|i| placeholder_at(&mnt, &format!("recover-{i}.bin"), 32))
+        .collect();
+    group.mark_mount(&mnt).expect("mark");
+    let mut worker = Worker::with_deadline(
+        group.try_clone().expect("clone"),
+        SlowStart(std::sync::atomic::AtomicUsize::new(0)),
+        Policy::permissive(),
+        InFlight::new(),
+        Duration::from_millis(500),
+    );
+
+    let mut outcomes = Vec::new();
+    for path in &paths {
+        let reader = unsafe { libc::fork() };
+        if reader == 0 {
+            let code = match std::fs::read(path) {
+                Ok(b) if b.first() == Some(&b'H') => 0,
+                Ok(_) => 7,
+                Err(_) => 1,
+            };
+            unsafe { libc::_exit(code) };
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut status = 0;
+        let mut done = false;
+        while Instant::now() < deadline {
+            let _ = worker.run(Instant::now() + Duration::from_millis(100));
+            if unsafe { libc::waitpid(reader, &mut status, libc::WNOHANG) } == reader {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "reader for {} never finished", path.display());
+        outcomes.push(libc::WEXITSTATUS(status));
+        // Enough that the abandoned first fetch has finished by the last read.
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+
+    assert!(
+        outcomes.contains(&1),
+        "expected at least one denial while the fetcher was stuck: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes.last(),
+        Some(&0),
+        "the fetcher recovered but was never used again — the wedge is a one-way \
+         door and this mount serves EIO forever: {outcomes:?}"
+    );
+    assert!(
+        !worker.fetcher_wedged(),
+        "still reported as wedged after a successful fetch"
+    );
+    for p in &paths {
+        let _ = std::fs::remove_file(p);
+    }
+}
