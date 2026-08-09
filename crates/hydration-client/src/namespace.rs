@@ -765,9 +765,9 @@ mod tests {
     /// file once, at its final path.
     #[test]
     fn a_nested_rename_names_each_file_once() {
-        let mut ns = tree();
-        // The inner folder is reported as waiting for the outer one, so both
-        // resolve in a single `apply`.
+        // Built child-first, so the inner folder is still waiting for the outer
+        // one when it arrives and both resolve inside a single `apply`. That is
+        // the batch shape that names a file twice if nothing coalesces.
         let mut inner = Namespace::new();
         inner.apply(Item::Root { id: "R".into() });
         inner.apply(file("b", "G", "b.txt", 20));
@@ -778,7 +778,6 @@ mod tests {
             ["Archive/Renamed/b.txt"],
             "a file was named more than once, or at a stale path: {out:?}"
         );
-        let _ = ns;
     }
 
     #[test]
