@@ -33,6 +33,11 @@ const PUNCH_HOLE: i32 = 0x02;
 const KEEP_SIZE: i32 = 0x01;
 
 /// Create a file that has metadata and no content.
+/// Only safe **before** the mount is marked, or from a process that is not the
+/// one answering events. Inside a marked mount, use [`create_under`].
+///
+/// `set_len` is a truncate, and a truncate inside a marked mount fires a
+/// pre-content event — see [`create_under`] for what that costs.
 pub fn create(path: &Path, size: u64, mode: u32) -> io::Result<FileId> {
     let file = fs::OpenOptions::new()
         .write(true)
@@ -41,6 +46,58 @@ pub fn create(path: &Path, size: u64, mode: u32) -> io::Result<FileId> {
     file.set_len(size)?;
     fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
     mark_dehydrated(path, true)?;
+    id_of(path)
+}
+
+/// Create a placeholder inside a mount that is already being watched.
+///
+/// The window between `open` and the dehydrated mark is the problem, and it is
+/// not theoretical — it silently broke three conformance invariants.
+///
+/// Giving the file its size is `ftruncate`, which fires a pre-content event. At
+/// that instant the file exists but is not yet marked, so the worker answering
+/// the event asks "is this a placeholder?", is told no, concludes the content is
+/// already present, and **adds an ignore mark**. That mark is permanent: the
+/// finished placeholder — correct size, correct xattrs, zero blocks — is then
+/// invisible to hydration for the rest of the group's life, and every read of it
+/// returns zeros with no event and no error.
+///
+/// Marking first does not help either: then the same `ftruncate` is a write to a
+/// *known* placeholder, hydration is attempted, there is nothing to fetch yet,
+/// and the create fails. The window has to be closed rather than moved, so the
+/// whole construction happens under an ignore mark — the same shape [`evict`]
+/// uses for the same reason.
+///
+/// [`evict`]: crate::evict::evict
+pub fn create_under(
+    group: &crate::fanotify::Group,
+    path: &Path,
+    size: u64,
+    mode: u32,
+) -> io::Result<FileId> {
+    // Creating an empty file touches no content, so this much is safe unmarked.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    drop(file);
+
+    // From here until the mark is set, the file must not generate events.
+    group.ignore(path)?;
+    let finish = || -> io::Result<()> {
+        let file = fs::OpenOptions::new().write(true).open(path)?;
+        file.set_len(size)?;
+        drop(file);
+        fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+        mark_dehydrated(path, true)
+    };
+    let result = finish();
+
+    // Re-armed whatever happened. A placeholder left ignored is worse than no
+    // placeholder at all: it exists, it looks right, and it reads as zeros.
+    let rearm = group.unignore(path);
+    result?;
+    rearm?;
     id_of(path)
 }
 

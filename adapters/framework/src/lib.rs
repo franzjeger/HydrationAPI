@@ -305,7 +305,12 @@ impl Harness for Framework {
         let id = self.cloud.seed(name, content, etag);
         let path = self.mount.join(name);
         let _ = std::fs::remove_file(&path);
-        placeholder::create(&path, content.len() as u64, 0o644).expect("placeholder");
+        // Created under the group: the mount is already watched, and giving the
+        // file its size fires a pre-content event that would otherwise be
+        // answered before the placeholder is marked — leaving it ignored, and
+        // invisible to hydration for good.
+        placeholder::create_under(&self.group, &path, content.len() as u64, 0o644)
+            .expect("placeholder");
         store::set_xattr(&path, store::XATTR_ID, id.as_bytes()).expect("record cloud id");
         store::set_xattr(&path, store::XATTR_ETAG, etag.as_bytes()).ok();
         self.rescan();

@@ -95,9 +95,23 @@ They run on a clock the tests move, so the races are arranged rather than
 waited for — sleeping through a 900-second debounce is why they stayed hidden
 the first time.
 
-What is not built yet: eviction, the `FAN_MNT_ATTACH` exposure watch wired
-through to status, the backup manifest, and the systemd units. See DESIGN.md §8
-for the v1 scope.
+### Conformance
+
+The framework is measured by the same eight invariants as the FUSE client, plus
+6a — which is `N/A` for a FUSE client and is the whole point here:
+
+```bash
+sudo -E HYDRATION_TEST_MOUNT=/mnt/scratch cargo test -p adapter-framework
+```
+
+**9 of 9**, stable across ten consecutive runs. Getting there took finding three
+causes, none of them the kernel: a placeholder that ignore-marked itself while
+being created, an index scanned once and never again, and a name collision the
+harness resolved by hash order.
+
+What is not built yet: the `FAN_MNT_ATTACH` exposure watch wired through to
+status, the backup manifest, per-event timeouts (§6a-bis), and the binaries the
+systemd units point at. See DESIGN.md §8.
 
 ## The contract
 

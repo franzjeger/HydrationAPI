@@ -48,14 +48,31 @@ impl Cloud {
         id
     }
 
+    /// The newest object with this name.
+    ///
+    /// "Newest" rather than "the one we happen to find" because a rename over a
+    /// placeholder legitimately produces two: the renamed file is the ex-temp
+    /// inode, which carries no cloud id, so its upload creates a fresh object
+    /// while the seeded one is orphaned under the same name. `HashMap` iteration
+    /// order is randomised per process, so `find` returned either of them and
+    /// 5.4 failed on roughly a coin toss with "the cloud holds stale content".
+    ///
+    /// Picking the newest makes the harness deterministic. It does not answer
+    /// the design question underneath, which is real and belongs in §5.4: after
+    /// `write temp -> rename over target`, *which* cloud object is the target?
+    /// The framework currently orphans the original instead of either updating
+    /// it or deleting it, and neither the contract nor the code says which it
+    /// should be.
     pub fn by_name(&self, name: &str) -> Option<CloudObject> {
-        self.state
-            .lock()
-            .unwrap()
-            .objects
-            .values()
-            .find(|o| o.name == name)
-            .cloned()
+        let st = self.state.lock().unwrap();
+        let mut hits: Vec<&CloudObject> = st.objects.values().filter(|o| o.name == name).collect();
+        hits.sort_by_key(|o| {
+            o.id.rsplit('-')
+                .next()
+                .and_then(|n| n.parse::<u32>().ok())
+                .unwrap_or(0)
+        });
+        hits.last().map(|o| (*o).clone())
     }
 
     pub fn ops(&self) -> Vec<CloudOp> {

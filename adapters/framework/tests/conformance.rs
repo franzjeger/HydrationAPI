@@ -101,34 +101,32 @@ fn framework_conformance() {
         println!("  {name}\n      {why}\n");
     }
 
-    // Deliberately no pass/fail assertion yet, and that is the current finding.
+    // The framework satisfies its own contract, and this asserts it.
     //
-    // Consecutive runs do not agree: 6, 7 and 7 of 9 across three runs, with
-    // different invariants failing. The framework is not stable, so an
-    // expectation table written today would record a coin toss.
+    // It did not until the three causes below were found, and the suite ran at
+    // 5-7 of 9 with different invariants failing each time. None of them was the
+    // kernel: `probes/eventtrace.c` gets a pre-content event on a well-formed
+    // placeholder eight times out of eight.
     //
-    // What the instability is *not*: a kernel that fails to generate or deliver
-    // pre-content events. `probes/eventtrace.c` puts a reader on a well-formed
-    // placeholder eight times over and gets an event every time, and the kernel
-    // stack of a blocked writer names the path directly —
-    // `do_ftruncate -> fsnotify_pre_content -> fanotify_handle_event`. The
-    // events are there. Whatever is dropping them is on this side.
-    //
-    // What is established:
-    //
-    //  * The suite drives both halves for real — forked worker, socket,
-    //    supervisor — and 5.1, 5.2, 5.6 and 5.8 pass in every run.
-    //  * Three genuine framework bugs were found by pointing it here and are
-    //    fixed: a placeholder needs an explicit mark (`st_blocks == 0` also
-    //    describes a brand-new file, so the first write into the sync directory
-    //    failed with EIO); btrfs stores small files inline, so a punched hole
-    //    leaves blocks behind and a dehydrated script was served as zeros; and
-    //    a second fanotify group with nobody serving it blocks every write.
-    //  * The remaining failures share one symptom: a read of a well-formed
-    //    placeholder — marked, right size, zero blocks, cloud id present —
-    //    sometimes returns zeros with no event recorded for it.
-    //
-    // The next step is to find out whether that event is not generated or not
-    // delivered, and only then to write down what this suite should assert.
-    let _ = (passed, failed);
+    //  * `seed_remote` created placeholders inside the marked mount. Giving a
+    //    file its size is `ftruncate`, which fires a pre-content event, and at
+    //    that instant the file existed but was not yet marked — so the worker
+    //    concluded the content was present and added an ignore mark. The
+    //    finished placeholder was then invisible to hydration for good, and read
+    //    as zeros with no event and no error. Fixed by building it under an
+    //    ignore mark (`placeholder::create_under`).
+    //  * The daemon's index was scanned once at startup and never again, so a
+    //    placeholder created afterwards was refused with EIO. Whether that
+    //    happened depended on thread scheduling. Fixed by looking again before
+    //    refusing.
+    //  * A rename over a placeholder legitimately leaves two cloud objects with
+    //    the same name, and the harness picked between them by `HashMap`
+    //    iteration order. Fixed by picking the newest — which makes the harness
+    //    deterministic and leaves the design question in §5.4 open.
+    assert!(
+        failed.is_empty(),
+        "the framework no longer satisfies its own contract: {:?}",
+        failed.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+    );
+    let _ = passed;
 }

@@ -114,7 +114,7 @@ impl<P: Provider> Daemon<P> {
     pub fn serve(&mut self, conn: &mut DaemonConn) -> io::Result<()> {
         while let Some(msg) = conn.recv()? {
             match msg {
-                FromHelper::Fetch(req) => match self.resolve(req.file) {
+                FromHelper::Fetch(req) => match self.resolve_or_rescan(req.file) {
                     Ok((cloud_id, size)) => match self.provider.fetch(&cloud_id, size) {
                         Ok(content) if content.len() as u64 == size => {
                             conn.send_ready(req.id, &content)?;
@@ -142,6 +142,24 @@ impl<P: Provider> Daemon<P> {
             }
         }
         Ok(())
+    }
+
+    /// Resolve, looking again before giving up.
+    ///
+    /// The index is built by walking, once, when the daemon starts. Anything
+    /// created after that — every placeholder a sync pass brings down while this
+    /// loop is running — is absent from it, and refusing on an absent entry
+    /// turns a perfectly good file into `EIO` for the reader.
+    ///
+    /// It presents as a race because it is one: whether a file is in the index
+    /// depends on whether it existed when the scan happened. A rescan before
+    /// refusing costs a walk on the miss path only, and the miss path is already
+    /// about to fail.
+    fn resolve_or_rescan(&mut self, file: FileId) -> Result<(String, u64), Refusal> {
+        if self.store.lookup(&file).is_none() {
+            let _ = self.rescan();
+        }
+        self.resolve(file)
     }
 
     fn resolve(&self, file: FileId) -> Result<(String, u64), Refusal> {
