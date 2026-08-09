@@ -9,6 +9,7 @@
 //! `hydration-protocol`, and it is deliberately too narrow to express a
 //! destination.
 
+pub mod manifest;
 pub mod store;
 pub mod upload;
 
