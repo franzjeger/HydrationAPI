@@ -1857,6 +1857,27 @@ impl StoredView {
     }
 }
 
+/// A completed round's two writes, derived and held back until the framework
+/// proves it applied the batch they describe.
+///
+/// A provider is never told a batch was applied. Committing at the end of the
+/// round that derived them therefore advances the durable position past changes
+/// the framework may never have seen — and a removal is the one change that
+/// cannot be recovered afterwards. Graph does not replay a consumed tombstone,
+/// `Namespace::listing()` cannot express a deletion, and the tree written
+/// alongside the token already agrees the object is gone, so no later diff can
+/// rediscover it either.
+///
+/// Deferring only the token is not enough, and that is not a guess: with the
+/// tree still written in-round, a restart resumes the older token and replays
+/// the tombstone, but `Namespace::apply(Item::Delete { id })` for an id the
+/// restored tree no longer holds emits no `Change` at all. The position
+/// recovers; the removal does not. So the pair moves together or not at all.
+struct Uncommitted {
+    tree: TreeBlob,
+    token: TokenBlob,
+}
+
 /// One completed pass over the feed, before anything is written.
 struct Attempt {
     listing: Vec<Change>,
@@ -1884,6 +1905,12 @@ pub struct GraphDiscover<P: PageSource, S: StateStore, K: Sleeper> {
     last_input: Option<Cursor>,
     served: Option<(Vec<Change>, Cursor)>,
     repeats: u32,
+    /// The previous round's tree and token, derived and not yet on disk.
+    ///
+    /// Held here rather than written where they were derived, because the
+    /// round that derived them has no way of knowing whether the batch it
+    /// returned was ever applied. See [`Uncommitted`].
+    pending: Option<Uncommitted>,
     /// Makes every cursor this provider mints unique.
     ///
     /// Graph hands back the same deltaLink for two consecutive rounds when the
@@ -1905,6 +1932,7 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             last_input: None,
             served: None,
             repeats: 0,
+            pending: None,
             rounds: 0,
             escalation: None,
         }
@@ -1953,6 +1981,28 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             });
         }
         Some(served)
+    }
+
+    /// Land the previous round's writes, tree first, then token.
+    ///
+    /// Reached only from the path that has just been handed a cursor other than
+    /// the one it was last handed — the sole evidence this trait offers that
+    /// `hydration-sync` accepted the batch and advanced past it. The ordering
+    /// between the two writes is unchanged and still absolute: a tree newer
+    /// than its token is harmless, a token newer than its tree is
+    /// unrecoverable.
+    ///
+    /// A failure discards the pair instead of holding it for another attempt.
+    /// Everything it describes is derivable again from the token still on disk,
+    /// and re-deriving it is exactly what a crash here would cost — one round
+    /// trip. Retaining a pair whose tree may have half landed, and writing it
+    /// later against a store that has moved underneath it, costs more.
+    fn commit(&mut self) -> io::Result<()> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(());
+        };
+        self.store.save_tree(&pending.tree)?;
+        self.store.save_token(&pending.token)
     }
 
     fn fail(&mut self, fault: Fault) -> io::Error {
@@ -2220,10 +2270,12 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             Err(f) => return Err(self.fail(f)),
         };
 
-        // Write the tree, then the token, and only once the round is known to
-        // have completed. "Always write the tree, then decide about the token"
-        // satisfies every ordering assertion and destroys the state a refusal
-        // was protecting: the next round starts from a tree that agrees with the
+        // Derive the tree and the token, and write neither. A round that
+        // completed is not a round that was applied, and only [`commit`] — on
+        // the next call that proves the framework moved on — puts either on
+        // disk. "Always write the tree, then decide about the token" satisfies
+        // every ordering assertion and destroys the state a refusal was
+        // protecting: the next round starts from a tree that agrees with the
         // page it refused to trust.
         let generation = stored.generation + 1;
         let tree = encode_tree(
@@ -2233,11 +2285,9 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             &done.mounts,
             generation,
         );
-        self.store.save_tree(&tree)?;
 
         let mut token = done.tokens;
         token.generation = generation;
-        self.store.save_token(&token)?;
 
         let Some(link) = token.get(self.scope.drive()).map(str::to_string) else {
             // The primary scope always ends at a deltaLink or the attempt fails,
@@ -2246,9 +2296,14 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             // drive every pass, so it is refused rather than returned.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "the round persisted no token for the drive it was syncing",
+                "the round derived no token for the drive it was syncing",
             ));
         };
+
+        // Held, not written. A crash from here until the next accepted pass
+        // costs one round trip and nothing else: the older token is still on
+        // disk, so the round — tombstones included — is simply run again.
+        self.pending = Some(Uncommitted { tree, token });
 
         self.rounds += 1;
         let cursor = Cursor(Some(format!("r{}:{link}", self.rounds)));
@@ -2270,8 +2325,19 @@ impl<P: PageSource, S: StateStore, K: Sleeper> hydration_client::delta::Discover
 {
     fn changes(&mut self, cursor: &Cursor) -> io::Result<(Vec<Change>, Cursor)> {
         if let Some(served) = self.repeat(cursor) {
+            // A repeat is the framework saying it could not apply the batch, so
+            // the previous round's writes stay held: advancing the position now
+            // is precisely what makes an unapplied tombstone unrecoverable.
             return Ok(served);
         }
+        // Anything else is a cursor other than the one this instance was last
+        // handed, which `hydration-sync` only produces after a pass it accepted
+        // (`bin/hydration-sync.rs`, the delta thread: `cursor = next` on a
+        // clean pass and on a quiet one, and the cursor left untouched on a
+        // retryable one). That is the acknowledgement, and it is what makes the
+        // previous round's pair safe to land — before this round reads the
+        // store, so the round that follows builds on it.
+        self.commit()?;
         let out = self.run_round();
         if let Ok((changes, next)) = &out {
             self.last_input = Some(cursor.clone());

@@ -45,6 +45,18 @@
 //!
 //! A call that returned `Err` is not remembered, so a retry after a failure is a
 //! fresh round rather than a repeat.
+//!
+//! That third case carries one more job. A round derives its tree and its token
+//! and writes *neither*: being handed a different cursor is the only evidence
+//! this trait ever gives that a batch was applied, so it is the only moment at
+//! which advancing the durable position is safe. The previous round's pair is
+//! committed there — tree first, then token, the ordering rule unchanged —
+//! before the new round reads the store. A crash in between costs one round
+//! trip and nothing else, whereas advancing under an unapplied batch loses any
+//! removal in it for good: Graph does not replay a consumed tombstone,
+//! `listing()` cannot express a deletion, and `Namespace::apply(Item::Delete)`
+//! for an id the tree no longer holds emits nothing at all. Tests that need a
+//! round's state on disk say so with [`ack`].
 
 #![allow(clippy::type_complexity)]
 
@@ -854,6 +866,23 @@ impl Rig {
     }
 }
 
+/// Acknowledge a round: hand the *same* instance the cursor that round minted.
+///
+/// A round derives its tree and its token and writes neither. The pair lands on
+/// the next call whose cursor differs from the one the instance was last handed
+/// — the only evidence `hydration-sync` ever gives that a batch was applied
+/// (`hydration-sync.rs`, the delta thread: `cursor = next` on a clean or quiet
+/// pass, and the cursor left untouched on a retryable one). This is that call.
+///
+/// Deliberately `let _ =`: the round this call goes on to *start* is not the
+/// subject of any test that uses it, and is usually unscripted. The previous
+/// round's pair is on disk before that round issues its first request, so the
+/// outcome either way is irrelevant — which is exactly the property being
+/// relied on.
+fn ack<P: PageSource>(d: &mut Provider<P>, cursor: &Cursor) {
+    let _ = d.changes(cursor);
+}
+
 // --- request shorthands ----------------------------------------------------
 
 fn first_req(drive: &str) -> Req {
@@ -1028,7 +1057,7 @@ fn positive_control_an_empty_cursor_with_no_persisted_state_does_enumerate() {
     );
 
     let mut d = rig.provider();
-    let (changes, _) = d.changes(&Cursor::default()).expect("a first run must sync");
+    let (changes, cursor) = d.changes(&Cursor::default()).expect("a first run must sync");
 
     assert_eq!(
         rig.journal.calls(),
@@ -1039,14 +1068,26 @@ fn positive_control_an_empty_cursor_with_no_persisted_state_does_enumerate() {
         upserted(&changes),
         set(&[cloud(MINE, "01A"), cloud(MINE, "01B")])
     );
+    // The two writes moved one call later, and nothing else about them changed.
+    // A round that derived a batch is not a round the framework applied, and
+    // persisting the position under an unapplied batch is what makes a
+    // tombstone in it unrecoverable — so the round itself writes nothing.
+    assert_eq!(
+        rig.journal.store_events(),
+        vec![Ev::Load],
+        "the round reads the store and writes nothing"
+    );
+    ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.store_events(),
         vec![
             Ev::Load,
             Ev::SaveTree(3),
-            Ev::SaveToken(format!("{MINE}={}", lnk("D1")))
+            Ev::SaveToken(format!("{MINE}={}", lnk("D1"))),
+            Ev::Load,
         ],
-        "load, then the tree, then the token"
+        "load, then the tree, then the token — on the acknowledging call, and \
+         before that call reads the store for its own round"
     );
 }
 
@@ -1083,7 +1124,7 @@ fn a_stored_token_with_no_stored_tree_is_discarded_rather_than_resumed() {
     );
 
     let mut d = rig.provider();
-    let (changes, _) = d.changes(&Cursor::default()).expect("recoverable");
+    let (changes, cursor) = d.changes(&Cursor::default()).expect("recoverable");
 
     assert_eq!(rig.journal.calls(), vec![first_req(MINE)]);
     assert!(
@@ -1098,6 +1139,10 @@ fn a_stored_token_with_no_stored_tree_is_discarded_rather_than_resumed() {
         removed(&changes).is_empty(),
         "there was no tree to diff against, so nothing can be concluded gone"
     );
+    // The pair lands on the call that proves the batch was applied, not on the
+    // round that derived it. Same two writes, same order, one call later.
+    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
         vec![
@@ -1160,6 +1205,9 @@ fn a_stored_tree_with_no_stored_token_enumerates_and_still_diffs_for_deletions()
         set(&[cloud(MINE, "01A"), cloud(MINE, "01B")])
     );
     assert!(cursor_str(&cursor).contains("D2"));
+    // The tree lands on the call that proves the batch was applied, so the
+    // deletion only leaves the persisted tree once the framework has seen it.
+    ack(&mut d, &cursor);
     let tree = rig.store.stored_tree().expect("a tree was written");
     assert!(!tree_ids(&tree).contains(&cloud(MINE, "01C")));
 }
@@ -1246,7 +1294,7 @@ fn a_restart_never_reads_the_stored_tree_as_a_page_of_deletions() {
     );
 
     let mut d = rig.provider();
-    let (changes, _) = d
+    let (changes, cursor) = d
         .changes(&Cursor::default())
         .expect("an ordinary restart is not an escalation");
 
@@ -1256,6 +1304,10 @@ fn a_restart_never_reads_the_stored_tree_as_a_page_of_deletions() {
         removed(&changes)
     );
     assert_eq!(upsert_count(&changes), 500);
+    // The pair lands on the call that proves the batch was applied. Same two
+    // writes, same order, same contents, one call later.
+    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
         vec![
@@ -1297,7 +1349,7 @@ fn a_restart_never_asks_for_token_latest() {
     );
 
     let mut d = rig.provider();
-    let (changes, _) = d.changes(&Cursor::default()).expect("resumable");
+    let (changes, cursor) = d.changes(&Cursor::default()).expect("resumable");
 
     assert_eq!(rig.journal.calls(), vec![resume_req("D9")]);
     assert!(
@@ -1305,6 +1357,10 @@ fn a_restart_never_asks_for_token_latest() {
         "?token=latest skips every change made while the daemon was down"
     );
     assert_eq!(removed(&changes), set(&[cloud(MINE, "01B")]));
+    // The token lands on the call that proves the batch was applied — the same
+    // one token, one call later.
+    assert!(rig.journal.token_writes().is_empty());
+    ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.token_writes(),
         vec![format!("{MINE}={}", lnk("D10"))]
@@ -1360,7 +1416,7 @@ fn a_round_interrupted_mid_enumeration_resumes_from_the_token_not_the_next_link(
             &lnk("D10"),
         ))],
     );
-    let (changes, _) = d.changes(&Cursor::default()).expect("the retry completes");
+    let (changes, cursor) = d.changes(&Cursor::default()).expect("the retry completes");
 
     assert_eq!(
         rig.journal.calls().first(),
@@ -1370,6 +1426,9 @@ fn a_round_interrupted_mid_enumeration_resumes_from_the_token_not_the_next_link(
     assert!(upserted(&changes).contains(&cloud(MINE, "01B")));
     assert!(upserted(&changes).contains(&cloud(MINE, "01C")));
     assert!(upserted(&changes).contains(&cloud(MINE, "01D")));
+    // D10 reaches the disk on the call that proves the batch was applied, not
+    // on the round that reached it.
+    ack(&mut d, &cursor);
     assert_eq!(
         rig.store
             .stored_token()
@@ -1398,9 +1457,14 @@ fn a_resumed_round_still_follows_its_next_links() {
         ))],
     );
     let mut round_one = rig.provider();
-    round_one
+    let (_, c1) = round_one
         .changes(&Cursor::default())
         .expect("the first round enumerates");
+    // Round one's writes land on the call that proves the framework applied its
+    // batch, so the predecessor is acknowledged before it is dropped. Without
+    // that, the restart below would inherit an empty store — which is the
+    // correct outcome for a round nobody applied, and not the case under test.
+    ack(&mut round_one, &c1);
 
     // A restart: a *fresh* instance, handed the empty cursor the framework
     // always hands after one.
@@ -1468,7 +1532,10 @@ fn positive_control_a_fresh_instance_resumes_the_token_its_predecessor_wrote() {
         ))],
     );
     let mut one = rig.provider();
-    one.changes(&Cursor::default()).expect("round one");
+    let (_, c1) = one.changes(&Cursor::default()).expect("round one");
+    // The predecessor's writes land on the call that proves its batch was
+    // applied; that call is what makes it a predecessor with state on disk.
+    ack(&mut one, &c1);
 
     rig.journal.clear();
     rig.script(
@@ -1593,7 +1660,7 @@ fn a_repeated_cursor_is_served_from_memory_with_no_request_and_no_backoff() {
     );
 
     let mut d = rig.provider();
-    let (_, _c1) = d.changes(&Cursor::default()).expect("round one");
+    let (_, c1) = d.changes(&Cursor::default()).expect("round one");
     let mut batches = Vec::new();
     for _ in 0..3 {
         batches.push(d.changes(&Cursor::default()).expect("a repeat"));
@@ -1609,13 +1676,26 @@ fn a_repeated_cursor_is_served_from_memory_with_no_request_and_no_backoff() {
         "no backoff, because there was no request: {:?}",
         rig.journal.sleeps()
     );
-    assert_eq!(rig.journal.token_writes().len(), 1);
     for (b, _) in &batches {
         assert!(
             !upserted(b).contains(&cloud(MINE, "01C")),
             "the next round's page was consumed by a repeat"
         );
     }
+    // A repeat is the framework saying it could not apply the batch, so the
+    // round's pair is still held: nothing at all has been written yet. Moving
+    // the position under an unapplied batch is what lost the removal.
+    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    ack(&mut d, &c1);
+    assert_eq!(rig.journal.token_writes().len(), 1);
+    assert_eq!(
+        rig.journal.writes(),
+        vec![
+            Ev::SaveTree(2),
+            Ev::SaveToken(format!("{MINE}={}", lnk("D10")))
+        ],
+        "one tree and one token, tree first — round one's, once acknowledged"
+    );
 }
 
 /// POSITIVE CONTROL. A provider that mistakes every subsequent call for a repeat
@@ -1657,6 +1737,10 @@ fn positive_control_an_acknowledged_cursor_runs_the_next_round() {
     );
     assert!(upserted(&b2).contains(&cloud(MINE, "01C")));
     assert_ne!(c2, c1);
+    // Each round's pair lands on the call that acknowledges it: round two's
+    // call wrote round one's D10, so round two's D11 needs one more.
+    assert_eq!(rig.journal.token_writes().len(), 1);
+    ack(&mut d, &c2);
     assert_eq!(rig.journal.token_writes().len(), 2);
     assert_eq!(
         rig.journal.token_writes().last().cloned(),
@@ -1752,12 +1836,26 @@ fn three_repeats_of_one_cursor_are_reported_as_a_stall() {
         Some(Escalation::StalledRetryable { passes, .. }) => assert_eq!(passes, 3),
         other => panic!("three repeats must be reported as a stall, got {other:?}"),
     }
-    assert_eq!(rig.journal.token_writes().len(), 1);
-    let (b, _) = last.unwrap();
+    // A stall is the case where the acknowledging call never comes, so nothing
+    // has been written at all — which is the whole of the fix: the position
+    // stays where the wedged batch was read from, and the tombstone in it is
+    // still reachable from the token on disk after a restart.
+    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    let (b, c) = last.unwrap();
     assert_eq!(
         removed(&b),
         set(&[cloud(MINE, "01X")]),
         "the stall is reported, not resolved by quietly dropping the work"
+    );
+    // And when the framework does finally move on, the pair lands exactly once.
+    ack(&mut d, &c);
+    assert_eq!(rig.journal.token_writes().len(), 1);
+    assert_eq!(
+        rig.journal.writes(),
+        vec![
+            Ev::SaveTree(2),
+            Ev::SaveToken(format!("{MINE}={}", lnk("D10")))
+        ]
     );
 }
 
@@ -1888,6 +1986,11 @@ fn the_tree_written_is_this_rounds_tree_and_it_is_written_before_the_token() {
     let mut d = rig.provider();
     let (_, cursor) = d.changes(&Cursor::default()).expect("a clean round");
 
+    // Still this round's tree, still before the token — one call later. The
+    // round derives the pair and writes neither; the call that proves the batch
+    // was applied is the one that lands it.
+    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
         vec![
@@ -1928,8 +2031,14 @@ fn a_tree_write_failure_writes_no_token_at_all() {
     );
 
     let mut d = rig.provider();
+    // The writes happen on the call that proves the batch was applied, so that
+    // is where a full disk surfaces. Everything else about this test is
+    // unchanged: the tree write fails and no token is written at all.
+    let (_, c1) = d
+        .changes(&Cursor::default())
+        .expect("the round derives its state");
     assert!(
-        d.changes(&Cursor::default()).is_err(),
+        d.changes(&c1).is_err(),
         "a round whose state could not be written did not complete"
     );
     assert_eq!(
@@ -1940,7 +2049,7 @@ fn a_tree_write_failure_writes_no_token_at_all() {
 
     rig.store.clear_faults();
     rig.journal.clear();
-    let (changes, _) = d.changes(&Cursor::default()).expect("the retry");
+    let (changes, _) = d.changes(&c1).expect("the retry");
     assert_eq!(rig.journal.calls().first(), Some(&resume_req("D9")));
     assert!(upserted(&changes).contains(&cloud(MINE, "01B")));
 }
@@ -1977,7 +2086,12 @@ fn a_token_write_failure_does_not_advance_the_in_memory_token() {
     );
 
     let mut d = rig.provider();
-    let _ = d.changes(&Cursor::default());
+    // The pair lands on the call that proves the batch was applied, so the
+    // token failure surfaces there — after the tree of the same round landed.
+    let (_, c1) = d
+        .changes(&Cursor::default())
+        .expect("the round derives its state");
+    let _ = d.changes(&c1);
     assert_eq!(
         rig.journal.writes(),
         vec![Ev::SaveTree(3), Ev::SaveTokenFailed],
@@ -1986,7 +2100,7 @@ fn a_token_write_failure_does_not_advance_the_in_memory_token() {
 
     rig.store.clear_faults();
     rig.journal.clear();
-    let (changes, _) = d.changes(&Cursor::default()).expect("the retry");
+    let (changes, _) = d.changes(&c1).expect("the retry");
 
     assert_eq!(
         rig.journal.calls().first(),
@@ -2019,7 +2133,9 @@ fn a_tree_write_failure_leaves_the_old_pair_intact() {
         ))],
     );
     let mut one = rig.provider();
-    one.changes(&Cursor::default()).expect("round one");
+    let (_, c1) = one.changes(&Cursor::default()).expect("round one");
+    // Round one's pair lands on the call that proves its batch was applied.
+    ack(&mut one, &c1);
     let tree_before = rig.store.tree_bytes().expect("a tree");
     let token_before = rig.store.token_bytes().expect("a token");
 
@@ -2037,7 +2153,12 @@ fn a_tree_write_failure_leaves_the_old_pair_intact() {
     );
 
     let mut two = rig.provider();
-    let outcome = two.changes(&Cursor::default());
+    // The failing write is on the acknowledging call, which is where both
+    // writes now happen.
+    let (_, c2) = two
+        .changes(&Cursor::default())
+        .expect("the round derives its state");
+    let outcome = two.changes(&c2);
 
     assert!(
         !rig.journal
@@ -2049,12 +2170,22 @@ fn a_tree_write_failure_leaves_the_old_pair_intact() {
     );
     assert_eq!(rig.store.tree_bytes(), Some(tree_before));
     assert_eq!(rig.store.token_bytes(), Some(token_before));
-    if let Ok((_, c)) = outcome {
-        assert!(
-            !cursor_str(&c).contains("DELTA-2"),
-            "a round whose state was not persisted has no new position to hand out"
-        );
-    }
+    assert!(
+        outcome.is_err(),
+        "a pair that could not be written is not a pass that completed"
+    );
+    // The position the round handed out was never durable, and the assertion
+    // that used to say so — "no new position to hand out" — now says it where
+    // it is actually observable: the next round starts from DELTA-1 again,
+    // because nothing about DELTA-2 reached the disk.
+    rig.journal.clear();
+    let _ = two.changes(&c2);
+    assert_eq!(
+        rig.journal.calls().first(),
+        Some(&resume_req("DELTA-1")),
+        "the old pair is what the retry resumes: {:?}",
+        rig.journal.calls()
+    );
 }
 
 /// The harmless half of the ordering rule, proved harmless rather than assumed.
@@ -2081,7 +2212,9 @@ fn a_crash_after_the_tree_write_replays_the_delta_and_keeps_the_rest_of_the_tree
         ))],
     );
     let mut one = rig.provider();
-    one.changes(&Cursor::default()).expect("round one");
+    let (_, c1) = one.changes(&Cursor::default()).expect("round one");
+    // Round one's pair lands on the call that proves its batch was applied.
+    ack(&mut one, &c1);
 
     // Round two: the tree lands, the token write is interrupted.
     rig.store.fail_token(io::ErrorKind::Interrupted);
@@ -2094,7 +2227,12 @@ fn a_crash_after_the_tree_write_replays_the_delta_and_keeps_the_rest_of_the_tree
     );
     rig.script(resume_req("DELTA-1"), vec![Reply::ok(renamed)]);
     let mut two = rig.provider();
-    let _ = two.changes(&Cursor::default());
+    // Both writes are on the acknowledging call, so that is where round two's
+    // interrupted token write happens.
+    let (_, c2) = two
+        .changes(&Cursor::default())
+        .expect("round two derives its state");
+    let _ = two.changes(&c2);
 
     let held = rig.store.stored_tree().expect("the tree landed");
     let ids = tree_ids(&held);
@@ -2160,7 +2298,10 @@ fn a_crash_between_the_two_writes_costs_a_move_only_when_the_token_is_written_fi
         ))],
     );
     let mut one = rig.provider();
-    one.changes(&Cursor::default()).expect("round one");
+    let (_, c1) = one.changes(&Cursor::default()).expect("round one");
+    // Round one's pair lands on the call that proves its batch was applied, and
+    // before the write counter below is armed.
+    ack(&mut one, &c1);
 
     rig.store.fail_after_n_writes(1);
     rig.script(
@@ -2174,7 +2315,12 @@ fn a_crash_between_the_two_writes_costs_a_move_only_when_the_token_is_written_fi
         ))],
     );
     let mut two = rig.provider();
-    let _ = two.changes(&Cursor::default());
+    // The two writes are on the acknowledging call, so that is the call the
+    // power cut lands in the middle of.
+    let (_, c2) = two
+        .changes(&Cursor::default())
+        .expect("round two derives its state");
+    let _ = two.changes(&c2);
 
     // Round three. Every branch a correct or incorrect implementation could take
     // is scripted, so the failure is the outcome and not a missing fixture.
@@ -2235,7 +2381,9 @@ fn a_token_that_does_not_belong_to_the_stored_tree_is_discarded() {
         ))],
     );
     let mut one = rig.provider();
-    one.changes(&Cursor::default()).expect("round one");
+    let (_, c1) = one.changes(&Cursor::default()).expect("round one");
+    // Round one's pair lands on the call that proves its batch was applied.
+    ack(&mut one, &c1);
 
     // A tree write that returned success and did not survive the power cut.
     rig.store.swallow_tree_write(true);
@@ -2250,7 +2398,12 @@ fn a_token_that_does_not_belong_to_the_stored_tree_is_discarded() {
         ))],
     );
     let mut two = rig.provider();
-    let _ = two.changes(&Cursor::default());
+    // Both writes are on the acknowledging call, so that is where the swallowed
+    // tree write and the token that outruns it happen.
+    let (_, c2) = two
+        .changes(&Cursor::default())
+        .expect("round two derives its state");
+    let _ = two.changes(&c2);
 
     rig.store.clear_faults();
     rig.journal.clear();
@@ -2303,9 +2456,14 @@ fn a_round_that_produced_no_changes_still_persists_its_tree() {
     );
 
     let mut d = rig.provider();
-    let (changes, _) = d.changes(&Cursor::default()).expect("a clean round");
+    let (changes, cursor) = d.changes(&Cursor::default()).expect("a clean round");
 
     assert!(changes.is_empty(), "a root and an empty folder are no files");
+    // An empty batch is still acknowledged — `hydration-sync.rs` advances the
+    // cursor on a quiet pass too — so the tree still reaches disk, one call
+    // later and with the folder in it.
+    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
         vec![
@@ -2361,6 +2519,9 @@ fn only_a_delta_link_is_ever_persisted_as_a_token() {
     let mut d = rig.provider();
     let (_, cursor) = d.changes(&Cursor::default()).expect("a three-page round");
 
+    // Still one token per round and still after the tree — written on the call
+    // that proves the round's batch was applied.
+    ack(&mut d, &cursor);
     let tokens = rig.store.tokens_written();
     assert_eq!(tokens.len(), 1, "one token per round, at the end of it");
     let bytes = String::from_utf8(tokens[0].as_bytes()).expect("utf-8");
@@ -2408,7 +2569,10 @@ fn a_second_provider_instance_over_the_same_store_does_not_write_back_a_stale_tr
             &lnk("DELTA-1"),
         ))],
     );
-    one.changes(&Cursor::default()).expect("instance one syncs");
+    let (_, c1) = one.changes(&Cursor::default()).expect("instance one syncs");
+    // Instance one's pair lands on the call that proves its batch was applied;
+    // that is the state instance two must not write back over.
+    ack(&mut one, &c1);
 
     rig.journal.clear();
     rig.script(
@@ -2418,8 +2582,12 @@ fn a_second_provider_instance_over_the_same_store_does_not_write_back_a_stale_tr
             &lnk("DELTA-2"),
         ))],
     );
-    two.changes(&Cursor::default())
+    let (_, c2) = two
+        .changes(&Cursor::default())
         .expect("instance two runs a round");
+    // Instance two's own pair lands the same way, so what is on disk at the end
+    // is a tree instance two derived — the thing under test.
+    ack(&mut two, &c2);
 
     let events = rig.journal.store_events();
     assert_eq!(
@@ -2603,7 +2771,9 @@ fn an_endless_chain_of_fresh_next_links_stops_at_the_page_budget() {
 #[test]
 fn a_long_finite_enumeration_completes_and_yields_exactly_one_token() {
     let rig = Rig::with_cap(usize::MAX);
-    let pages = GeneratedPages::bounded(rig.journal.clone(), vec![MAX_PAGES_PER_ROUND - 1]);
+    // A trivial second round is scripted only so the acknowledging call below
+    // has something to resume; nothing about it is asserted on.
+    let pages = GeneratedPages::bounded(rig.journal.clone(), vec![MAX_PAGES_PER_ROUND - 1, 1]);
     let mut d = rig.generated(pages);
 
     let (changes, cursor) = d
@@ -2616,6 +2786,9 @@ fn a_long_finite_enumeration_completes_and_yields_exactly_one_token() {
         MAX_PAGES_PER_ROUND - 1,
         "no duplicates"
     );
+    // Still exactly one token for the round, written on the call that proves
+    // its batch was applied.
+    ack(&mut d, &cursor);
     let tokens = rig.store.tokens_written();
     assert_eq!(tokens.len(), 1);
     assert_eq!(tokens[0].get(&drive_id(MINE)), Some(lnk("D0").as_str()));
@@ -2638,7 +2811,9 @@ fn a_long_finite_enumeration_completes_and_yields_exactly_one_token() {
 fn the_page_budget_belongs_to_the_round_not_to_the_provider() {
     let rig = Rig::with_cap(usize::MAX);
     let per_round = MAX_PAGES_PER_ROUND - 2;
-    let pages = GeneratedPages::bounded(rig.journal.clone(), vec![per_round; 3]);
+    // A fourth round is scripted only so the acknowledging call below has
+    // something to resume; nothing about it is asserted on.
+    let pages = GeneratedPages::bounded(rig.journal.clone(), vec![per_round; 4]);
     let mut d = rig.generated(pages);
 
     let (_, c1) = d.changes(&Cursor::default()).expect("round one");
@@ -2648,6 +2823,9 @@ fn the_page_budget_belongs_to_the_round_not_to_the_provider() {
     assert!(cursor_str(&c1).contains("D0"));
     assert!(cursor_str(&c2).contains("D1"));
     assert!(cursor_str(&c3).contains("D2"));
+    // Each round's token is written by the call that acknowledges it, so three
+    // acknowledged rounds are still three tokens — the third one call later.
+    ack(&mut d, &c3);
     let tokens = rig.store.tokens_written();
     assert_eq!(tokens.len(), 3);
     for (i, t) in tokens.iter().enumerate() {
@@ -2694,6 +2872,9 @@ fn an_empty_page_carrying_a_next_link_is_followed() {
         set(&[cloud(MINE, "01A"), cloud(MINE, "01B")])
     );
     assert!(cursor_str(&cursor).contains("DELTA-1"));
+    // The one token of the round, written on the call that proves its batch was
+    // applied.
+    ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.token_writes(),
         vec![format!("{MINE}={}", lnk("DELTA-1"))]
@@ -2753,6 +2934,10 @@ fn a_delta_link_on_the_first_page_completes_the_round_and_nothing_further_is_fet
         "Cursor(None) makes the driver re-enumerate the whole drive next pass"
     );
     assert!(cursor_str(&cursor).contains("DELTA-1"));
+    // The pair lands on the call that proves the batch was applied. Same two
+    // writes, same order, same contents, one call later.
+    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
         vec![
@@ -2913,12 +3098,15 @@ fn a_round_lost_to_a_bad_page_is_reissued_from_the_start_and_completes() {
             &lnk("DELTA-1"),
         ))],
     );
-    let (changes, _) = d.changes(&Cursor::default()).expect("the retry completes");
+    let (changes, cursor) = d.changes(&Cursor::default()).expect("the retry completes");
 
     assert!(rig.journal.calls().contains(&next_req("P1")));
     assert_eq!(upsert_count(&changes), 201);
     assert_eq!(upserted(&changes).len(), 201, "no id twice");
     assert!(removed(&changes).is_empty());
+    // One token for the one round that completed, written on the call that
+    // proves its batch was applied — the lost round wrote nothing either way.
+    ack(&mut d, &cursor);
     assert_eq!(rig.store.tokens_written().len(), 1);
 }
 
@@ -3183,10 +3371,13 @@ fn two_scopes_in_one_round_each_get_their_own_token() {
     );
 
     let mut d = rig.provider();
-    let (changes, _) = d.changes(&Cursor::default()).expect("a fan-out round");
+    let (changes, cursor) = d.changes(&Cursor::default()).expect("a fan-out round");
 
     assert!(upserted(&changes).contains(&cloud(MINE, "01X")));
     assert!(upserted(&changes).contains(&cloud(THEIRS, "01X")));
+    // Still one token write for the whole fan-out, on the call that proves the
+    // round's batch was applied.
+    ack(&mut d, &cursor);
     let tokens = rig.store.tokens_written();
     assert_eq!(tokens.len(), 1, "one round, one token write");
     let blob = &tokens[0];
@@ -3224,7 +3415,7 @@ fn a_delta_link_for_one_scope_does_not_end_another_scopes_paging() {
     );
 
     let mut d = rig.provider();
-    let (changes, _) = d.changes(&Cursor::default()).expect("a fan-out round");
+    let (changes, cursor) = d.changes(&Cursor::default()).expect("a fan-out round");
 
     assert!(
         rig.journal.calls().contains(&next_req_on(THEIRS, "PT1")),
@@ -3236,6 +3427,9 @@ fn a_delta_link_for_one_scope_does_not_end_another_scopes_paging() {
         Some("Team Files/y.txt"),
         "the far side hangs from the near placeholder, not from a root of its own"
     );
+    // The token is written by the call that proves the round's batch was
+    // applied; it still carries both scopes' links.
+    ack(&mut d, &cursor);
     let blob = rig.store.tokens_written().pop().expect("a token");
     assert_eq!(blob.get(&drive_id(MINE)), Some(link_on(MINE, "DM").as_str()));
     assert_eq!(
@@ -3261,7 +3455,10 @@ fn each_drives_token_is_stored_and_resumed_under_its_own_drive_id() {
         ))],
     );
     let mut one = rig.provider();
-    one.changes(&Cursor::default()).expect("round one");
+    let (_, c1) = one.changes(&Cursor::default()).expect("round one");
+    // Round one's per-drive token blob lands on the call that proves its batch
+    // was applied; it is what round two has to resume from.
+    ack(&mut one, &c1);
 
     rig.journal.clear();
     rig.script(
@@ -3310,7 +3507,10 @@ fn state_belonging_to_another_drive_is_discarded_whole_and_reports_no_deletions(
         ))],
     );
     let mut old = rig.provider_for(primary(OLD));
-    old.changes(&Cursor::default()).expect("the old account");
+    let (_, c_old) = old.changes(&Cursor::default()).expect("the old account");
+    // The old account's pair lands on the call that proves its batch was
+    // applied — that is the state the new sign-in has to discard.
+    ack(&mut old, &c_old);
 
     rig.journal.clear();
     rig.script(
@@ -3330,7 +3530,7 @@ fn state_belonging_to_another_drive_is_discarded_whole_and_reports_no_deletions(
     );
 
     let mut fresh = rig.provider_for(primary(NEW));
-    let (changes, _) = fresh
+    let (changes, c_new) = fresh
         .changes(&Cursor::default())
         .expect("a new drive is not a fault");
 
@@ -3346,6 +3546,9 @@ fn state_belonging_to_another_drive_is_discarded_whole_and_reports_no_deletions(
         .journal
         .calls()
         .contains(&resume_req_on(OLD, "DELTA-OLD-1")));
+    // The new drive's tree replaces the old one on the call that proves its
+    // batch was applied.
+    ack(&mut fresh, &c_new);
     let tree = rig.store.stored_tree().expect("a tree");
     assert!(tree_ids(&tree).iter().all(|id| id.starts_with(NEW)));
 }
@@ -3402,6 +3605,10 @@ fn an_expired_token_re_enumerates_and_returns_a_fresh_cursor_rather_than_errorin
     );
     assert_eq!(removed(&changes), set(&[cloud(MINE, "01C")]));
     assert!(cursor.0.is_some() && cursor_str(&cursor).contains("D20"));
+    // The recovered pair lands on the call that proves the batch was applied.
+    // Same two writes, same order, same contents, one call later.
+    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
         vec![
@@ -3439,7 +3646,10 @@ fn the_expired_token_diff_removes_a_file_deleted_while_the_token_was_dead() {
         vec![Reply::ok(body_delta(&[], &lnk("DLATEST")))],
     );
     let mut one = rig.provider();
-    one.changes(&Cursor::default()).expect("round one");
+    let (_, c1) = one.changes(&Cursor::default()).expect("round one");
+    // Round one's pair lands on the call that proves its batch was applied —
+    // it is the tree the expired-token diff below is taken against.
+    ack(&mut one, &c1);
 
     rig.journal.clear();
     rig.script(
@@ -3473,6 +3683,10 @@ fn the_expired_token_diff_removes_a_file_deleted_while_the_token_was_dead() {
     assert!(upserted(&changes).contains(&cloud(MINE, "01A")));
     assert!(upserted(&changes).contains(&cloud(MINE, "01B")));
     assert!(cursor_str(&cursor).contains("DELTA-2"));
+    // The recovered pair lands on the call that proves the batch was applied.
+    // Same two writes, same order, same contents, one call later.
+    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    ack(&mut two, &cursor);
     assert_eq!(
         rig.journal.writes(),
         vec![
@@ -3642,13 +3856,15 @@ fn a_tree_that_fails_to_deserialise_discards_the_token_with_it() {
     );
 
     let mut d = rig.provider();
-    let (changes, _) = d
+    let (changes, cursor) = d
         .changes(&Cursor::default())
         .expect("a corrupt tree is recoverable, and no panic escapes");
 
     assert!(rig.journal.calls().contains(&first_req(MINE)));
     assert!(!rig.journal.calls().contains(&resume_req("DELTA-1")));
     assert!(removed(&changes).is_empty());
+    // The replacement tree lands on the call that proves the batch was applied.
+    ack(&mut d, &cursor);
     let tree = rig.store.stored_tree().expect("a tree was rewritten");
     let ids = tree_ids(&tree);
     assert!(ids.contains(&cloud(MINE, "01A")) && ids.contains(&cloud(MINE, "01B")));
@@ -3678,8 +3894,12 @@ fn the_content_tag_survives_the_tree_round_trip() {
         ))],
     );
     let mut one = rig.provider();
-    let (b1, _) = one.changes(&Cursor::default()).expect("round one");
+    let (b1, c1) = one.changes(&Cursor::default()).expect("round one");
     assert_eq!(etag_of(&b1, &cloud(MINE, "01A")), Some("ct:c:{G1},1"));
+    // Round one's tree lands on the call that proves its batch was applied.
+    // Without it the restart below finds an empty store and re-enumerates,
+    // which would answer this test out of the page rather than out of the tree.
+    ack(&mut one, &c1);
 
     rig.script(
         resume_req("DELTA-1"),
@@ -3717,7 +3937,11 @@ fn a_package_is_still_opaque_after_a_restart() {
         ))],
     );
     let mut one = rig.provider();
-    one.changes(&Cursor::default()).expect("round one");
+    let (_, c1) = one.changes(&Cursor::default()).expect("round one");
+    // Round one's tree lands on the call that proves its batch was applied.
+    // Without it the restart below finds an empty store and re-enumerates,
+    // which would never read the notebook back out of the tree at all.
+    ack(&mut one, &c1);
     match tree_entry(&rig.store.stored_tree().unwrap(), &cloud(MINE, "01NB")) {
         Some(Item::Upsert { kind, .. }) => assert_eq!(kind, Kind::Opaque),
         other => panic!("the notebook must be stored as opaque: {other:?}"),
@@ -3734,12 +3958,15 @@ fn a_package_is_still_opaque_after_a_restart() {
         ))],
     );
     let mut two = rig.provider();
-    let (changes, _) = two.changes(&Cursor::default()).expect("round two");
+    let (changes, c2) = two.changes(&Cursor::default()).expect("round two");
 
     for p in paths(&changes) {
         assert!(!p.contains("Notes/"), "walked into a package: {p}");
         assert!(!p.ends_with(".one"), "emitted a notebook internal: {p}");
     }
+    // Acknowledged too, so the tree checked below is the one round two wrote
+    // back after reading the notebook out of round one's — not round one's own.
+    ack(&mut two, &c2);
     match tree_entry(&rig.store.stored_tree().unwrap(), &cloud(MINE, "01NB")) {
         Some(Item::Upsert { kind, .. }) => assert_eq!(kind, Kind::Opaque),
         other => panic!("still opaque after the restart: {other:?}"),
@@ -3769,12 +3996,16 @@ fn the_pinned_tag_source_is_persisted_and_never_re_probed() {
         ))],
     );
     let mut one = rig.provider();
-    let (b1, _) = one.changes(&Cursor::default()).expect("round one");
+    let (b1, c1) = one.changes(&Cursor::default()).expect("round one");
     assert_eq!(
         etag_of(&b1, &cloud(MINE, "01A")),
         Some("qx:QXAAA"),
         "a drive with hashes and no cTags pins QuickXor"
     );
+    // Round one's tree — and with it the pinned tag source — lands on the call
+    // that proves its batch was applied. Without it the restart below finds an
+    // empty store, re-probes from a fresh page, and the pin is never tested.
+    ack(&mut one, &c1);
 
     rig.script(
         resume_req("DELTA-1"),
