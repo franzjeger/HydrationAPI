@@ -218,14 +218,14 @@ fn main() -> io::Result<()> {
     // is holding cannot be killed by a signal and every later operation on the
     // mount queues behind it.
     let mut status = 0;
-    let mut beat = in_flight.progress();
+    let mut beat = (in_flight.progress(), in_flight.liveness());
     let mut moved = Instant::now();
     let mut stalled = false;
     loop {
         if unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) } == child {
             break;
         }
-        let now = in_flight.progress();
+        let now = (in_flight.progress(), in_flight.liveness());
         if now != beat {
             beat = now;
             moved = Instant::now();

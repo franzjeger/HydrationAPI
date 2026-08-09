@@ -353,6 +353,85 @@ pub fn has_mark(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Write one chunk of hydrated content at `offset`.
+///
+/// Through the event fd, never by re-opening the path — the trap this module is
+/// arranged around (§6a-ter). Measured (`probes/stream.c`): these partial writes
+/// fire no further pre-content events, and a bystander cannot observe the
+/// half-filled file because their own event queues behind the one being served.
+pub fn write_at(fd: std::os::fd::BorrowedFd<'_>, buf: &[u8], offset: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = unsafe {
+            libc::pwrite(
+                fd.as_raw_fd(),
+                buf[done..].as_ptr() as *const libc::c_void,
+                buf.len() - done,
+                (offset + done as u64) as libc::off_t,
+            )
+        };
+        if n <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        done += n as usize;
+    }
+    Ok(())
+}
+
+/// Everything a completed streamed transfer still owes the file.
+///
+/// The same four steps `hydrate` ends with, in the same order and for the same
+/// reasons — separated only because the content arrived in pieces rather than
+/// all at once, and the caller wrote it as it came.
+pub fn finish_hydration(fd: std::os::fd::BorrowedFd<'_>, expected: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::fsync(fd.as_raw_fd()) } < 0 {
+        let e = io::Error::last_os_error();
+        let _ = punch_fd(fd, expected);
+        let _ = hydration_protocol::stamp::write_fd(fd);
+        return Err(e);
+    }
+    unmark_fd(fd)?;
+    match hydration_protocol::flags::set_nodump_fd(fd, false) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
+        Err(e) => return Err(e),
+    }
+    let _ = hydration_protocol::stamp::write_fd(fd);
+    Ok(())
+}
+
+/// Put a placeholder back exactly as it was, whatever a failed transfer left.
+///
+/// Punches the *whole declared size*, never only what was written: a previous
+/// abandoned attempt may have left residue further in, and punching only the
+/// latest range would leave a file that is marked as empty and is not.
+pub fn abandon(fd: std::os::fd::BorrowedFd<'_>, expected: u64) -> io::Result<()> {
+    punch_fd(fd, expected)?;
+    let _ = hydration_protocol::stamp::write_fd(fd);
+    Ok(())
+}
+
+/// Clear any residue before a transfer starts.
+///
+/// A marked file that occupies disk cannot exist between transfers, but it is
+/// exactly what a crash mid-stream leaves — and the supervisor cannot clean it
+/// up, because it holds the event fd's *number* and not the descriptor. So the
+/// next transfer does it, which is the only place that can.
+pub fn clear_residue(fd: std::os::fd::BorrowedFd<'_>, expected: u64) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if st.st_blocks == 0 {
+        return Ok(false);
+    }
+    punch_fd(fd, expected)?;
+    Ok(true)
+}
+
 /// The same question asked of an open file rather than a name.
 ///
 /// This is the one the worker uses. A name is a weaker handle than it looks:

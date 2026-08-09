@@ -11,7 +11,7 @@ There are three traits. None of them are about POSIX; the framework owns all of
 that.
 
 ```rust
-trait Provider { fn fetch(&mut self, cloud_id: &str, size: u64) -> io::Result<Vec<u8>>; }
+trait Provider { fn fetch(&mut self, cloud_id: &str, size: u64, out: &mut Body<'_>) -> io::Result<()>; }
 trait Sink     { fn upload(&mut self, path: &Path, existing: Option<&str>) -> io::Result<Uploaded>;
                  fn remove(&mut self, cloud_id: &str) -> io::Result<()>; }
 trait Discover { fn changes(&mut self, cursor: &Cursor) -> io::Result<(Vec<Change>, Cursor)>; }
@@ -37,19 +37,31 @@ of wrong bytes passes. OneDrive supplies `quickXorHash` and often `sha1`; check
 one. "A wrong byte that arrives with success" is the failure this whole project
 is arranged against, and length alone does not catch it.
 
-**Return exactly `size` bytes, or an error.** There is no partial success in this
-framework and adding one is not a small change — §5.7 exists because a
-half-hydrated file is indistinguishable from a real one afterwards. If the
-transfer ends early, return the error. Do not return what arrived.
+**Write the object into `out`, and let `out` hold you to it.** Usually the whole
+implementation:
 
-The framework checks the length twice — once in the client, once in the
-privileged helper — and the helper's check happens *before* it reads your body,
-so an honest error costs less than a dishonest success.
+```rust
+fn fetch(&mut self, id: &str, _size: u64, out: &mut Body<'_>) -> io::Result<()> {
+    let mut body = self.http.get(self.url(id)).send()?;
+    std::io::copy(&mut body, out)?;
+    Ok(())
+}
+```
 
-**Do not retry inside `fetch` for longer than a few seconds.** A reader is
-blocked inside `read()` for the whole call, and the helper gives up after 30
-seconds and hands them `EIO`. Long retries do not help that reader; they only
-delay the error. Retry at the sync level, where nobody is waiting.
+`Body` knows the object's size before you start, because the framework took it
+from the placeholder rather than from you. Writing past it fails at the offending
+byte; finishing short becomes an abort rather than a truncated file. There is no
+partial success here and adding one is not a small change — §5.7 exists because a
+half-hydrated file is indistinguishable from a real one afterwards. Returning
+`Err` abandons the transfer cleanly: the placeholder is put back exactly as it
+was and the reader gets an error.
+
+**Keep sending, or fail.** Three limits bound a transfer, and they ask different
+questions: the service has 30 seconds to send anything at all, 60 seconds to send
+anything *more* once it has started, and 10 minutes in total. So a slow link is
+fine and a stopped one is not — but a silent retry inside `fetch` looks exactly
+like a stall to the framework. Retry at the sync level, where nobody is waiting,
+and keep writing while you are being read.
 
 **`cloud_id` is whatever you returned from `upload` or put in a `Change`.** The
 framework never parses it. It can be a Graph item id, a URL, a JSON blob — but it
@@ -214,19 +226,23 @@ them.
 
 ## Two ceilings to know about before you design around them
 
-**Whole-object fetches, with a 30-second deadline.** `fetch` returns a `Vec<u8>`
-and must complete before the first byte reaches the reader, and the privileged
-helper gives up after 30 seconds. So an object larger than roughly thirty seconds
-of your bandwidth — a few hundred megabytes on a home connection — cannot be
-served at all, and the failure is not confined to that file: fetches are
-serialised, and three consecutive misses put the helper in a state where every
-dehydrated file on the mount returns `EIO` until it recovers. A file manager
-generating thumbnails over a video folder reaches this on day one.
+**There is a total transfer cap, and it is not going away.** Ten minutes by
+default. It is chosen from *how long a filesystem operation may block*, not from
+how big a file may be — because the reader is inside `read()` the whole time and
+cannot be killed by a signal (§6a-bis), so an uncapped transfer means a user with
+an unkillable process for hours.
 
-Until the framework grows streaming fetches, a provider should refuse
-oversized objects with a clear error rather than letting them consume the
-deadline, and a client should avoid creating placeholders it knows it cannot
-serve.
+So the ceiling is `cap × bandwidth`: tens of gigabytes on a decent link, rather
+than the few hundred megabytes the old whole-object design allowed. That is a
+real improvement of roughly sixty-fold, and it is **not** the same as no limit.
+Above it, refuse the object with a clear error rather than spending ten minutes
+to fail anyway.
+
+Note what streaming does *not* fix. A `read()` demands only the page it needs, so
+a sequentially-read file produces many small demands — but a **mapped** read
+demands the whole object in one event (measured, §8d), and nothing can decompose
+that. `mmap` is every ELF loader, every runtime loading a library, sqlite, `grep`
+on a large file. For those the cap is the ceiling, exactly.
 
 **Restoring from a backup needs a procedure you have to write.** A restore
 reproduces content without extended attributes, so every restored file looks like

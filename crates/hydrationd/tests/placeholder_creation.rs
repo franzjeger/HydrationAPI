@@ -22,7 +22,7 @@ use hydration_protocol::FileId;
 /// The name of a mechanism that was removed for being exploitable. Kept here so
 /// the tests below can assert its absence.
 const REMOVED_BUILDING_MARK: &str = "user.hydration.building";
-use hydrationd::daemon::{Fetch, Worker};
+use hydrationd::daemon::{FetchWhole, Worker};
 use hydrationd::fanotify::Group;
 use hydrationd::policy::Policy;
 use hydrationd::supervisor::InFlight;
@@ -48,7 +48,7 @@ fn skip(why: &str) {
 /// Content that is unmistakably content, so "did this hydrate" is not a guess.
 struct Canned(Vec<u8>);
 
-impl Fetch for Canned {
+impl FetchWhole for Canned {
     fn fetch(&mut self, _file: FileId, size: u64) -> io::Result<Vec<u8>> {
         let mut v = self.0.clone();
         v.resize(size as usize, b'.');

@@ -759,6 +759,20 @@ To ting rettet det:
   hendelser — så ingenting henger, og vakten river ned monteringen derfra. Det er
   §6a-bis' tredje krav nådd via den andre veien.
 
+**Streaming er nå bygget** (§8c, §8d). Hentingen leveres i biter inn i
+hendelsens fd etter hvert som bytene kommer, med tre grenser som stiller
+forskjellige spørsmål: 30 s til å si *noe*, 60 s til å si *mer*, og 10 minutter
+totalt. Taket er dermed valgt ut fra hvor lenge en filsystemoperasjon får
+blokkere, ikke ut fra hvor stor en fil får være — og det må finnes, siden leseren
+ikke kan signaleres bort. Hjelperen bufrer én bit framfor hele objektet, så
+minnekostnaden er `MAX_CHUNK` og ikke filstørrelsen.
+
+Vakten fikk en andre teller for dette. Fremdriftstelleren beveger seg bare når en
+hendelse er ferdig besvart, så en legitim fem minutters nedlasting så nøyaktig ut
+som en hengt arbeider. Den nye pulsen ligger i arbeiderens egen ventesløyfe —
+bevisst *ikke* på bytes, for en puls som følger nettverket lar en leverandør som
+drysser én byte per stallvindu holde monteringen i praksis for alltid.
+
 **Én begrensning som står igjen, målt og bevisst.** Hentinger er serialisert —
 én forbindelse til synk-daemonen, én utestående forespørsel. En henting som har
 gått over fristen holder derfor køen til den faktisk returnerer, og lesinger bak

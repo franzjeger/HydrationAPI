@@ -48,6 +48,17 @@ impl Notifier {
     }
 }
 
+/// How a streamed transfer ended.
+#[derive(Debug)]
+pub enum Streamed {
+    /// Every promised byte landed.
+    Complete,
+    /// The daemon gave up part way. The placeholder must be put back.
+    Aborted { errno: i32, reason: String },
+    /// The daemon refused before sending anything.
+    Refused(FetchResponse),
+}
+
 /// The sync daemon's end.
 pub struct DaemonConn {
     reader: BufReader<UnixStream>,
@@ -77,6 +88,85 @@ impl HelperConn {
 
     pub fn send(&mut self, msg: &FromHelper) -> io::Result<()> {
         self.notifier().send(msg)
+    }
+
+    /// Read a streamed body into `dest`, one chunk at a time.
+    ///
+    /// `expected` is the placeholder's size, taken from the filesystem rather
+    /// than from anything the daemon said. The `Ready` line is refused if it
+    /// disagrees — before a byte is read, so the daemon cannot choose how much a
+    /// root process allocates — and from then on the running total is checked
+    /// against it on every chunk.
+    ///
+    /// `on_progress` is called after each chunk lands, and is how the worker
+    /// keeps its stall clock and its liveness signal honest during a transfer
+    /// that may legitimately take minutes.
+    ///
+    /// Nothing is buffered beyond one chunk, so a 10 GB object costs
+    /// [`crate::MAX_CHUNK`] of memory rather than 10 GB.
+    pub fn recv_streamed(
+        &mut self,
+        expected: u64,
+        dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
+        on_progress: &mut dyn FnMut(u64),
+    ) -> io::Result<Streamed> {
+        if expected > crate::MAX_OBJECT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("placeholder claims {expected} bytes; the helper's limit is {}", crate::MAX_OBJECT),
+            ));
+        }
+        let mut total = 0u64;
+        let mut buf = vec![0u8; crate::MAX_CHUNK as usize];
+        loop {
+            let mut line = String::new();
+            if self.reader.read_line(&mut line)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the sync daemon closed the connection mid-transfer",
+                ));
+            }
+            match decode::<ToHelper>(&line).map_err(io::Error::other)? {
+                ToHelper::Fetch(FetchResponse::Ready { len, .. }) => {
+                    if len != expected {
+                        // Refused on the declaration, before the body. The stream
+                        // is now out of step, so the caller must drop the
+                        // connection rather than resynchronise.
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("daemon offered {len} bytes for a {expected}-byte placeholder"),
+                        ));
+                    }
+                }
+                ToHelper::Chunk { len, .. } => {
+                    if len > crate::MAX_CHUNK || total + len > expected {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("chunk of {len} would overrun a {expected}-byte object"),
+                        ));
+                    }
+                    let n = len as usize;
+                    self.reader.read_exact(&mut buf[..n])?;
+                    dest(&buf[..n], total)?;
+                    total += len;
+                    on_progress(total);
+                }
+                ToHelper::Done { .. } => {
+                    if total != expected {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("daemon claimed completion at {total} of {expected} bytes"),
+                        ));
+                    }
+                    return Ok(Streamed::Complete);
+                }
+                ToHelper::Abort { errno, reason, .. } => {
+                    return Ok(Streamed::Aborted { errno, reason });
+                }
+                ToHelper::Fetch(other) => return Ok(Streamed::Refused(other)),
+                ToHelper::Control(_) => continue,
+            }
+        }
     }
 
     /// Read one response, and its content if it has any.
@@ -123,6 +213,120 @@ impl HelperConn {
     }
 }
 
+/// Where a provider's bytes go, and the only way they get there.
+///
+/// Holds the promise made by the `Ready` line and will not let it be broken:
+/// writing past `promised` fails at the offending byte, and finishing short is
+/// an [`ToHelper::Abort`] rather than a silent truncation. Both are the same
+/// rule from §5.7 — the whole object or nothing — moved from something a
+/// provider must remember into something it cannot avoid.
+pub struct Body<'a> {
+    writer: &'a mut UnixStream,
+    id: u64,
+    promised: u64,
+    written: u64,
+    finished: bool,
+}
+
+impl Body<'_> {
+    /// How many bytes are still owed.
+    pub fn remaining(&self) -> u64 {
+        self.promised.saturating_sub(self.written)
+    }
+
+    /// Finish, or say why not.
+    ///
+    /// Consuming rather than borrowing, so a body cannot be left in an
+    /// indeterminate state: every path out of a fetch either completes the
+    /// promise or aborts it.
+    pub fn finish(mut self) -> io::Result<()> {
+        if self.written != self.promised {
+            let short = self.promised - self.written;
+            self.abort_with(
+                libc::EIO,
+                &format!("provider delivered {short} bytes fewer than the object's size"),
+            )?;
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("short delivery: {} of {} bytes", self.written, self.promised),
+            ));
+        }
+        let line = encode(&ToHelper::Done { id: self.id }).map_err(io::Error::other)?;
+        self.finished = true;
+        self.send_line(&line)
+    }
+
+    /// Give up on this transfer without desynchronising the stream.
+    pub fn abort(mut self, errno: i32, reason: &str) -> io::Result<()> {
+        self.abort_with(errno, reason)
+    }
+
+    fn abort_with(&mut self, errno: i32, reason: &str) -> io::Result<()> {
+        let line = encode(&ToHelper::Abort {
+            id: self.id,
+            errno,
+            reason: reason.to_string(),
+        })
+        .map_err(io::Error::other)?;
+        self.finished = true;
+        self.send_line(&line)
+    }
+
+    fn send_line(&mut self, line: &str) -> io::Result<()> {
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.flush()
+    }
+}
+
+impl Write for Body<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // Refused at the offending byte, not counted up and complained about
+        // afterwards. A provider that would have sent too much finds out where.
+        if self.written + buf.len() as u64 > self.promised {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "provider offered more than the object's size: {} written, {} promised, \
+                     {} more offered",
+                    self.written,
+                    self.promised,
+                    buf.len()
+                ),
+            ));
+        }
+        let n = buf.len().min(crate::MAX_CHUNK as usize);
+        let line = encode(&ToHelper::Chunk {
+            id: self.id,
+            len: n as u64,
+        })
+        .map_err(io::Error::other)?;
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.write_all(&buf[..n])?;
+        self.writer.flush()?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for Body<'_> {
+    fn drop(&mut self) {
+        // A body dropped without `finish` or `abort` is a provider that panicked
+        // or returned early. The helper is waiting on a promise nobody is going
+        // to keep, so it is told — an unanswered stream is a reader blocked for
+        // as long as the deadline allows, for no reason.
+        if !self.finished {
+            let _ = self.abort_with(libc::EIO, "the provider abandoned the transfer");
+        }
+    }
+}
+
 impl DaemonConn {
     pub fn new(stream: UnixStream) -> io::Result<Self> {
         let (reader, writer) = split(stream)?;
@@ -136,6 +340,28 @@ impl DaemonConn {
             return Ok(None);
         }
         decode(&line).map(Some).map_err(io::Error::other)
+    }
+
+    /// Begin a streamed answer, and return the sink the content goes into.
+    ///
+    /// `len` is the placeholder's size, which the daemon already knows — it never
+    /// has to declare a length it has not received. The returned [`Body`] is what
+    /// enforces that promise: it counts, it refuses the byte that would exceed
+    /// `len` at that byte rather than at the end, and it frames each write onto
+    /// the wire. A provider whose whole implementation is `io::copy(&mut resp,
+    /// out)` cannot get the contract wrong, which is the point of handing it a
+    /// concrete type rather than a `dyn Write`.
+    pub fn begin(&mut self, id: u64, len: u64) -> io::Result<Body<'_>> {
+        let line = encode(&ToHelper::Fetch(FetchResponse::Ready { id, len }))
+            .map_err(io::Error::other)?;
+        self.writer.write_all(line.as_bytes())?;
+        Ok(Body {
+            writer: &mut self.writer,
+            id,
+            promised: len,
+            written: 0,
+            finished: false,
+        })
     }
 
     /// Answer with content.

@@ -432,12 +432,53 @@ pub enum Control {
     Hydrated { file: FileId },
 }
 
+/// The largest single body chunk the helper will accept.
+///
+/// The helper's own constant, never the daemon's. It bounds one allocation in a
+/// root process, and the component that chooses it must be the one that lives
+/// with being wrong about it.
+pub const MAX_CHUNK: u64 = 1 << 20;
+
+/// The largest object the *helper* will hydrate, whatever a placeholder claims.
+///
+/// The delta pass already refuses absurd sizes, but that runs on the unprivileged
+/// side — the side §6b assumes may be compromised — so it is not a bound the root
+/// process may rely on. Two checks for one rule, the same argument the length
+/// check already makes.
+pub const MAX_OBJECT: u64 = 1 << 40;
+
 /// Anything the daemon may send.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ToHelper {
     Fetch(FetchResponse),
     Control(Control),
+    /// Part of the body announced by a `Ready`. Exactly `len` raw bytes follow
+    /// this line.
+    ///
+    /// The body is chunked rather than sent as one run so that a transfer can be
+    /// *abandoned* without desynchronising the stream. Streaming means the
+    /// daemon declares a length before it has the bytes — it takes the length
+    /// from the placeholder, which it knows — and a provider that then delivers
+    /// short would leave the connection out of step forever if the body were a
+    /// flat run. With chunks, a short delivery is an [`ToHelper::Abort`] and the
+    /// connection survives.
+    Chunk {
+        id: u64,
+        len: u64,
+    },
+    /// The body is complete. Accepted only when the running total equals the
+    /// length the `Ready` announced.
+    Done {
+        id: u64,
+    },
+    /// The transfer will not complete. The placeholder is put back exactly as it
+    /// was and the reader gets `errno`.
+    Abort {
+        id: u64,
+        errno: i32,
+        reason: String,
+    },
 }
 
 /// Anything the helper may send.

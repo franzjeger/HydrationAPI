@@ -17,7 +17,7 @@ pub mod reclaim;
 pub mod store;
 pub mod upload;
 
-use hydration_protocol::transport::DaemonConn;
+use hydration_protocol::transport::{Body, DaemonConn};
 use hydration_protocol::{FetchResponse, FileId, FromHelper};
 use std::io;
 use std::path::Path;
@@ -32,10 +32,31 @@ pub use store::{Entry, Store};
 /// get right on its own. What is left is the part only the client knows: how to
 /// talk to its service.
 pub trait Provider: Send {
-    /// The whole object. Returning fewer bytes than `size` is a failure, not a
-    /// partial success — the framework will refuse it and the reader will get an
-    /// error rather than a truncated file (§5.7).
-    fn fetch(&mut self, cloud_id: &str, size: u64) -> io::Result<Vec<u8>>;
+    /// Write the whole object into `out`.
+    ///
+    /// Streamed rather than returned, because the previous shape — hand back a
+    /// `Vec` — made the object's size the memory cost *and* required the whole
+    /// transfer to finish inside one deadline. An object larger than a few
+    /// seconds of bandwidth was unservable, and its failure took the mount with
+    /// it (§8d).
+    ///
+    /// [`Body`] holds the promise made on the wire and will not let it be
+    /// broken: writing past the object's size fails at that byte, and finishing
+    /// short is an abort rather than a truncation. So the whole of a correct
+    /// implementation is usually
+    ///
+    /// ```ignore
+    /// fn fetch(&mut self, id: &str, _size: u64, out: &mut Body<'_>) -> io::Result<()> {
+    ///     let mut body = self.http.get(self.url(id)).send()?;
+    ///     std::io::copy(&mut body, out)?;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// Returning `Err` abandons the transfer; the placeholder is put back
+    /// exactly as it was and the reader gets an error rather than a short file
+    /// (§5.7).
+    fn fetch(&mut self, cloud_id: &str, size: u64, out: &mut Body<'_>) -> io::Result<()>;
 }
 
 /// Why a fetch could not be served, in the framework's own terms.
@@ -152,25 +173,25 @@ impl<P: Provider> Daemon<P> {
         while let Some(msg) = conn.recv()? {
             match msg {
                 FromHelper::Fetch(req) => match self.resolve_or_rescan(req.file) {
-                    Ok((cloud_id, size)) => match self.provider.fetch(&cloud_id, size) {
-                        Ok(content) if content.len() as u64 == size => {
-                            conn.send_ready(req.id, &content)?;
-                        }
-                        Ok(content) => {
-                            // Caught here as well as in the helper. Two checks
-                            // for one rule is not redundancy: this one can say
-                            // which provider misbehaved, and the helper's is the
-                            // one that cannot be bypassed.
-                            conn.send(
-                                Refusal::WrongLength {
-                                    got: content.len(),
-                                    want: size,
+                    Ok((cloud_id, size)) => {
+                        // The length is declared from the placeholder, which we
+                        // already know — never from something the provider has
+                        // yet to deliver. `Body` then holds it to that.
+                        let mut body = conn.begin(req.id, size)?;
+                        match self.provider.fetch(&cloud_id, size, &mut body) {
+                            Ok(()) => {
+                                // A short delivery becomes an abort here rather
+                                // than a truncated file; `finish` sends it and
+                                // reports the error.
+                                if let Err(e) = body.finish() {
+                                    eprintln!("hydration: {cloud_id} ended short: {e}");
                                 }
-                                .into_response(req.id),
-                            )?;
+                            }
+                            Err(e) => {
+                                let _ = body.abort(libc::EIO, &format!("{e}"));
+                            }
                         }
-                        Err(e) => conn.send(Refusal::Provider(e).into_response(req.id))?,
-                    },
+                    }
                     Err(refusal) => conn.send(refusal.into_response(req.id))?,
                 },
                 FromHelper::ExposureChanged { mounts } => {

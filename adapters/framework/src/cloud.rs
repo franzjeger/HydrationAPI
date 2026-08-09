@@ -102,7 +102,13 @@ impl Cloud {
 }
 
 impl Provider for Cloud {
-    fn fetch(&mut self, cloud_id: &str, size: u64) -> io::Result<Vec<u8>> {
+    fn fetch(
+        &mut self,
+        cloud_id: &str,
+        size: u64,
+        out: &mut hydration_protocol::transport::Body<'_>,
+    ) -> io::Result<()> {
+        use std::io::Write;
         let mut st = self.state.lock().unwrap();
         st.ops.push(CloudOp::Get {
             id: cloud_id.to_string(),
@@ -110,13 +116,18 @@ impl Provider for Cloud {
         let Some(obj) = st.objects.get(cloud_id).cloned() else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no such object"));
         };
-        match st.fetch.get(&obj.name) {
+        let bytes = match st.fetch.get(&obj.name) {
+            // Short on purpose: the suite's 5.7 case. `Body` refuses to call it
+            // finished, so this becomes an abort rather than a truncated file.
             Some(FetchBehaviour::Short { bytes }) => {
-                Ok(obj.content[..(*bytes).min(obj.content.len())].to_vec())
+                obj.content[..(*bytes).min(obj.content.len())].to_vec()
             }
-            Some(FetchBehaviour::Stale { .. }) => Ok(vec![b'!'; size as usize]),
-            _ => Ok(obj.content),
-        }
+            Some(FetchBehaviour::Stale { .. }) => vec![b'!'; size as usize],
+            _ => obj.content,
+        };
+        drop(st);
+        out.write_all(&bytes)?;
+        Ok(())
     }
 }
 

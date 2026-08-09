@@ -46,11 +46,22 @@ struct Fake {
 }
 
 impl Provider for Fake {
-    fn fetch(&mut self, _cloud_id: &str, _size: u64) -> io::Result<Vec<u8>> {
-        Ok(match self.truncate_to {
+    fn fetch(
+        &mut self,
+        _cloud_id: &str,
+        _size: u64,
+        out: &mut hydration_protocol::transport::Body<'_>,
+    ) -> io::Result<()> {
+        use std::io::Write;
+        let body = match self.truncate_to {
             Some(n) => self.body[..n.min(self.body.len())].to_vec(),
             None => self.body.clone(),
-        })
+        };
+        // A short body is written and then simply not finished; `Body` turns
+        // that into an abort rather than a truncated file, which is §5.7 moved
+        // out of the provider's hands.
+        out.write_all(&body)?;
+        Ok(())
     }
 }
 

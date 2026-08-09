@@ -42,6 +42,17 @@ struct Shared {
     /// The event fd the worker is currently holding, or -1.
     slot: AtomicI32,
     _pad: u32,
+    /// Incremented every time the worker passes through its own wait loop.
+    ///
+    /// Deliberately not a byte counter. A heartbeat that moves with the network
+    /// makes the supervisor's verdict depend on the network, and the supervisor
+    /// is the one component that must have no opinion about it — a provider
+    /// dribbling one byte per stall window would otherwise hold the mount for
+    /// what is arithmetically forever. This moves at a rate the *worker*
+    /// controls, so a worker stuck in an uninterruptible write or deadlocked on
+    /// its own pre-content event stops bumping it, which is exactly the state
+    /// that must be caught.
+    working: AtomicU64,
     /// Incremented every time the worker finishes answering an event.
     ///
     /// A counter rather than a timestamp, so the shared page needs no clock and
@@ -103,6 +114,7 @@ impl InFlight {
         unsafe {
             (*shared).slot.store(-1, Ordering::SeqCst);
             (*shared).beat.store(0, Ordering::SeqCst);
+            (*shared).working.store(0, Ordering::SeqCst);
         }
         Self {
             shared,
@@ -142,6 +154,20 @@ impl InFlight {
             -1 => None,
             fd => Some(fd),
         }
+    }
+
+    /// Called once per pass of the worker's wait loop during a long transfer.
+    ///
+    /// A transfer that legitimately takes minutes would otherwise look exactly
+    /// like a hung worker — `progress()` frozen, an event held — and the mount
+    /// would be torn down mid-download.
+    pub fn working(&self) {
+        unsafe { (*self.shared).working.fetch_add(1, Ordering::SeqCst) };
+    }
+
+    /// The worker's own liveness, independent of whether anything completed.
+    pub fn liveness(&self) -> u64 {
+        unsafe { (*self.shared).working.load(Ordering::SeqCst) }
     }
 
     /// How many events the worker has answered.

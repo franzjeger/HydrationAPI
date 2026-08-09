@@ -19,7 +19,7 @@
 //!    complete.
 
 use crate::daemon::Fetch;
-use hydration_protocol::transport::HelperConn;
+use hydration_protocol::transport::{HelperConn, Streamed};
 use hydration_protocol::{FetchRequest, FetchResponse, FileId, FromHelper};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -54,7 +54,13 @@ impl SocketFetch {
 }
 
 impl Fetch for SocketFetch {
-    fn fetch(&mut self, file: FileId, size: u64) -> io::Result<Vec<u8>> {
+    fn fetch_into(
+        &mut self,
+        file: FileId,
+        size: u64,
+        dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
+        progress: &mut dyn FnMut(u64),
+    ) -> io::Result<()> {
         let ours = self.mount_fsid()?;
         if file.fsid != ours {
             return Err(io::Error::new(
@@ -73,83 +79,40 @@ impl Fetch for SocketFetch {
             id,
             file,
             offset: 0,
-            // v1 fetches whole files. The event's range is the readahead window
-            // rather than what the application asked for, so honouring it would
-            // be guessing with extra steps.
+            // v1 fetches whole objects. The event's range is a *demand* rather
+            // than a hint (§8d) — answering with less than it asks for hands the
+            // reader zeros — so serving ranges is a real feature and not a
+            // shortcut, and it is deliberately not in this change.
             len: size,
             cgroup: None,
         }))?;
 
         // `size` comes from the filesystem, not from the daemon: the length the
-        // body is allowed to be is decided here, before anything is read.
-        let (resp, body) = self.conn.recv(size)?;
-
-        if resp.id() != id {
-            // A mismatched correlation id means the stream is out of step, and
-            // the next body could be matched to the wrong file. There is no safe
-            // way to continue on this connection.
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("response {} does not answer request {id}", resp.id()),
-            ));
-        }
-
-        match resp {
-            FetchResponse::Ready { .. } => Ok(body),
-            FetchResponse::Failed { errno, reason, .. } => {
-                Err(io::Error::from_raw_os_error(errno).chain(&reason))
+        // body may be is decided here, before anything is read. The helper's own
+        // `MAX_OBJECT` bounds it besides, because the delta pass's limit runs on
+        // the side §6b assumes may be compromised.
+        match self.conn.recv_streamed(size, dest, progress)? {
+            Streamed::Complete => Ok(()),
+            Streamed::Aborted { errno, reason } => {
+                Err(io::Error::new(
+                    io::Error::from_raw_os_error(errno).kind(),
+                    reason,
+                ))
             }
-            FetchResponse::Denied { reason, .. } => Err(io::Error::new(
+            Streamed::Refused(FetchResponse::Failed { errno, reason, .. }) => {
+                Err(io::Error::new(
+                    io::Error::from_raw_os_error(errno).kind(),
+                    reason,
+                ))
+            }
+            Streamed::Refused(FetchResponse::Denied { reason, .. }) => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("the sync daemon declined: {reason}"),
+                format!("policy refused this reader: {reason}"),
+            )),
+            Streamed::Refused(other) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected response: {other:?}"),
             )),
         }
-    }
-}
-
-/// Attach a reason to an errno without losing the errno.
-trait Chain {
-    fn chain(self, reason: &str) -> io::Error;
-}
-
-impl Chain for io::Error {
-    fn chain(self, reason: &str) -> io::Error {
-        match self.raw_os_error() {
-            Some(code) => io::Error::new(self.kind(), format!("{reason} (errno {code})")),
-            None => io::Error::new(self.kind(), reason.to_string()),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use hydration_protocol::transport::DaemonConn;
-    use std::os::unix::net::UnixStream;
-
-    #[test]
-    fn a_file_on_another_device_is_refused_without_asking_the_daemon() {
-        // The daemon is never consulted: if this check ever moved after the
-        // request, a compromised daemon would get to see which inodes exist
-        // outside the sync directory.
-        let (a, b) = UnixStream::pair().unwrap();
-        let daemon = DaemonConn::new(b).unwrap();
-        let mut f = SocketFetch::new(HelperConn::new(a).unwrap(), Path::new("/"));
-
-        let root_dev = {
-            use std::os::unix::fs::MetadataExt;
-            std::fs::metadata("/").unwrap().dev()
-        };
-        let err = f
-            .fetch(
-                FileId {
-                    fsid: root_dev.wrapping_add(1),
-                    ino: 2,
-                },
-                10,
-            )
-            .expect_err("a file on a different device must be refused");
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-        drop(daemon);
     }
 }

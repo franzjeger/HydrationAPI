@@ -15,7 +15,61 @@ use std::path::{Path, PathBuf};
 /// holding the credentials, and they are on the other side of a socket in the
 /// real daemon.
 pub trait Fetch: Send {
+    /// Deliver the object by writing it into `dest`, chunk by chunk.
+    ///
+    /// `dest` is called with `(bytes, offset)` as they arrive and `progress`
+    /// after each one. Streaming rather than returning a `Vec` is what lifts the
+    /// size ceiling from "whatever fits in one deadline" to "whatever the
+    /// transfer cap allows" — and what stops a root process from allocating an
+    /// object's worth of memory per read (§8d).
+    fn fetch_into(
+        &mut self,
+        file: FileId,
+        size: u64,
+        dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
+        progress: &mut dyn FnMut(u64),
+    ) -> io::Result<()>;
+}
+
+/// The simple case: a fetcher that has the whole object in hand.
+///
+/// Streaming is what the framework needs from a real provider, but plenty of
+/// callers — tests, and any source that is already local — have the bytes
+/// already. Implementing this gives them [`Fetch`] for free, and keeps the
+/// interesting trait honest about what it is for.
+pub trait FetchWhole: Send {
     fn fetch(&mut self, file: FileId, size: u64) -> io::Result<Vec<u8>>;
+}
+
+impl<T: FetchWhole> Fetch for T {
+    fn fetch_into(
+        &mut self,
+        file: FileId,
+        size: u64,
+        dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
+        progress: &mut dyn FnMut(u64),
+    ) -> io::Result<()> {
+        let body = self.fetch(file, size)?;
+        // Delivered in chunks even though it is all here, so that a caller which
+        // swaps a local source for a network one changes nothing about how the
+        // worker sees it.
+        let mut off = 0u64;
+        for part in body.chunks(hydration_protocol::MAX_CHUNK as usize) {
+            dest(part, off)?;
+            off += part.len() as u64;
+            progress(off);
+        }
+        // A short body is the provider's failure, not a partial success (§5.7),
+        // and answering the event with less than it demanded would hand the
+        // reader zeros (§8d).
+        if off != size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("delivered {off} of {size} bytes"),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Resolve the file an event refers to.
@@ -37,6 +91,13 @@ pub enum Handled {
     /// A placeholder with no name and no content. Allowed without fetching,
     /// because there is nothing to fetch.
     Empty,
+    /// A transfer that started and was given up on — too slow, or too large to
+    /// hold a filesystem operation open for.
+    ///
+    /// Distinct from `Failed` for the same reason `Denied` is: "a 4 GB object
+    /// was abandoned at 900 MB" is a capacity fact the user needs, and it is
+    /// indistinguishable from a provider fault otherwise.
+    Abandoned { reason: String },
     /// Already had content: nothing to do but let it through.
     AlreadyPresent,
     Denied {
@@ -65,22 +126,56 @@ pub enum Handled {
 /// The thread is created after `spawn_split`'s `fork`, never before: forking a
 /// process that already has threads gives the child one thread and any locks the
 /// others held, which is its own class of hang.
+/// What the fetch thread tells the worker while a transfer runs.
+enum Step {
+    /// Bytes landed. Carries the running total, for the log and for the cap.
+    Progress(u64),
+    /// Every promised byte arrived.
+    Done,
+    /// It will not complete.
+    Failed(io::Error),
+}
+
+/// A [`Fetch`] you can give up on, streamed.
+///
+/// §6a-bis's first requirement, extended to transfers that legitimately take
+/// minutes. A `Fetch` is client code talking to a network and may never return;
+/// if the worker waits inside it the pre-content event goes unanswered, and a
+/// process blocked in one cannot be killed by a signal, so every later operation
+/// on the mount blocks too.
+///
+/// The deadline cannot be enforced by asking implementors to respect one. So the
+/// fetch runs on its own thread and the worker waits on a channel — but now it
+/// waits *repeatedly*, once per chunk, which is what lets a slow-but-progressing
+/// transfer continue while a stopped one is still cut off promptly.
+///
+/// Three limits, and they answer different questions:
+///
+/// - **first byte** — is this service answering at all?
+/// - **stall** — has it stopped part way?
+/// - **total** — is this object simply too big to be worth blocking a filesystem
+///   operation for? Unbounded total is not defensible: the reader is inside
+///   `read()` the whole time and cannot be signalled away, so "no cap" means a
+///   user can have an unkillable process for hours. The cap is chosen from how
+///   long a filesystem operation may block, not from how big a file may be.
 struct Timed {
-    req: std::sync::mpsc::Sender<(u64, FileId, u64)>,
-    rep: std::sync::mpsc::Receiver<(u64, io::Result<Vec<u8>>)>,
+    req: std::sync::mpsc::Sender<Job>,
+    rep: std::sync::mpsc::Receiver<(u64, Step)>,
     seq: u64,
-    /// Consecutive deadlines missed. A single slow object is not a verdict on
-    /// the fetcher; a run of them is.
     missed: u32,
-    /// When the run started, so an unresponsive fetcher is bounded in time and
-    /// not only in count.
     since: Option<std::time::Instant>,
 }
 
-/// After this many consecutive misses the fetcher is treated as wedged and no
-/// longer waited on, so each event costs a denial rather than a full timeout.
-/// Denying promptly is the fail-closed answer; making every reader wait out the
-/// deadline first would be the same outage, slower.
+struct Job {
+    seq: u64,
+    file: FileId,
+    size: u64,
+    fd: i32,
+}
+
+/// After this many consecutive first-byte misses the fetcher is treated as
+/// unresponsive and no longer waited on, so each event costs a denial rather
+/// than a full timeout.
 const WEDGED_AFTER: u32 = 3;
 
 /// Whether this error means the socket is gone rather than the request refused.
@@ -97,22 +192,31 @@ fn is_connection_lost(e: &io::Error) -> bool {
 
 /// How long a fetcher may stay unresponsive before the unit gives up on itself.
 ///
-/// §6a-bis's third requirement, reached by the other road. A worker that denies
-/// promptly is not stuck, so the supervisor's stall watch will never fire — the
-/// mount would go on serving instant `EIO` forever, healthily, which is an
-/// outage that looks like a working system. Past this point the worker stops,
-/// the supervisor takes over, and the mount comes down so the unit can restart.
+/// §6a-bis's third requirement reached by another road: a worker that denies
+/// promptly is not stuck, so the supervisor's stall watch never fires and the
+/// mount would serve instant `EIO` forever, healthily.
 pub const WEDGED_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl Timed {
     fn new<F: Fetch + 'static>(mut fetch: F) -> Self {
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<(u64, FileId, u64)>();
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<Job>();
         let (rep_tx, rep_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            while let Ok((seq, file, size)) = req_rx.recv() {
-                // A send failure means the worker is gone; there is nobody left
-                // to answer for, so stop rather than fetching into the void.
-                if rep_tx.send((seq, fetch.fetch(file, size))).is_err() {
+            while let Ok(job) = req_rx.recv() {
+                let tx = rep_tx.clone();
+                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(job.fd) };
+                let mut wrote = |buf: &[u8], off: u64| -> io::Result<()> {
+                    placeholder::write_at(borrowed, buf, off)
+                };
+                let mut tick = |total: u64| {
+                    let _ = tx.send((job.seq, Step::Progress(total)));
+                };
+                let outcome = fetch.fetch_into(job.file, job.size, &mut wrote, &mut tick);
+                let step = match outcome {
+                    Ok(()) => Step::Done,
+                    Err(e) => Step::Failed(e),
+                };
+                if rep_tx.send((job.seq, step)).is_err() {
                     return;
                 }
             }
@@ -130,7 +234,6 @@ impl Timed {
         self.missed >= WEDGED_AFTER
     }
 
-    /// How long it has been unresponsive, if it is.
     fn wedged_for(&self) -> std::time::Duration {
         match self.since {
             Some(t) if self.wedged() => t.elapsed(),
@@ -148,16 +251,25 @@ impl Timed {
         self.since = None;
     }
 
-    fn fetch(&mut self, file: FileId, size: u64, within: std::time::Duration) -> io::Result<Vec<u8>> {
+    /// Run one transfer into `fd`, calling `alive` once per wait so the caller
+    /// can prove to the supervisor that it is still in control of its own loop.
+    ///
+    /// Deliberately not a byte counter: a heartbeat that moves with the network
+    /// lets a provider dribbling one byte per stall-window hold the mount for
+    /// what is arithmetically forever. This one moves at a rate the *worker*
+    /// controls, and the worker is the thing that decides when patience runs out.
+    fn run(
+        &mut self,
+        file: FileId,
+        size: u64,
+        fd: i32,
+        limits: Limits,
+        alive: &mut dyn FnMut(),
+    ) -> Result<u64, TransferError> {
         if self.wedged() {
-            // Abandoned fetches keep running, and a reply from one is proof the
-            // fetcher is alive again. Draining for it here is what keeps this
-            // from being a one-way door: the short-circuit below skips the send,
-            // so without this nothing could ever arrive, nothing could reset the
-            // counter, and three missed deadlines would turn the mount into
-            // instant `EIO` for good — served by two healthy-looking processes,
-            // with nothing to tear anything down. That is the state §6a-bis says
-            // must not persist, reached quietly.
+            // Abandoned transfers keep running, and anything from one is proof
+            // of life. Draining for it here is what keeps this from being a
+            // one-way door.
             let mut recovered = false;
             while self.rep.try_recv().is_ok() {
                 recovered = true;
@@ -165,63 +277,123 @@ impl Timed {
             if recovered {
                 self.answered();
             } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("fetcher unresponsive after {WEDGED_AFTER} consecutive deadlines"),
-                ));
+                return Err(TransferError::Unresponsive);
             }
         }
+
         self.seq += 1;
         let want = self.seq;
-        if self.req.send((want, file, size)).is_err() {
-            return Err(io::Error::other("the fetch thread is gone"));
+        if self
+            .req
+            .send(Job {
+                seq: want,
+                file,
+                size,
+                fd,
+            })
+            .is_err()
+        {
+            return Err(TransferError::Gone);
         }
 
-        // Replies from abandoned fetches are still in the channel and are not
-        // answers to this question — matching on the sequence number is what
-        // keeps a late reply from being delivered as the wrong file's content,
-        // which would be silent corruption rather than a visible failure.
-        let deadline = std::time::Instant::now() + within;
+        let began = std::time::Instant::now();
+        let mut deadline = began + limits.first_byte;
+        let mut moved = 0u64;
         loop {
+            alive();
+            if began.elapsed() > limits.total {
+                self.missed_one();
+                return Err(TransferError::TooLong { got: moved, size });
+            }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 self.missed_one();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("fetch exceeded {within:?}"),
-                ));
+                return Err(if moved == 0 {
+                    TransferError::NoFirstByte
+                } else {
+                    TransferError::Stalled { got: moved, size }
+                });
             }
-            match self.rep.recv_timeout(left) {
-                Ok((got, r)) if got == want => {
-                    // A dead peer fails *instantly*, not slowly, so counting
-                    // only missed deadlines would never notice one. The helper
-                    // connects out once and has no reconnect path, so a routine
-                    // client restart — an upgrade, `Restart=on-failure`, a
-                    // logout that clears the runtime directory along with the
-                    // socket — would otherwise leave this worker serving instant
-                    // EIO forever, under two units that both look healthy.
-                    //
-                    // Only connection-terminal errors count. A per-file refusal
-                    // ("no cloud id for this inode") is an ordinary answer and
-                    // must not bring the mount down.
-                    match &r {
-                        Err(e) if is_connection_lost(e) => self.missed_one(),
-                        _ => self.answered(),
+            match self.rep.recv_timeout(left.min(HEARTBEAT)) {
+                Ok((got, _)) if got != want => continue,
+                Ok((_, Step::Progress(total))) => {
+                    if moved == 0 {
+                        // The first byte is the evidence that matters: it says
+                        // the service is alive. A transfer that produced bytes
+                        // and then stalled is a fact about the object, not about
+                        // the fetcher, and must not count towards wedged.
+                        self.answered();
                     }
-                    return r;
+                    moved = total;
+                    deadline = std::time::Instant::now() + limits.stall;
                 }
-                Ok(_) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    self.missed_one();
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("fetch exceeded {within:?}"),
-                    ));
+                Ok((_, Step::Done)) => {
+                    self.answered();
+                    return Ok(moved);
                 }
+                Ok((_, Step::Failed(e))) => {
+                    if is_connection_lost(&e) {
+                        self.missed_one();
+                    } else if moved > 0 {
+                        self.answered();
+                    }
+                    return Err(TransferError::Provider(e));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(io::Error::other("the fetch thread stopped"))
+                    return Err(TransferError::Gone)
                 }
             }
+        }
+    }
+}
+
+/// How often the worker proves it is alive while waiting on a transfer.
+const HEARTBEAT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What bounds a transfer.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// How long the service has to say anything at all.
+    pub first_byte: std::time::Duration,
+    /// How long it may go without saying anything more.
+    pub stall: std::time::Duration,
+    /// The longest a filesystem operation may be blocked by us, whatever the
+    /// object's size. Not optional: the reader cannot be signalled away.
+    pub total: std::time::Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            first_byte: std::time::Duration::from_secs(30),
+            stall: std::time::Duration::from_secs(60),
+            total: std::time::Duration::from_secs(600),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TransferError {
+    NoFirstByte,
+    Stalled { got: u64, size: u64 },
+    TooLong { got: u64, size: u64 },
+    Unresponsive,
+    Gone,
+    Provider(io::Error),
+}
+
+impl std::fmt::Display for TransferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoFirstByte => write!(f, "the provider sent nothing"),
+            Self::Stalled { got, size } => write!(f, "stalled at {got} of {size} bytes"),
+            Self::TooLong { got, size } => {
+                write!(f, "abandoned at {got} of {size} bytes: too long to hold a read")
+            }
+            Self::Unresponsive => write!(f, "fetcher unresponsive"),
+            Self::Gone => write!(f, "the fetch thread is gone"),
+            Self::Provider(e) => write!(f, "{e}"),
         }
     }
 }
@@ -232,11 +404,8 @@ pub struct Worker<F: Fetch> {
     policy: Policy,
     pub log: DenialLog,
     in_flight: InFlight,
-    /// How long any one event may take before the reader is told `EIO`.
-    ///
-    /// Bounded, and bounded low: this is not a network timeout but the longest a
-    /// filesystem operation anywhere on the mount may be stalled by us. §6a-bis.
-    event_deadline: std::time::Duration,
+    /// What bounds a transfer: first byte, stall, and total. §6a-bis.
+    limits: Limits,
     /// So a denial count is announced when it changes rather than every loop.
     reported_denials: usize,
     _fetch: std::marker::PhantomData<F>,
@@ -249,7 +418,7 @@ pub const DEFAULT_EVENT_DEADLINE: std::time::Duration = std::time::Duration::fro
 
 impl<F: Fetch + 'static> Worker<F> {
     pub fn new(group: Group, fetch: F, policy: Policy, in_flight: InFlight) -> Self {
-        Self::with_deadline(group, fetch, policy, in_flight, DEFAULT_EVENT_DEADLINE)
+        Self::with_limits(group, fetch, policy, in_flight, Limits::default())
     }
 
     pub fn with_deadline(
@@ -257,7 +426,27 @@ impl<F: Fetch + 'static> Worker<F> {
         fetch: F,
         policy: Policy,
         in_flight: InFlight,
-        event_deadline: std::time::Duration,
+        first_byte: std::time::Duration,
+    ) -> Self {
+        Self::with_limits(
+            group,
+            fetch,
+            policy,
+            in_flight,
+            Limits {
+                first_byte,
+                stall: first_byte,
+                total: first_byte * 20,
+            },
+        )
+    }
+
+    pub fn with_limits(
+        group: Group,
+        fetch: F,
+        policy: Policy,
+        in_flight: InFlight,
+        limits: Limits,
     ) -> Self {
         Self {
             group,
@@ -265,7 +454,7 @@ impl<F: Fetch + 'static> Worker<F> {
             policy,
             log: DenialLog::default(),
             in_flight,
-            event_deadline,
+            limits,
             reported_denials: 0,
             _fetch: std::marker::PhantomData,
         }
@@ -315,7 +504,9 @@ impl<F: Fetch + 'static> Worker<F> {
             Handled::Hydrated { .. } | Handled::AlreadyPresent | Handled::Empty => {
                 allow(&self.group, fd)
             }
-            Handled::Denied { .. } | Handled::Failed { .. } => deny(&self.group, fd),
+            Handled::Denied { .. } | Handled::Failed { .. } | Handled::Abandoned { .. } => {
+                deny(&self.group, fd)
+            }
         };
         self.in_flight.released();
         unsafe { libc::close(fd) };
@@ -439,38 +630,77 @@ impl<F: Fetch + 'static> Worker<F> {
             }
         };
 
-        let content = match self.fetch.fetch(id, size, self.event_deadline) {
-            Ok(c) => c,
+        // Residue from a transfer that was cut off mid-stream.
+        //
+        // A marked file that occupies disk cannot exist between transfers, but
+        // it is exactly what a crash during one leaves — and the supervisor
+        // cannot clean it up, because it holds the event fd's *number* and not
+        // the descriptor, so it can answer but not punch. The next transfer is
+        // therefore the only place it can be done.
+        match placeholder::clear_residue(borrowed, size) {
+            Ok(true) => eprintln!("[worker] cleared residue from an interrupted transfer"),
+            Ok(false) => {}
             Err(e) => {
                 return Handled::Failed {
-                    reason: format!("fetch failed: {e}"),
+                    reason: format!("could not clear an interrupted transfer: {e}"),
                 }
             }
-        };
+        }
 
-        // Written through the event fd, never by re-opening the path. A write to
-        // a freshly opened file inside the marked mount fires another
-        // pre-content event, and the only process that could answer it is this
-        // one — which is about to be blocked inside the write. The helper
-        // deadlocks against itself and the reader waits forever.
+        // Written through the event fd as the bytes arrive, never by re-opening
+        // the path. A write to a freshly opened file inside the marked mount
+        // fires another pre-content event, and the only process that could
+        // answer it is this one — which is about to be blocked inside the write.
         //
-        // The whole object or nothing (§5.7): a refusal leaves the placeholder
-        // exactly as it was found.
-        match placeholder::hydrate_fd(borrowed, &content, size) {
-            Ok(()) => {
-                // The mark is cleared inside `hydrate_fd`, in the same operation
-                // that wrote the content — one owner, so the two cannot disagree.
-                //
-                // No path, no ignore mark: an unlinked file has no name to mark
-                // and will not be opened again anyway.
-                if let Some(p) = &path {
-                    let _ = self.group.ignore(p);
+        // Measured (`probes/stream.c`): these partial writes fire no events of
+        // their own, and no bystander can observe the half-filled file, because
+        // their own event queues behind the one being served. That is what makes
+        // filling incrementally safe rather than merely convenient.
+        let limits = self.limits;
+        let in_flight = self.in_flight.clone();
+        let mut alive = move || in_flight.working();
+        let outcome = self.fetch.run(id, size, ev.fd, limits, &mut alive);
+
+        match outcome {
+            Ok(_) => match placeholder::finish_hydration(borrowed, size) {
+                Ok(()) => {
+                    // The mark is cleared inside `finish_hydration`, in the same
+                    // operation that fsynced the content — one owner, so the two
+                    // cannot disagree.
+                    //
+                    // No path, no ignore mark: an unlinked file has no name to
+                    // mark and will not be opened again anyway.
+                    if let Some(p) = &path {
+                        let _ = self.group.ignore(p);
+                    }
+                    Handled::Hydrated { bytes: size }
                 }
-                Handled::Hydrated { bytes: size }
-            }
-            Err(e) => Handled::Failed {
-                reason: format!("hydration refused: {e}"),
+                Err(e) => {
+                    let _ = placeholder::abandon(borrowed, size);
+                    Handled::Failed {
+                        reason: format!("hydration refused: {e}"),
+                    }
+                }
             },
+            Err(e) => {
+                // The whole object or nothing (§5.7). Whatever landed is punched
+                // back out, so the placeholder is exactly as it was found — and
+                // the reader gets an error rather than the part that arrived,
+                // because answering `FAN_ALLOW` with less than the event asked
+                // for hands them zeros in silence (§8d).
+                let _ = placeholder::abandon(borrowed, size);
+                let abandoned = matches!(
+                    e,
+                    TransferError::TooLong { .. } | TransferError::Stalled { .. }
+                );
+                let reason = format!("{e}");
+                if abandoned {
+                    self.log.record("-", "transfer abandoned", path.as_deref());
+                    Handled::Abandoned { reason }
+                } else {
+                    Handled::Failed { reason }
+                }
+            }
         }
     }
 
@@ -642,14 +872,21 @@ impl SplitHandle {
     ) -> io::Result<SuperviseReport> {
         let mut status = 0i32;
         let mut stalled = false;
-        let mut beat = self.in_flight.progress();
+        // Either counter moving is proof of life.
+        //
+        // `progress` only moves when an event is fully answered, and a
+        // legitimate streaming transfer can hold one for minutes — so watching
+        // it alone would tear the mount down mid-download. `liveness` moves once
+        // per pass of the worker's own wait loop, at a rate the worker controls
+        // rather than the network.
+        let mut beat = (self.in_flight.progress(), self.in_flight.liveness());
         let mut moved = std::time::Instant::now();
 
         loop {
             if unsafe { libc::waitpid(self.worker, &mut status, libc::WNOHANG) } == self.worker {
                 break;
             }
-            let now = self.in_flight.progress();
+            let now = (self.in_flight.progress(), self.in_flight.liveness());
             if now != beat {
                 beat = now;
                 moved = std::time::Instant::now();

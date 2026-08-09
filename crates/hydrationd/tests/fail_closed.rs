@@ -13,7 +13,7 @@
 //! runner that can provide the mount.
 
 use hydration_protocol::FileId;
-use hydrationd::daemon::{spawn_split, Fetch, Handled, Worker};
+use hydrationd::daemon::{spawn_split, FetchWhole, Handled, Worker};
 use hydrationd::fanotify::Group;
 use hydrationd::placeholder;
 use hydrationd::policy::Policy;
@@ -45,7 +45,7 @@ fn mount() -> Option<PathBuf> {
 }
 
 struct Canned(Vec<u8>);
-impl Fetch for Canned {
+impl FetchWhole for Canned {
     fn fetch(&mut self, _file: FileId, _size: u64) -> io::Result<Vec<u8>> {
         Ok(self.0.clone())
     }
@@ -53,7 +53,7 @@ impl Fetch for Canned {
 
 /// A fetcher that answers with the wrong length, to drive §5.7.
 struct Short;
-impl Fetch for Short {
+impl FetchWhole for Short {
     fn fetch(&mut self, _file: FileId, size: u64) -> io::Result<Vec<u8>> {
         Ok(vec![b'x'; (size / 2) as usize])
     }
@@ -61,7 +61,7 @@ impl Fetch for Short {
 
 /// A fetcher that never returns, so the worker can be killed mid-event.
 struct Hangs;
-impl Fetch for Hangs {
+impl FetchWhole for Hangs {
     fn fetch(&mut self, _file: FileId, _size: u64) -> io::Result<Vec<u8>> {
         loop {
             std::thread::sleep(Duration::from_secs(3600));

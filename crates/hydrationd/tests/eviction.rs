@@ -5,7 +5,7 @@
 //! ```
 
 use hydration_protocol::FileId;
-use hydrationd::daemon::{Fetch, Worker};
+use hydrationd::daemon::{FetchWhole, Worker};
 use hydrationd::evict::{evict, Backup, Refused};
 use hydrationd::policy::Policy;
 use hydrationd::supervisor::InFlight;
@@ -200,7 +200,7 @@ fn an_evicted_file_is_intercepted_again() {
 /// Content that is unmistakably content.
 struct Canned(Vec<u8>);
 
-impl Fetch for Canned {
+impl FetchWhole for Canned {
     fn fetch(&mut self, _file: FileId, size: u64) -> std::io::Result<Vec<u8>> {
         let mut v = self.0.clone();
         v.resize(size as usize, b'.');

@@ -142,8 +142,17 @@ impl Discover for FolderCloud {
 }
 
 impl Provider for FolderCloud {
-    fn fetch(&mut self, cloud_id: &str, _size: u64) -> io::Result<Vec<u8>> {
-        std::fs::read(self.object(cloud_id))
+    fn fetch(
+        &mut self,
+        cloud_id: &str,
+        _size: u64,
+        out: &mut hydration_protocol::transport::Body<'_>,
+    ) -> io::Result<()> {
+        // What a real provider's implementation looks like too: open the
+        // object, copy it into the sink, let the sink hold the contract.
+        let mut src = std::fs::File::open(self.object(cloud_id))?;
+        io::copy(&mut src, out)?;
+        Ok(())
     }
 }
 

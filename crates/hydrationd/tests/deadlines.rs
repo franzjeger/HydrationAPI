@@ -19,7 +19,7 @@
 //!   2. the supervisor notices a worker that has stopped answering at all.
 
 use hydration_protocol::FileId;
-use hydrationd::daemon::{spawn_split, Fetch, Handled, Worker};
+use hydrationd::daemon::{spawn_split, Fetch, FetchWhole, Handled, Worker};
 use hydrationd::fanotify::Group;
 use hydrationd::placeholder;
 use hydrationd::policy::Policy;
@@ -46,7 +46,7 @@ fn skip(why: &str) {
 /// A cloud that never answers. Not slow — stopped.
 struct NeverReturns;
 
-impl Fetch for NeverReturns {
+impl FetchWhole for NeverReturns {
     fn fetch(&mut self, _file: FileId, _size: u64) -> io::Result<Vec<u8>> {
         loop {
             std::thread::sleep(Duration::from_secs(3600));
@@ -60,7 +60,7 @@ impl Fetch for NeverReturns {
 /// different question. The point here is recovery.
 struct SlowOnce(std::sync::atomic::AtomicUsize);
 
-impl Fetch for SlowOnce {
+impl FetchWhole for SlowOnce {
     fn fetch(&mut self, _file: FileId, size: u64) -> io::Result<Vec<u8>> {
         if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
             std::thread::sleep(Duration::from_secs(4));
@@ -221,9 +221,16 @@ fn a_missed_deadline_does_not_disable_later_fetches() {
 
 /// Requirement 2: the supervisor notices a worker that stopped answering.
 ///
-/// The worker here has no deadline worth the name, so it will sit on the event
-/// forever. That is precisely the state a signal cannot fix, and the supervisor
-/// has to reach it on its own.
+/// A fetch that never returns is no longer this state — the worker waits on it
+/// through its own loop, bumping the liveness counter, and gives up when the
+/// transfer cap expires. That is the streaming design working, and it is why
+/// this test cannot use a slow provider to produce a stuck worker any more.
+///
+/// The state that must still be caught is a worker that has stopped running its
+/// loop at all while holding an event: blocked in an uninterruptible filesystem
+/// operation, or deadlocked on a pre-content event of its own making. `SIGSTOP`
+/// reproduces exactly that shape — alive, holding, bumping nothing — without
+/// needing to arrange a real deadlock.
 #[test]
 fn a_worker_that_stops_answering_is_taken_over() {
     let Some(mnt) = mount() else {
@@ -249,6 +256,10 @@ fn a_worker_that_stops_answering_is_taken_over() {
         };
         unsafe { libc::_exit(code) };
     }
+
+    // Give the worker time to dequeue the event, then freeze it holding it.
+    std::thread::sleep(Duration::from_secs(2));
+    unsafe { libc::kill(handle.worker_pid(), libc::SIGSTOP) };
 
     let report = handle
         .supervise_with_stall(
@@ -296,7 +307,7 @@ fn a_prompt_fetch_is_unaffected() {
     let path = placeholder_at(&mnt, "prompt.bin", 32);
 
     struct Prompt;
-    impl Fetch for Prompt {
+    impl FetchWhole for Prompt {
         fn fetch(&mut self, _f: FileId, size: u64) -> io::Result<Vec<u8>> {
             Ok(vec![b'H'; size as usize])
         }
@@ -362,7 +373,7 @@ fn a_fetcher_that_recovers_is_used_again() {
 
     /// Blocks for longer than several deadlines, then serves normally.
     struct SlowStart(std::sync::atomic::AtomicUsize);
-    impl Fetch for SlowStart {
+    impl FetchWhole for SlowStart {
         fn fetch(&mut self, _f: FileId, size: u64) -> io::Result<Vec<u8>> {
             if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 std::thread::sleep(Duration::from_secs(5));
@@ -449,7 +460,7 @@ fn a_lost_connection_counts_towards_giving_up_and_a_refusal_does_not() {
     };
 
     struct Fails(io::ErrorKind);
-    impl Fetch for Fails {
+    impl FetchWhole for Fails {
         fn fetch(&mut self, _f: FileId, _size: u64) -> io::Result<Vec<u8>> {
             Err(io::Error::new(self.0, "measured failure"))
         }
@@ -508,4 +519,104 @@ fn a_lost_connection_counts_towards_giving_up_and_a_refusal_does_not() {
             let _ = std::fs::remove_file(p);
         }
     }
+}
+
+/// The reason streaming exists: an object bigger than one deadline's worth of
+/// bandwidth, served by a provider that is slow but never stops.
+///
+/// Under the old design this was unservable at any speed — the whole object had
+/// to arrive inside a single 30-second window, and its failure took three
+/// consecutive misses to wedge the fetcher and the mount with it. Under
+/// streaming the transfer simply continues, because the deadline that matters is
+/// "has it stopped", not "is it finished".
+///
+/// It also pins the memory claim: the helper buffers one chunk, so a large
+/// object costs a chunk rather than its size.
+#[test]
+fn a_slow_but_steady_transfer_completes_past_the_first_byte_deadline() {
+    let Some(mnt) = mount() else {
+        skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
+        return;
+    };
+    use hydrationd::daemon::Limits;
+
+    const SIZE: u64 = 6 << 20;
+
+    /// Delivers in slices, pausing between them for longer than the first-byte
+    /// deadline would have allowed in total.
+    struct Dribbles;
+    impl Fetch for Dribbles {
+        fn fetch_into(
+            &mut self,
+            _file: FileId,
+            size: u64,
+            dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
+            progress: &mut dyn FnMut(u64),
+        ) -> io::Result<()> {
+            let chunk = vec![b'H'; 512 * 1024];
+            let mut off = 0u64;
+            while off < size {
+                let n = chunk.len().min((size - off) as usize);
+                dest(&chunk[..n], off)?;
+                off += n as u64;
+                progress(off);
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            Ok(())
+        }
+    }
+
+    let path = placeholder_at(&mnt, "slow-and-large.bin", SIZE);
+    let group = Group::new_pre_content().expect("group");
+    group.mark_mount(&mnt).expect("mark");
+    let mut worker = Worker::with_limits(
+        group.try_clone().expect("clone"),
+        Dribbles,
+        Policy::permissive(),
+        InFlight::new(),
+        Limits {
+            // Deliberately shorter than the transfer takes. Under the old design
+            // this alone made the object unservable.
+            first_byte: Duration::from_secs(2),
+            stall: Duration::from_secs(2),
+            total: Duration::from_secs(60),
+        },
+    );
+
+    let reader = unsafe { libc::fork() };
+    if reader == 0 {
+        let got = std::fs::read(&path).unwrap_or_default();
+        let ok = got.len() as u64 == SIZE && got.iter().all(|&b| b == b'H');
+        unsafe { libc::_exit(if ok { 0 } else { 7 }) };
+    }
+
+    let began = Instant::now();
+    let mut status = 0;
+    let mut done = false;
+    while began.elapsed() < Duration::from_secs(45) {
+        let _ = worker.run(Instant::now() + Duration::from_millis(200));
+        if unsafe { libc::waitpid(reader, &mut status, libc::WNOHANG) } == reader {
+            done = true;
+            break;
+        }
+    }
+    if !done {
+        unsafe {
+            libc::kill(reader, libc::SIGKILL);
+            libc::waitpid(reader, &mut status, 0);
+        }
+        panic!("a slow but steady 6 MiB transfer never completed");
+    }
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        0,
+        "the object was not delivered whole; 7 means the content was wrong"
+    );
+    assert!(
+        began.elapsed() > Duration::from_secs(4),
+        "the transfer finished too fast to have exercised the deadline: {:?}",
+        began.elapsed()
+    );
+    assert!(!worker.fetcher_wedged(), "a slow transfer counted as unresponsive");
+    let _ = std::fs::remove_file(&path);
 }
