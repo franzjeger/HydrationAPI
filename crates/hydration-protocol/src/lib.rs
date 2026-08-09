@@ -20,6 +20,115 @@ use serde::{Deserialize, Serialize};
 
 pub mod transport;
 
+/// The `nodump` inode flag, and its one legitimate use here.
+///
+/// DESIGN.md §6d. A backup that skips dehydrated files does not contain the
+/// cloud files, and a user who believed their backup covered the sync folder
+/// finds out at restore time. `nodump` is how a placeholder asks to be skipped —
+/// but almost nothing honours it, which is why the manifest is the mechanism and
+/// this is only the part that cooperating tools can see.
+///
+/// It lives in the shared crate because both halves touch it and they must not
+/// disagree: the privileged side sets it when a file loses its content and
+/// clears it when the content comes back, and the unprivileged side reports what
+/// a backup will therefore miss.
+///
+/// Measured (`probes/nodump.c`, 6.17, btrfs), and all three answers shape the
+/// code that uses this:
+///
+/// ```text
+///   set nodump: completed, events fired: 0
+///   survives a hole punch:            yes
+///   survives being written through:   yes
+/// ```
+///
+/// Firing no pre-content event is what makes it safe to set inside `evict()`,
+/// which runs in the marked mount in the process that answers events — the trap
+/// in §6a-ter. Surviving a write is why clearing it needs an explicit step in
+/// hydration: filling the file does not do it.
+pub mod flags {
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::path::Path;
+
+    /// `_IOR`/`_IOW` encoding, rather than the two constants everyone pastes.
+    ///
+    /// `FS_IOC_GETFLAGS` is `_IOR('f', 1, long)`, and the request number embeds
+    /// `sizeof(long)` — so the familiar `0x80086601` is correct only where a
+    /// long is eight bytes. Hard-coding it silently breaks on 32-bit, in the
+    /// direction that matters: the ioctl fails, the flag is never set, and a
+    /// backup quietly includes or excludes the wrong files.
+    const fn ioc(dir: u32, ty: u8, nr: u8, size: usize) -> libc::c_ulong {
+        ((dir << 30) | ((size as u32) << 16) | ((ty as u32) << 8) | nr as u32) as libc::c_ulong
+    }
+
+    const READ: u32 = 2;
+    const WRITE: u32 = 1;
+    const LONG: usize = std::mem::size_of::<libc::c_long>();
+    const GETFLAGS: libc::c_ulong = ioc(READ, b'f', 1, LONG);
+    const SETFLAGS: libc::c_ulong = ioc(WRITE, b'f', 2, LONG);
+    const NODUMP: libc::c_long = 0x0000_0040;
+
+    /// Set or clear `nodump`, opening read-only.
+    ///
+    /// Read-only on purpose: this runs inside the marked mount, and opening for
+    /// write there is how §6a-ter's trap is sprung. Changing an inode flag needs
+    /// no write access, only ownership.
+    pub fn set_nodump(path: &Path, on: bool) -> io::Result<()> {
+        let f = std::fs::File::open(path)?;
+        let mut cur: libc::c_long = 0;
+        if unsafe { libc::ioctl(f.as_raw_fd(), GETFLAGS, &mut cur) } < 0 {
+            return Err(unsupported_or(io::Error::last_os_error()));
+        }
+        let want = if on { cur | NODUMP } else { cur & !NODUMP };
+        if want != cur && unsafe { libc::ioctl(f.as_raw_fd(), SETFLAGS, &want) } < 0 {
+            return Err(unsupported_or(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// As [`set_nodump`], on a descriptor that is already open.
+    ///
+    /// What hydration uses: the content is written through the event fd, and
+    /// re-opening the path to clear a flag would be the same trap by a different
+    /// door.
+    pub fn set_nodump_fd(fd: std::os::fd::BorrowedFd<'_>, on: bool) -> io::Result<()> {
+        let mut cur: libc::c_long = 0;
+        if unsafe { libc::ioctl(fd.as_raw_fd(), GETFLAGS, &mut cur) } < 0 {
+            return Err(unsupported_or(io::Error::last_os_error()));
+        }
+        let want = if on { cur | NODUMP } else { cur & !NODUMP };
+        if want != cur && unsafe { libc::ioctl(fd.as_raw_fd(), SETFLAGS, &want) } < 0 {
+            return Err(unsupported_or(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    pub fn has_nodump(path: &Path) -> io::Result<bool> {
+        let f = std::fs::File::open(path)?;
+        let mut cur: libc::c_long = 0;
+        if unsafe { libc::ioctl(f.as_raw_fd(), GETFLAGS, &mut cur) } < 0 {
+            return Err(unsupported_or(io::Error::last_os_error()));
+        }
+        Ok(cur & NODUMP != 0)
+    }
+
+    /// Filesystems that have no such flag report `ENOTTY`. Worth naming, because
+    /// the caller's choice differs: an unsupported filesystem means the backup
+    /// policy cannot be honoured at all and the user has to be told, whereas a
+    /// permission error is a bug here.
+    fn unsupported_or(e: io::Error) -> io::Error {
+        match e.raw_os_error() {
+            Some(libc::ENOTTY) | Some(libc::EOPNOTSUPP) => io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this filesystem has no nodump flag",
+            ),
+            _ => e,
+        }
+    }
+}
+
+
 /// Extended attributes both halves agree on.
 ///
 /// Here rather than in either half because they are the shared vocabulary: the
@@ -49,6 +158,53 @@ pub mod xattr {
     // forging it made a real placeholder serve zeros to a reader. See
     // `hydrationd`'s `nothing_to_serve` for what replaced it: a property of the
     // file rather than a claim about it.
+}
+
+/// Files the framework puts in the user's sync directory, and the one rule about
+/// them.
+///
+/// > **The framework's own files are never synced.**
+///
+/// Obvious once stated and easy to leave out, because nothing fails loudly when
+/// you do. The manifest is rewritten every time the placeholder count changes;
+/// if it is treated as user content it is uploaded on every rewrite, comes back
+/// down as a delta, and the two ends chase each other indefinitely. Worse, a
+/// cloud object could claim the manifest's own path and a delta pass would
+/// happily replace §6d's mechanism with a placeholder — leaving the file that
+/// tells a restoring user what is missing as a file with no content.
+///
+/// One predicate, in the shared crate, for the same reason the xattr names are
+/// here: the scan, the manifest builder, the delta pass and the change watcher
+/// all need the same answer, and four copies of it is how they come to disagree.
+pub mod names {
+    /// Lives in the sync root. Named so it sorts early and reads as what it is.
+    pub const MANIFEST: &str = ".hydration-manifest";
+
+    /// True for anything the framework wrote for its own purposes.
+    ///
+    /// Matched on the file name alone, so it holds at any depth — scratch names
+    /// are created wherever a placeholder is, which is wherever the cloud says.
+    pub fn is_internal(name: &str) -> bool {
+        name == MANIFEST || name == concat!(".hydration-manifest", ".tmp") || is_scratch(name)
+    }
+
+    /// A half-finished placeholder rename: `.<base>.hydration-<seq>`.
+    ///
+    /// The trailing digits are what make this specific rather than a prefix
+    /// match. A looser test matched the manifest itself — the file §6d exists to
+    /// produce, whose whole purpose is to survive a backup and tell a restoring
+    /// user what was left out. A sweep that quietly deletes it is the same class
+    /// of failure as everything else here: something reporting success for work
+    /// it destroyed.
+    pub fn is_scratch(name: &str) -> bool {
+        let Some(rest) = name.strip_prefix('.') else {
+            return false;
+        };
+        let Some((base, seq)) = rest.rsplit_once(".hydration-") else {
+            return false;
+        };
+        !base.is_empty() && !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit())
+    }
 }
 
 /// Identifies a file without naming it.

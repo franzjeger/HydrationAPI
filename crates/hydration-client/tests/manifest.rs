@@ -235,3 +235,36 @@ fn nodump_can_be_set_and_cleared() {
     let flags = s.split_whitespace().next().unwrap_or("");
     assert!(!flags.contains('d'), "nodump not cleared: {s}");
 }
+
+/// The framework's own files must never become the user's content.
+///
+/// This is the loop it prevents. The manifest is rewritten whenever the
+/// placeholder count changes. If the scan indexes it, it is an ordinary local
+/// file: change detection sees the write, the queue debounces it, the upload
+/// gives it a cloud id, the next delta pass brings it back down, and the rewrite
+/// after that starts again. Nothing errors. The two ends simply never stop
+/// talking about a file the user has never heard of.
+#[test]
+fn the_frameworks_own_files_are_not_indexed_as_user_content() {
+    use hydration_client::store::Store;
+
+    let dir = scratch("not-indexed");
+    std::fs::write(dir.join("real.txt"), b"the user's file").unwrap();
+    Manifest::build(&dir).unwrap().write(&dir).unwrap();
+    // The two states a placeholder rename can be interrupted in.
+    std::fs::write(dir.join(".hydration-manifest.tmp"), b"half-written").unwrap();
+    std::fs::write(dir.join(".real.txt.hydration-2"), b"interrupted").unwrap();
+
+    let mut store = Store::new();
+    store.scan(&dir).unwrap();
+
+    let indexed: Vec<String> = store
+        .paths()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        indexed,
+        vec!["real.txt".to_string()],
+        "the framework's own files were indexed as user content: {indexed:?}"
+    );
+}

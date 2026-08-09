@@ -175,23 +175,7 @@ impl TmpfilePlacer {
     }
 }
 
-/// Exactly the names [`TmpfilePlacer`] creates: `.<base>.hydration-<seq>`.
-///
-/// The trailing digits are what make this specific rather than a prefix match.
-/// A looser test matched `.hydration-manifest` — the file §6d exists to produce,
-/// whose whole purpose is to survive and tell a restoring user what a backup
-/// left out. A cleanup routine that quietly deletes it is the same class of
-/// failure as everything else here: something reporting success for work it
-/// destroyed.
-fn is_scratch(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix('.') else {
-        return false;
-    };
-    let Some((base, seq)) = rest.rsplit_once(".hydration-") else {
-        return false;
-    };
-    !base.is_empty() && !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit())
-}
+use hydration_protocol::names::is_scratch;
 
 fn linkat(proc_path: &str, target: &Path) -> io::Result<()> {
     let from = std::ffi::CString::new(proc_path.as_bytes()).unwrap();

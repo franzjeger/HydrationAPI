@@ -74,6 +74,22 @@ impl Store {
                 if !md.is_file() {
                     continue;
                 }
+                // Never index the framework's own files.
+                //
+                // The manifest is rewritten whenever the placeholder count
+                // changes. Indexed, it becomes an ordinary local file: change
+                // detection sees the write, the queue debounces it, the upload
+                // gives it a cloud id, the next delta pass brings it back down,
+                // and the rewrite after that starts the cycle again. Nothing
+                // fails; the two ends simply never stop talking about a file the
+                // user has never heard of.
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(hydration_protocol::names::is_internal)
+                {
+                    continue;
+                }
                 self.index.insert(
                     FileId {
                         fsid: md.dev(),
@@ -111,6 +127,14 @@ impl Store {
 
     pub fn forget(&mut self, id: &FileId) {
         self.index.remove(id);
+    }
+
+    /// Every file the scan indexed, in no particular order.
+    ///
+    /// Exposed so a caller can assert what is *not* in here — the framework's
+    /// own files most of all, since including them is silent rather than loud.
+    pub fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.index.values().map(|p| p.as_path())
     }
 
     pub fn len(&self) -> usize {

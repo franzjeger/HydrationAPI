@@ -391,7 +391,10 @@ impl Harness for Framework {
                 .flatten()
                 .is_some()
         };
-        let outcome = evict::evict(&self.group, &path, safe);
+        // Exclude: the conformance suite stands in for a deployment that has
+        // chosen §6d's least-bad policy, and it is the setting where the flag
+        // actually does something to observe.
+        let outcome = evict::evict(&self.group, &path, evict::Backup::Exclude, safe);
         match outcome {
             Ok(Ok(())) => {}
             other => {

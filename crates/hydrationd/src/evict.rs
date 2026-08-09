@@ -35,9 +35,24 @@ pub enum Refused {
 /// parameter rather than a check inside this function because only the
 /// unprivileged side knows — and getting it wrong is not a performance problem,
 /// it is data loss with no error message.
+/// What eviction should tell cooperating backup tools. §6d.
+///
+/// No default, because there is no safe one: excluding means a backup silently
+/// lacks the content, and including means any backup sweep pulls the whole drive
+/// down. The caller has to have decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backup {
+    /// Set `nodump`, so tools that honour it skip the placeholder.
+    Exclude,
+    /// Leave the flag alone; the file is readable like any other and reading it
+    /// will hydrate it.
+    Include,
+}
+
 pub fn evict(
     group: &Group,
     path: &Path,
+    backup: Backup,
     is_safe: impl FnOnce() -> bool,
 ) -> io::Result<Result<(), Refused>> {
     if placeholder::is_dehydrated(path)? {
@@ -57,6 +72,24 @@ pub fn evict(
     // with no content — and a reader arriving there would be given zeros and
     // told they were real.
     placeholder::mark_dehydrated(path, true)?;
+
+    // Alongside the mark, and for the same reason: the moment the content goes,
+    // a backup reading this file gets a hole. Setting the flag fires no
+    // pre-content event (measured, `probes/nodump.c`), which is what makes it
+    // safe to do here — inside the marked mount, in the process that answers
+    // events.
+    //
+    // A filesystem with no such flag is not a failure of eviction. It is a
+    // failure of the backup policy, and §6d already requires the count to be
+    // visible in the manifest, which is the mechanism that does not depend on
+    // anyone honouring a flag.
+    if backup == Backup::Exclude {
+        match hydration_protocol::flags::set_nodump(path, true) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
+            Err(e) => return Err(e),
+        }
+    }
 
     // Step 1. Still under the ignore mark the file got when it was hydrated, so
     // this write does not generate an event nobody is going to answer.

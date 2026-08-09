@@ -4,7 +4,11 @@
 //! sudo -E HYDRATIOND_TEST_MOUNT=/mnt/scratch cargo test -p hydrationd --test eviction
 //! ```
 
-use hydrationd::evict::{evict, Refused};
+use hydration_protocol::FileId;
+use hydrationd::daemon::{Fetch, Worker};
+use hydrationd::evict::{evict, Backup, Refused};
+use hydrationd::policy::Policy;
+use hydrationd::supervisor::InFlight;
 use hydrationd::fanotify::Group;
 use hydrationd::placeholder;
 use std::path::PathBuf;
@@ -50,7 +54,7 @@ fn evicting_returns_the_disk_and_keeps_the_metadata() {
     assert!(!placeholder::is_dehydrated(&path).unwrap());
 
     // Would block forever if the punch happened after the mark was dropped.
-    let outcome = evict(&group, &path, || true).expect("evict");
+    let outcome = evict(&group, &path, Backup::Exclude, || true).expect("evict");
     assert_eq!(outcome, Ok(()));
 
     let md = std::fs::metadata(&path).unwrap();
@@ -80,7 +84,7 @@ fn a_file_that_is_not_in_the_cloud_is_never_evicted() {
     group.ignore(&path).expect("ignore");
 
     // The unprivileged side reports that this content exists nowhere else.
-    let outcome = evict(&group, &path, || false).expect("evict");
+    let outcome = evict(&group, &path, Backup::Exclude, || false).expect("evict");
     assert_eq!(
         outcome,
         Err(Refused::NotUploaded),
@@ -109,7 +113,7 @@ fn evicting_something_already_empty_is_refused_not_repeated() {
     group.mark_mount(&mnt).expect("mark");
 
     assert_eq!(
-        evict(&group, &path, || true).expect("evict"),
+        evict(&group, &path, Backup::Exclude, || true).expect("evict"),
         Err(Refused::AlreadyDehydrated)
     );
     let _ = std::fs::remove_file(&path);
@@ -142,7 +146,7 @@ fn an_evicted_file_is_intercepted_again() {
     let group = Group::new_pre_content().expect("group");
     group.mark_mount(&mnt).expect("mark");
     group.ignore(&path).unwrap();
-    evict(&group, &path, || true)
+    evict(&group, &path, Backup::Exclude, || true)
         .expect("evict")
         .expect("evicted");
 
@@ -190,5 +194,119 @@ fn an_evicted_file_is_intercepted_again() {
         "closing the group did not release the blocked reader"
     );
 
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Content that is unmistakably content.
+struct Canned(Vec<u8>);
+
+impl Fetch for Canned {
+    fn fetch(&mut self, _file: FileId, size: u64) -> std::io::Result<Vec<u8>> {
+        let mut v = self.0.clone();
+        v.resize(size as usize, b'.');
+        Ok(v)
+    }
+}
+
+/// §6d's flag, both ends of its life.
+///
+/// The flag exists so that backup tools which honour it skip a file with no
+/// content. That makes *clearing* it the load-bearing half: a hydrated file that
+/// is still flagged goes on being skipped by every such backup, which is the
+/// §6d harm arriving by the back door — content that exists only on this machine
+/// and is excluded from the backup anyway.
+///
+/// Measured (`probes/nodump.c`): the flag survives being written through, so
+/// hydration does not clear it as a side effect. It has to be an explicit step,
+/// and this is what checks that it is.
+#[test]
+fn the_backup_flag_is_set_on_eviction_and_cleared_on_hydration() {
+    let Some(mnt) = mount() else {
+        skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
+        return;
+    };
+    use hydration_protocol::flags::has_nodump;
+
+    let path = mnt.join("nodump-lifecycle.bin");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, b"content that will be evicted and then fetched back").expect("seed");
+    assert!(!has_nodump(&path).unwrap(), "the flag was already set");
+
+    let group = Group::new_pre_content().expect("group");
+    group.mark_mount(&mnt).expect("mark");
+    group.ignore(&path).expect("ignore");
+
+    evict(&group, &path, Backup::Exclude, || true)
+        .expect("evict")
+        .expect("refused");
+    assert!(
+        has_nodump(&path).unwrap(),
+        "eviction left the placeholder visible to backups that honour nodump"
+    );
+
+    // Hydration through the event fd, which is the only way it happens in
+    // production — and the only way that exercises the clearing step.
+    let mut worker = Worker::new(
+        group.try_clone().expect("clone"),
+        Canned(b"fetched back from the cloud".to_vec()),
+        Policy::permissive(),
+        InFlight::new(),
+    );
+    let reader = unsafe { libc::fork() };
+    if reader == 0 {
+        let _ = std::fs::read(&path);
+        unsafe { libc::_exit(0) };
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut status = 0;
+    let mut done = false;
+    while std::time::Instant::now() < deadline {
+        let _ = worker.run(std::time::Instant::now() + std::time::Duration::from_millis(200));
+        if unsafe { libc::waitpid(reader, &mut status, libc::WNOHANG) } == reader {
+            done = true;
+            break;
+        }
+    }
+    if !done {
+        unsafe {
+            libc::kill(reader, libc::SIGKILL);
+            libc::waitpid(reader, &mut status, 0);
+        }
+        panic!("the read never completed");
+    }
+
+    assert!(
+        !has_nodump(&path).unwrap(),
+        "the file has its content back but is still flagged nodump: every backup \
+         that honours the flag will keep skipping it"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Under the other policy the flag must not appear at all — a backup is meant to
+/// read these files and pull them down.
+#[test]
+fn including_a_placeholder_in_backups_leaves_the_flag_alone() {
+    let Some(mnt) = mount() else {
+        skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
+        return;
+    };
+    use hydration_protocol::flags::has_nodump;
+
+    let path = mnt.join("nodump-include.bin");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, b"content").expect("seed");
+
+    let group = Group::new_pre_content().expect("group");
+    group.mark_mount(&mnt).expect("mark");
+    group.ignore(&path).expect("ignore");
+
+    evict(&group, &path, Backup::Include, || true)
+        .expect("evict")
+        .expect("refused");
+    assert!(
+        !has_nodump(&path).unwrap(),
+        "Backup::Include set the flag anyway"
+    );
     let _ = std::fs::remove_file(&path);
 }

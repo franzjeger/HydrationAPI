@@ -23,7 +23,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// Lives in the sync root. Named so it sorts early and reads as what it is.
-pub const MANIFEST_NAME: &str = ".hydration-manifest";
+///
+/// Defined in the shared crate, because the scan, the delta pass and the change
+/// watcher all have to agree with the manifest builder about which files belong
+/// to the framework rather than to the user.
+pub use hydration_protocol::names::MANIFEST as MANIFEST_NAME;
 
 /// What a backup is missing for one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +69,14 @@ impl Manifest {
                     stack.push(path);
                     continue;
                 }
-                if !md.is_file() || path.file_name().is_some_and(|n| n == MANIFEST_NAME) {
+                // The framework's own files are not the user's, and a manifest
+                // that listed itself would be describing the wrong thing.
+                if !md.is_file()
+                    || path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(hydration_protocol::names::is_internal)
+                {
                     continue;
                 }
                 // The dehydrated mark, not `st_blocks`.
@@ -218,28 +229,14 @@ pub fn status_line(policy: BackupPolicy, dehydrated: usize) -> String {
     }
 }
 
-/// Set or clear the `nodump` flag. Only meaningful under [`BackupPolicy::Exclude`].
-pub fn set_nodump(path: &Path, on: bool) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    const FS_IOC_GETFLAGS: libc::c_ulong = 0x80086601;
-    const FS_IOC_SETFLAGS: libc::c_ulong = 0x40086602;
-    const FS_NODUMP_FL: libc::c_long = 0x00000040;
-
-    let f = std::fs::OpenOptions::new().read(true).open(path)?;
-    let mut flags: libc::c_long = 0;
-    if unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_GETFLAGS, &mut flags) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let updated = if on {
-        flags | FS_NODUMP_FL
-    } else {
-        flags & !FS_NODUMP_FL
-    };
-    if updated != flags && unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_SETFLAGS, &updated) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
+/// Set or clear the `nodump` flag.
+///
+/// Re-exported rather than reimplemented: the flag is set by the privileged side
+/// when a file loses its content and cleared when it comes back, and a second
+/// copy of the ioctl here is how the two ends start disagreeing about what the
+/// flag means. See `hydration_protocol::flags` for why the request numbers are
+/// computed rather than pasted.
+pub use hydration_protocol::flags::{has_nodump, set_nodump};
 
 fn string_xattr(path: &Path, name: &str) -> Option<String> {
     store::get_xattr(path, name)

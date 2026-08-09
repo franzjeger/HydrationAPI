@@ -241,6 +241,24 @@ pub fn hydrate_fd(
     // Cleared through the fd rather than the path: re-opening a path inside a
     // marked mount is the trap this whole module is arranged to avoid.
     unmark_fd(fd)?;
+
+    // And the backup flag, in the same breath, because filling the file does not
+    // clear it — measured (`probes/nodump.c`: "survives being written through:
+    // yes"). Left set, a hydrated file would go on being skipped by every backup
+    // that honours it, which is §6d's harm arriving by the back door: content
+    // that exists only here and is excluded from the backup anyway.
+    //
+    // Unconditional, and not gated on having set it ourselves. The narrow cost
+    // is a user who set `nodump` by hand on a file that later turns out to be a
+    // cloud placeholder: hydrating it clears their flag. That errs towards more
+    // data in the backup, which is the direction §6d exists to protect.
+    // A filesystem without the flag has nothing to clear, and a hydration that
+    // delivered its content must not be reported as failed over a backup hint.
+    match hydration_protocol::flags::set_nodump_fd(fd, false) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 

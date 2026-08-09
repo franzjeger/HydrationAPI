@@ -200,7 +200,22 @@ pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     }
     for c in p.components() {
         match c {
-            std::path::Component::Normal(_) => {}
+            std::path::Component::Normal(n) => {
+                // A cloud object may not claim one of the framework's own names.
+                //
+                // Without this, a remote service — or anything that can write to
+                // the account — could name an object `.hydration-manifest` and
+                // have a delta pass replace §6d's mechanism with a placeholder:
+                // the file that tells a restoring user what is missing would
+                // become a file with no content. It is refused rather than
+                // renamed, because a renamed path silently means something other
+                // than what the cloud said.
+                if n.to_str()
+                    .is_some_and(hydration_protocol::names::is_internal)
+                {
+                    return None;
+                }
+            }
             // Everything else — ParentDir, RootDir, Prefix, CurDir — either
             // escapes or is meaningless here.
             _ => return None,
@@ -226,5 +241,17 @@ mod tests {
         assert!(safe_join(root, "sub/../../out").is_none());
         assert!(safe_join(root, "").is_none());
         assert!(safe_join(root, "./x").is_none());
+    }
+
+    /// The framework's own files are not addressable from the cloud.
+    #[test]
+    fn a_cloud_object_cannot_claim_one_of_our_own_names() {
+        let root = Path::new("/home/frank/OneDrive");
+        assert!(safe_join(root, ".hydration-manifest").is_none());
+        assert!(safe_join(root, ".hydration-manifest.tmp").is_none());
+        assert!(safe_join(root, "sub/.hydration-manifest").is_none());
+        assert!(safe_join(root, "sub/.report.pdf.hydration-4").is_none());
+        // A name that merely looks similar is the user's business, not ours.
+        assert!(safe_join(root, ".hydration-notes.txt").is_some());
     }
 }

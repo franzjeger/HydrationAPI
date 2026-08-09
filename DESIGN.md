@@ -1088,6 +1088,63 @@ lister alle *N* med hash som lar dem hentes igjen.
 
 ---
 
+## 6e. Rammeverkets egne filer er aldri brukerens
+
+Én regel, og den er lett å utelate fordi ingenting feiler høyt når man gjør det:
+
+> **Rammeverkets egne filer synkes aldri.**
+
+Manifestet skrives om hver gang antallet placeholdere endrer seg. Behandles det
+som brukerinnhold, blir det en helt vanlig lokal fil: endringsdeteksjonen ser
+skrivingen, køen debouncer den, opplastingen gir den en sky-id, neste delta-pass
+henter den ned igjen, og omskrivingen etter det starter på nytt. Ingenting
+feiler. De to endene slutter bare aldri å snakke om en fil brukeren aldri har
+hørt om.
+
+Verre i den andre retningen: et skyobjekt kunne hete `.hydration-manifest`, og et
+delta-pass ville da erstattet §6d-mekanismen med en placeholder — filen som
+forteller en gjenopprettende bruker hva som mangler, ville selv blitt en fil uten
+innhold. `safe_join` avviser det nå, framfor å døpe det om: en omdøpt sti betyr
+stille noe annet enn det skyen sa.
+
+Predikatet ligger i den delte krata av samme grunn som xattr-navnene. Skanningen,
+manifest-byggeren, delta-passet og endringsvakten trenger alle det samme svaret,
+og fire kopier av det er hvordan de blir uenige.
+
+---
+
+## 6f. `nodump` har en eier
+
+Flagget hadde en setter og ingen livssyklus. Målt først (`probes/nodump.c`,
+6.17, btrfs), fordi alle tre svarene former koden:
+
+```
+set nodump: completed, events fired: 0
+survives a hole punch:            yes
+survives being written through:   yes
+```
+
+- **Ingen hendelse** er det som gjør det trygt å sette inne i `evict()`, som
+  kjører i den merkede monteringen i prosessen som svarer på hendelser (§6a-ter).
+  Flagget settes derfor rett ved siden av dehydreringsmerket, i samme funksjon.
+- **Overlever å bli skrevet gjennom** er den viktige: hydrering rydder det *ikke*
+  av seg selv. Uten et eksplisitt steg ville en hydrert fil fortsatt blitt hoppet
+  over av enhver backup som respekterer flagget — §6d-skaden inn bakveien, altså
+  innhold som bare finnes her og likevel er utelatt fra backupen. Det ryddes nå i
+  `hydrate_fd`, gjennom hendelsens fd, i samme operasjon som fyller filen.
+
+Ryddingen er ubetinget og ikke betinget av at vi satte det selv. Den smale
+kostnaden er en bruker som har satt `nodump` for hånd på en fil som senere viser
+seg å være en placeholder: hydrering fjerner flagget deres. Det bommer i retning
+*mer* data i backupen, som er retningen §6d finnes for å beskytte.
+
+`Backup::Exclude` / `Backup::Include` er nå et argument til `evict()` uten
+standardverdi, fordi det ikke finnes en trygg en — å utelate betyr at backupen
+stille mangler innholdet, å inkludere betyr at ethvert backup-sveip drar ned hele
+disken.
+
+---
+
 ## 7. Kostnad
 
 Forutsatt at klienten (auth, Graph-API, delta-sync) allerede finnes, som den gjør i
