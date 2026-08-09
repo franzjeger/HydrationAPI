@@ -10,6 +10,7 @@
 //! destination.
 
 pub mod store;
+pub mod upload;
 
 use hydration_protocol::transport::DaemonConn;
 use hydration_protocol::{FetchResponse, FileId, FromHelper};

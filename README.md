@@ -76,9 +76,28 @@ one attribute onto a file that has not moved. The client this replaces had to
 swap identities at that moment, and that swap produced three data-loss bugs and
 three later races.
 
-What is not built yet: change detection and upload, eviction, the
-`FAN_MNT_ATTACH` exposure watch wired through to status, the backup manifest,
-and the systemd units. See DESIGN.md §8 for the v1 scope.
+### Upload
+
+Local changes go back to the cloud under four rules, each one a shipped
+data-loss bug in the client this replaces:
+
+1. **Upload when the file goes quiet, not when it closes.** An atomic save
+   closes a temp file it is about to rename away; a scratch file is written and
+   deleted seconds later; ten saves start ten uploads that collide.
+2. **An upload is addressed by inode, never by a captured name.** The name is
+   resolved when the bytes are sent — after the rename has landed.
+3. **A missing local file is a positive statement.** The delete is the newer
+   intention and wins, including removing the object the upload just created.
+4. **The pending count includes edits still waiting.** Omitting them shows
+   "everything synced" over work that has not left the machine.
+
+They run on a clock the tests move, so the races are arranged rather than
+waited for — sleeping through a 900-second debounce is why they stayed hidden
+the first time.
+
+What is not built yet: eviction, the `FAN_MNT_ATTACH` exposure watch wired
+through to status, the backup manifest, and the systemd units. See DESIGN.md §8
+for the v1 scope.
 
 ## The contract
 

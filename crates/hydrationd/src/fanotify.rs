@@ -119,6 +119,16 @@ impl Group {
         )
     }
 
+    /// A plain notification group, for watching local changes.
+    pub fn new_notify() -> io::Result<Self> {
+        Self::init(FAN_CLASS_NOTIF | FAN_CLOEXEC, libc::O_RDONLY as u32)
+    }
+
+    /// Mark a mount for notification-class events.
+    pub fn mark_mount_events(&self, mountpoint: &std::path::Path, mask: u64) -> io::Result<()> {
+        self.mark(FAN_MARK_ADD | FAN_MARK_MOUNT, mask, mountpoint)
+    }
+
     fn init(flags: u32, event_flags: u32) -> io::Result<Self> {
         let fd = unsafe { fanotify_init(flags, event_flags) };
         if fd < 0 {
