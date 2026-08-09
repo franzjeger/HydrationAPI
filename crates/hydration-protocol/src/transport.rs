@@ -106,6 +106,7 @@ impl HelperConn {
     /// [`crate::MAX_CHUNK`] of memory rather than 10 GB.
     pub fn recv_streamed(
         &mut self,
+        want_id: u64,
         expected: u64,
         dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
         on_progress: &mut dyn FnMut(u64),
@@ -126,7 +127,30 @@ impl HelperConn {
                     "the sync daemon closed the connection mid-transfer",
                 ));
             }
-            match decode::<ToHelper>(&line).map_err(io::Error::other)? {
+            let msg = decode::<ToHelper>(&line).map_err(io::Error::other)?;
+            // Every frame must answer the request that is outstanding.
+            //
+            // The old whole-body receiver checked this and this one did not.
+            // Harmless while one request is in flight behind `&mut self` — and a
+            // cross-file content substitution the day pipelining lands, which is
+            // exactly what this framing exists to enable. Put back while it is
+            // free.
+            let frame_id = match &msg {
+                ToHelper::Fetch(r) => Some(r.id()),
+                ToHelper::Chunk { id, .. } | ToHelper::Done { id } | ToHelper::Abort { id, .. } => {
+                    Some(*id)
+                }
+                ToHelper::Control(_) => None,
+            };
+            if let Some(got) = frame_id {
+                if got != want_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("frame {got} does not answer request {want_id}"),
+                    ));
+                }
+            }
+            match msg {
                 ToHelper::Fetch(FetchResponse::Ready { len, .. }) => {
                     if len != expected {
                         // Refused on the declaration, before the body. The stream
@@ -139,10 +163,17 @@ impl HelperConn {
                     }
                 }
                 ToHelper::Chunk { len, .. } => {
-                    if len > crate::MAX_CHUNK || total + len > expected {
+                    // A zero-length chunk is not progress, and treating it as
+                    // such let a daemon reset the worker's stall clock forever
+                    // without delivering a byte. Refused at the frame, so the
+                    // rule holds for any caller rather than only the one that
+                    // remembers it.
+                    if len == 0 || len > crate::MAX_CHUNK || total + len > expected {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("chunk of {len} would overrun a {expected}-byte object"),
+                            format!(
+                            "chunk of {len} is empty or would overrun a {expected}-byte object"
+                        ),
                         ));
                     }
                     let n = len as usize;
@@ -226,6 +257,12 @@ pub struct Body<'a> {
     promised: u64,
     written: u64,
     finished: bool,
+    /// A write failed after the chunk header went out, so the byte run on the
+    /// wire is shorter than it was announced to be. Nothing can be written after
+    /// that without landing inside the previous chunk's body — the receiver
+    /// would read a control line as content and report success, measured — so
+    /// the connection is shut down rather than resynchronised.
+    poisoned: bool,
 }
 
 impl Body<'_> {
@@ -273,6 +310,14 @@ impl Body<'_> {
     }
 
     fn send_line(&mut self, line: &str) -> io::Result<()> {
+        if self.poisoned {
+            // Anything written now lands inside the unfinished byte run.
+            let _ = self.writer.shutdown(std::net::Shutdown::Both);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the body stream desynchronised; the connection was closed",
+            ));
+        }
         self.writer.write_all(line.as_bytes())?;
         self.writer.flush()
     }
@@ -304,8 +349,13 @@ impl Write for Body<'_> {
         })
         .map_err(io::Error::other)?;
         self.writer.write_all(line.as_bytes())?;
-        self.writer.write_all(&buf[..n])?;
-        self.writer.flush()?;
+        // From here the header is committed and the body is owed. A failure
+        // leaves the stream in a state no reader can recover from, so it is
+        // marked rather than retried.
+        if let Err(e) = self.writer.write_all(&buf[..n]).and_then(|()| self.writer.flush()) {
+            self.poisoned = true;
+            return Err(e);
+        }
         self.written += n as u64;
         Ok(n)
     }
@@ -361,10 +411,16 @@ impl DaemonConn {
             promised: len,
             written: 0,
             finished: false,
+            poisoned: false,
         })
     }
 
-    /// Answer with content.
+    /// Answer with content in one go.
+    ///
+    /// Wire-incompatible with [`HelperConn::recv_streamed`], which is the only
+    /// reader in production — kept for the tests that exercise the length check
+    /// against [`HelperConn::recv`], and for nothing else.
+    #[doc(hidden)]
     pub fn send_ready(&mut self, id: u64, content: &[u8]) -> io::Result<()> {
         let line = encode(&ToHelper::Fetch(FetchResponse::Ready {
             id,
@@ -374,6 +430,12 @@ impl DaemonConn {
         self.writer.write_all(line.as_bytes())?;
         self.writer.write_all(content)?;
         self.writer.flush()
+    }
+
+    /// The raw stream, for tests that need to emit frames `Body` would refuse.
+    #[doc(hidden)]
+    pub fn raw_writer(&mut self) -> &mut UnixStream {
+        &mut self.writer
     }
 
     /// Answer without content.

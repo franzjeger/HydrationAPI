@@ -67,12 +67,6 @@ enum Refusal {
     /// A file that exists locally and has never been uploaded. There is nothing
     /// to fetch, and that is not an error — the content is already the only copy.
     NeverUploaded,
-    Provider(io::Error),
-    /// The provider returned the wrong number of bytes.
-    WrongLength {
-        got: usize,
-        want: u64,
-    },
 }
 
 impl Refusal {
@@ -85,11 +79,6 @@ impl Refusal {
             Refusal::NeverUploaded => (
                 libc::ENODATA,
                 "the file has never been uploaded; the local copy is the only one".to_string(),
-            ),
-            Refusal::Provider(e) => (libc::EIO, format!("provider failed: {e}")),
-            Refusal::WrongLength { got, want } => (
-                libc::EIO,
-                format!("provider returned {got} bytes for an object recorded as {want}"),
             ),
         };
         FetchResponse::Failed { id, errno, reason }

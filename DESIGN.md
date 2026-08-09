@@ -767,6 +767,15 @@ blokkere, ikke ut fra hvor stor en fil får være — og det må finnes, siden l
 ikke kan signaleres bort. Hjelperen bufrer én bit framfor hele objektet, så
 minnekostnaden er `MAX_CHUNK` og ikke filstørrelsen.
 
+Åtte feil ble funnet i den første versjonen av dette, og den verste var en
+bruk-etter-lukking: hentetråden fikk hendelsens fd som et rått tall, arbeideren
+lukket det idet den svarte, og en forlatt overføring fortsatte å skrive til et
+tall kjernen i mellomtiden hadde gitt til *neste* hendelse. Målt: 8 MiB av ett
+objekt skrevet inn i en annen 4096-byte placeholder, merket fjernet, rapportert
+som `Hydrated`. Ikke et kappløp som krever flaks — hendelses-fd-er tildeles
+laveste ledige først, og arbeideren holder nesten ingen. Hentetråden eier nå sin
+egen `dup`.
+
 Vakten fikk en andre teller for dette. Fremdriftstelleren beveger seg bare når en
 hendelse er ferdig besvart, så en legitim fem minutters nedlasting så nøyaktig ut
 som en hengt arbeider. Den nye pulsen ligger i arbeiderens egen ventesløyfe —

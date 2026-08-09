@@ -620,3 +620,171 @@ fn a_slow_but_steady_transfer_completes_past_the_first_byte_deadline() {
     assert!(!worker.fetcher_wedged(), "a slow transfer counted as unresponsive");
     let _ = std::fs::remove_file(&path);
 }
+
+/// An abandoned transfer must not write into the next file.
+///
+/// The fetch thread was handed the event fd as a raw number. The worker closes
+/// that descriptor the moment it answers, so an abandoned transfer left the
+/// fetch thread still writing to a number the kernel had by then handed to the
+/// *next* event. Measured before the fix: 8 MiB of one object written into a
+/// different 4096-byte placeholder, its mark cleared, reported as `Hydrated`.
+/// Silent, durable, cross-file corruption — and not a race that needs luck,
+/// because event fds are allocated lowest-free-first and the worker holds
+/// almost none.
+#[test]
+fn an_abandoned_transfer_cannot_write_into_the_next_file() {
+    let Some(mnt) = mount() else {
+        skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
+        return;
+    };
+    use hydrationd::daemon::Limits;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Stalls on the first object past its deadline, then wakes up and writes
+    /// the whole thing — into whatever descriptor it was given.
+    struct StallsThenWakes(Arc<AtomicUsize>);
+    impl Fetch for StallsThenWakes {
+        fn fetch_into(
+            &mut self,
+            _file: FileId,
+            size: u64,
+            dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
+            progress: &mut dyn FnMut(u64),
+        ) -> io::Result<()> {
+            let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+            if first {
+                // Long enough that the worker gives up and answers the reader.
+                std::thread::sleep(Duration::from_secs(4));
+            }
+            let buf = vec![if first { b'A' } else { b'B' }; size as usize];
+            dest(&buf, 0)?;
+            progress(size);
+            Ok(())
+        }
+    }
+
+    let big = placeholder_at(&mnt, "uaf-big.bin", 8 << 20);
+    let small = placeholder_at(&mnt, "uaf-small.bin", 4096);
+    let group = Group::new_pre_content().expect("group");
+    group.mark_mount(&mnt).expect("mark");
+    let mut worker = Worker::with_limits(
+        group.try_clone().expect("clone"),
+        StallsThenWakes(Arc::new(AtomicUsize::new(0))),
+        Policy::permissive(),
+        InFlight::new(),
+        Limits {
+            first_byte: Duration::from_secs(1),
+            stall: Duration::from_secs(1),
+            total: Duration::from_secs(2),
+        },
+    );
+
+    for path in [&big, &small] {
+        let reader = unsafe { libc::fork() };
+        if reader == 0 {
+            let _ = std::fs::read(path);
+            unsafe { libc::_exit(0) };
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut status = 0;
+        while Instant::now() < deadline {
+            let _ = worker.run(Instant::now() + Duration::from_millis(100));
+            if unsafe { libc::waitpid(reader, &mut status, libc::WNOHANG) } == reader {
+                break;
+            }
+        }
+        // Let the abandoned first transfer wake up while the second is served.
+        std::thread::sleep(Duration::from_millis(500));
+        let _ = worker.run(Instant::now() + Duration::from_secs(4));
+    }
+
+    let md = std::fs::metadata(&small).expect("the small placeholder is gone");
+    assert_eq!(
+        md.len(),
+        4096,
+        "an abandoned transfer grew a different file to {} bytes",
+        md.len()
+    );
+    let body = std::fs::read(&small).unwrap_or_default();
+    assert!(
+        !body.contains(&b'A'),
+        "content from a different object was written into this file"
+    );
+    for p in [&big, &small] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// A `Fetch` that writes less than the object and claims success must not be
+/// believed.
+///
+/// `Body` holds a *provider* to the object's length. Nothing held the privileged
+/// `Fetch` trait to it, so an implementation that wrote half and returned `Ok`
+/// produced a file that was half content and half zeros, unmarked, reported as
+/// hydrated. The guarantee cannot live only in the half of the stack that
+/// happens to be typed for it.
+#[test]
+fn a_fetch_that_delivers_short_and_claims_success_is_refused() {
+    let Some(mnt) = mount() else {
+        skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
+        return;
+    };
+
+    struct Lies;
+    impl Fetch for Lies {
+        fn fetch_into(
+            &mut self,
+            _file: FileId,
+            size: u64,
+            dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
+            progress: &mut dyn FnMut(u64),
+        ) -> io::Result<()> {
+            let half = (size / 2) as usize;
+            dest(&vec![b'H'; half], 0)?;
+            progress(half as u64);
+            Ok(())
+        }
+    }
+
+    let path = placeholder_at(&mnt, "short-and-proud.bin", 8192);
+    let group = Group::new_pre_content().expect("group");
+    group.mark_mount(&mnt).expect("mark");
+    let mut worker = Worker::new(
+        group.try_clone().expect("clone"),
+        Lies,
+        Policy::permissive(),
+        InFlight::new(),
+    );
+
+    let reader = unsafe { libc::fork() };
+    if reader == 0 {
+        let code = match std::fs::read(&path) {
+            Ok(b) if b.iter().any(|&x| x == 0) => 7,
+            Ok(_) => 0,
+            Err(_) => 1,
+        };
+        unsafe { libc::_exit(code) };
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut status = 0;
+    let mut done = false;
+    while Instant::now() < deadline {
+        let _ = worker.run(Instant::now() + Duration::from_millis(100));
+        if unsafe { libc::waitpid(reader, &mut status, libc::WNOHANG) } == reader {
+            done = true;
+            break;
+        }
+    }
+    assert!(done, "the reader never came back");
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        1,
+        "expected EIO; 7 means the reader was handed half content and half zeros"
+    );
+    assert!(
+        hydrationd::placeholder::has_mark(&path).unwrap_or(false),
+        "the placeholder mark was cleared for a transfer that never completed"
+    );
+    let _ = std::fs::remove_file(&path);
+}

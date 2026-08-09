@@ -362,10 +362,10 @@ fn is_current(abs: &Path, cloud_id: &str, etag: Option<&str>, size: u64) -> bool
 
 /// The largest object a change may claim, beyond which it is refused.
 ///
-/// 1 TiB, which is above any single file a consumer service will hold and far
-/// below the point where a sparse placeholder's promised length becomes a
-/// denial of service against the daemon that has to allocate it.
-pub const MAX_OBJECT: u64 = 1 << 40;
+/// The helper enforces the same limit independently, because this one runs on
+/// the side §6b assumes may be compromised — but the number is defined once, so
+/// the two cannot drift into disagreeing about what "too large" means.
+pub use hydration_protocol::MAX_OBJECT;
 
 /// One change per object, last occurrence winning, order otherwise preserved.
 fn coalesce(changes: &[Change]) -> Vec<Change> {

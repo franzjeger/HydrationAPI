@@ -163,6 +163,8 @@ struct Timed {
     rep: std::sync::mpsc::Receiver<(u64, Step)>,
     seq: u64,
     missed: u32,
+    /// Transfers that started and had to be given up on.
+    abandoned: u32,
     since: Option<std::time::Instant>,
 }
 
@@ -170,7 +172,19 @@ struct Job {
     seq: u64,
     file: FileId,
     size: u64,
-    fd: i32,
+    /// The fetch thread's **own** descriptor, not the worker's number.
+    ///
+    /// A raw `i32` here was a use-after-close, and a bad one. The worker closes
+    /// the event fd as soon as it answers; an abandoned transfer leaves the
+    /// fetch thread still inside `fetch_into`, still calling `dest`, still
+    /// writing to that number — which the kernel has by then handed to the *next*
+    /// event. Measured: 8 MiB of one object written into a different 4096-byte
+    /// placeholder, its mark cleared, reported as `Hydrated`. Silent, durable,
+    /// cross-file corruption.
+    ///
+    /// Owning a `dup` fixes it at the root: the ghost writes into the file it
+    /// was actually fetching, which `abandon` has already punched.
+    fd: std::os::fd::OwnedFd,
 }
 
 /// After this many consecutive first-byte misses the fetcher is treated as
@@ -200,13 +214,24 @@ pub const WEDGED_LIMIT: std::time::Duration = std::time::Duration::from_secs(300
 impl Timed {
     fn new<F: Fetch + 'static>(mut fetch: F) -> Self {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Job>();
-        let (rep_tx, rep_rx) = std::sync::mpsc::channel();
+        // Bounded, because unbounded is an allocation in a root process that
+        // nothing refuses: a provider calling `progress` in a loop grew the
+        // worker from 3 MB to 11 GB in twelve seconds, with the heartbeat
+        // bumping the whole time so the supervisor stayed quiet. That is §8d's
+        // allocation problem, removed from the object path and reintroduced on
+        // the progress path.
+        //
+        // A full queue blocks the fetch thread rather than the worker, which is
+        // the right way round: the worker keeps its loop, and a provider that
+        // reports faster than anyone can listen is slowed rather than believed.
+        let (rep_tx, rep_rx) = std::sync::mpsc::sync_channel(64);
         std::thread::spawn(move || {
             while let Ok(job) = req_rx.recv() {
                 let tx = rep_tx.clone();
-                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(job.fd) };
+                use std::os::fd::AsFd;
+                let owned = job.fd;
                 let mut wrote = |buf: &[u8], off: u64| -> io::Result<()> {
-                    placeholder::write_at(borrowed, buf, off)
+                    placeholder::write_at(owned.as_fd(), buf, off)
                 };
                 let mut tick = |total: u64| {
                     let _ = tx.send((job.seq, Step::Progress(total)));
@@ -226,12 +251,13 @@ impl Timed {
             rep: rep_rx,
             seq: 0,
             missed: 0,
+            abandoned: 0,
             since: None,
         }
     }
 
     fn wedged(&self) -> bool {
-        self.missed >= WEDGED_AFTER
+        self.missed >= WEDGED_AFTER || self.abandoned >= WEDGED_AFTER
     }
 
     fn wedged_for(&self) -> std::time::Duration {
@@ -246,8 +272,21 @@ impl Timed {
         self.since.get_or_insert_with(std::time::Instant::now);
     }
 
+    /// A transfer that produced bytes and then had to be given up on.
+    ///
+    /// Counted separately from a first-byte miss, and both reach the same
+    /// verdict. A provider that sends one byte per event and returns would
+    /// otherwise never be judged unresponsive — every transfer "answered", every
+    /// transfer was abandoned, and §6a-bis's "come down rather than serve EIO
+    /// forever" was unreachable for that whole class.
+    fn abandoned_one(&mut self) {
+        self.abandoned += 1;
+        self.since.get_or_insert_with(std::time::Instant::now);
+    }
+
     fn answered(&mut self) {
         self.missed = 0;
+        self.abandoned = 0;
         self.since = None;
     }
 
@@ -266,6 +305,15 @@ impl Timed {
         limits: Limits,
         alive: &mut dyn FnMut(),
     ) -> Result<u64, TransferError> {
+        // Duplicated before the job is sent, so the transfer's descriptor
+        // outlives the worker's answer. See `Job::fd`.
+        let owned = {
+            let n = unsafe { libc::dup(fd) };
+            if n < 0 {
+                return Err(TransferError::Provider(io::Error::last_os_error()));
+            }
+            unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(n) }
+        };
         if self.wedged() {
             // Abandoned transfers keep running, and anything from one is proof
             // of life. Draining for it here is what keeps this from being a
@@ -289,7 +337,7 @@ impl Timed {
                 seq: want,
                 file,
                 size,
-                fd,
+                fd: owned,
             })
             .is_err()
         {
@@ -302,21 +350,21 @@ impl Timed {
         loop {
             alive();
             if began.elapsed() > limits.total {
-                self.missed_one();
+                self.abandoned_one();
                 return Err(TransferError::TooLong { got: moved, size });
             }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
-                self.missed_one();
-                return Err(if moved == 0 {
-                    TransferError::NoFirstByte
-                } else {
-                    TransferError::Stalled { got: moved, size }
-                });
+                if moved == 0 {
+                    self.missed_one();
+                    return Err(TransferError::NoFirstByte);
+                }
+                self.abandoned_one();
+                return Err(TransferError::Stalled { got: moved, size });
             }
             match self.rep.recv_timeout(left.min(HEARTBEAT)) {
                 Ok((got, _)) if got != want => continue,
-                Ok((_, Step::Progress(total))) => {
+                Ok((_, Step::Progress(total))) if total > moved => {
                     if moved == 0 {
                         // The first byte is the evidence that matters: it says
                         // the service is alive. A transfer that produced bytes
@@ -327,8 +375,24 @@ impl Timed {
                     moved = total;
                     deadline = std::time::Instant::now() + limits.stall;
                 }
+                // Progress that delivered nothing is not progress. Resetting the
+                // stall clock on it let a daemon sending zero-length chunks hold
+                // a read for the whole cap — measured at 2.3 million callbacks
+                // in three seconds — and the stall deadline never fired.
+                Ok((_, Step::Progress(_))) => continue,
                 Ok((_, Step::Done)) => {
                     self.answered();
+                    // §5.7, for the privileged trait as well as the
+                    // unprivileged one. `Body` holds a *provider* to the
+                    // object's length; nothing held a `Fetch` to it, so an
+                    // implementation that wrote half the object and returned
+                    // `Ok` produced a file that was half content and half zeros,
+                    // unmarked, reported as hydrated. The guarantee cannot live
+                    // only in the half of the stack that happens to be typed for
+                    // it.
+                    if moved != size {
+                        return Err(TransferError::Short { got: moved, size });
+                    }
                     return Ok(moved);
                 }
                 Ok((_, Step::Failed(e))) => {
@@ -375,6 +439,7 @@ impl Default for Limits {
 
 #[derive(Debug)]
 enum TransferError {
+    Short { got: u64, size: u64 },
     NoFirstByte,
     Stalled { got: u64, size: u64 },
     TooLong { got: u64, size: u64 },
@@ -386,6 +451,9 @@ enum TransferError {
 impl std::fmt::Display for TransferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Short { got, size } => {
+                write!(f, "delivered {got} of {size} bytes and claimed completion")
+            }
             Self::NoFirstByte => write!(f, "the provider sent nothing"),
             Self::Stalled { got, size } => write!(f, "stalled at {got} of {size} bytes"),
             Self::TooLong { got, size } => {
@@ -637,14 +705,10 @@ impl<F: Fetch + 'static> Worker<F> {
         // cannot clean it up, because it holds the event fd's *number* and not
         // the descriptor, so it can answer but not punch. The next transfer is
         // therefore the only place it can be done.
-        match placeholder::clear_residue(borrowed, size) {
-            Ok(true) => eprintln!("[worker] cleared residue from an interrupted transfer"),
-            Ok(false) => {}
-            Err(e) => {
-                return Handled::Failed {
-                    reason: format!("could not clear an interrupted transfer: {e}"),
-                }
-            }
+        if let Err(e) = placeholder::clear_residue(borrowed, size) {
+            return Handled::Failed {
+                reason: format!("could not clear an interrupted transfer: {e}"),
+            };
         }
 
         // Written through the event fd as the bytes arrive, never by re-opening

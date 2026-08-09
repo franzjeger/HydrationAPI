@@ -91,7 +91,7 @@ impl Fetch for SocketFetch {
         // body may be is decided here, before anything is read. The helper's own
         // `MAX_OBJECT` bounds it besides, because the delta pass's limit runs on
         // the side §6b assumes may be compromised.
-        match self.conn.recv_streamed(size, dest, progress)? {
+        match self.conn.recv_streamed(id, size, dest, progress)? {
             Streamed::Complete => Ok(()),
             Streamed::Aborted { errno, reason } => {
                 Err(io::Error::new(

@@ -439,7 +439,11 @@ pub enum Control {
 /// with being wrong about it.
 pub const MAX_CHUNK: u64 = 1 << 20;
 
-/// The largest object the *helper* will hydrate, whatever a placeholder claims.
+/// The largest object anything here will hydrate, whatever a placeholder claims.
+///
+/// 1 TiB: above any single file a consumer service holds, and far below the
+/// point where a sparse placeholder's promised length becomes a denial of
+/// service against the process that has to serve it.
 ///
 /// The delta pass already refuses absurd sizes, but that runs on the unprivileged
 /// side — the side §6b assumes may be compromised — so it is not a bound the root

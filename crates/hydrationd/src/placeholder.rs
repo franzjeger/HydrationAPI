@@ -413,23 +413,23 @@ pub fn abandon(fd: std::os::fd::BorrowedFd<'_>, expected: u64) -> io::Result<()>
     Ok(())
 }
 
-/// Clear any residue before a transfer starts.
+/// Clear whatever an interrupted transfer left, before the next one starts.
 ///
 /// A marked file that occupies disk cannot exist between transfers, but it is
 /// exactly what a crash mid-stream leaves — and the supervisor cannot clean it
 /// up, because it holds the event fd's *number* and not the descriptor. So the
 /// next transfer does it, which is the only place that can.
-pub fn clear_residue(fd: std::os::fd::BorrowedFd<'_>, expected: u64) -> io::Result<bool> {
-    use std::os::fd::AsRawFd;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if st.st_blocks == 0 {
-        return Ok(false);
-    }
-    punch_fd(fd, expected)?;
-    Ok(true)
+///
+/// Unconditional, and that is the point. The first version asked `st_blocks > 0`
+/// first, which walked straight back into the trap this module's own
+/// documentation records paying for once already: btrfs stores small files
+/// inline, so a fully punched 21-byte placeholder still reports blocks. Every
+/// small file would have reported residue on every ordinary read, and the log
+/// line saying so would have been false — corrosive to the one log §6c requires
+/// to be true. Punching a placeholder that has nothing in it costs one syscall
+/// and tells no lies.
+pub fn clear_residue(fd: std::os::fd::BorrowedFd<'_>, expected: u64) -> io::Result<()> {
+    punch_fd(fd, expected)
 }
 
 /// The same question asked of an open file rather than a name.
