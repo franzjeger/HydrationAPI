@@ -1316,7 +1316,13 @@ risikoprofil enn `ksmbd`-sammenligningen.
 7. Hydrering ved `FAN_PRE_ACCESS` — hele filen, ikke områder (se under).
 8. `FAN_MARK_IGNORE_SURV` på hydrerte filer, så de koster null.
 9. Endringsdeteksjon → debounce → opplasting, med de fem reglene i §5.
-10. Dehydrering: `PUNCH_HOLE` + fjern ignore-merke + sett nodump. Manuelt utløst i v1.
+10. Dehydrering: `PUNCH_HOLE` + fjern ignore-merke + sett nodump. **Mekanismen er
+   bygget og testet (7 tester), men ingen utløser er koblet til.** Det er ikke
+   glemt: en utløser utenfra må navngi en fil, og §6b sier at den privilegerte
+   siden aldri tar imot en destinasjon fra den uprivilegerte. Å løse det ordentlig
+   er en egen designrunde av samme slag som opprettelsen krevde, og å haste den
+   fram ville vært å gjenta feilen §6a-ter er en liste over. Inntil da kjøres
+   utkastelse bare fra konformanspakken.
 11. **Hydreringspolicy (§6c):** pidfd→cgroup, standardliste, `FAN_DENY_ERRNO(EPERM)`,
    synlig nektelseslogg.
 12. Konformanstestpakken. Alle åtte invariantene, pluss fail-closed-testen fra §6a.

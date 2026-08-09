@@ -237,6 +237,8 @@ pub struct Worker<F: Fetch> {
     /// Bounded, and bounded low: this is not a network timeout but the longest a
     /// filesystem operation anywhere on the mount may be stalled by us. §6a-bis.
     event_deadline: std::time::Duration,
+    /// So a denial count is announced when it changes rather than every loop.
+    reported_denials: usize,
     _fetch: std::marker::PhantomData<F>,
 }
 
@@ -264,6 +266,7 @@ impl<F: Fetch + 'static> Worker<F> {
             log: DenialLog::default(),
             in_flight,
             event_deadline,
+            reported_denials: 0,
             _fetch: std::marker::PhantomData,
         }
     }
@@ -512,6 +515,20 @@ impl<F: Fetch + 'static> Worker<F> {
         let mut buf = vec![0u8; 64 * 1024];
 
         while std::time::Instant::now() < until {
+            // §6c requires the denial log to be *visible*. A count kept in
+            // memory and never shown is the same failure as everything else
+            // here: something the user would want to know, known and not said.
+            // Reported when it changes, so a quiet system stays quiet and a
+            // backup sweep being refused announces itself.
+            let denials = self.log.entries().len();
+            if denials != self.reported_denials {
+                self.reported_denials = denials;
+                eprintln!(
+                    "[worker] hydration denied {denials} time(s) so far: {:?}",
+                    self.log.summary()
+                );
+            }
+
             // Stop rather than go on denying. Every reader has been answered —
             // the loop only reaches here between events — so nothing is left
             // hanging, and the supervisor takes the mount down from here.
