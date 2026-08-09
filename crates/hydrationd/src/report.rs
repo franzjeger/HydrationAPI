@@ -63,6 +63,27 @@ impl Dirty {
     }
 }
 
+/// Give the worker as many descriptors as it is allowed.
+///
+/// Each queued notify event costs a descriptor at `read()` time, and a backlog
+/// larger than the free-descriptor count does not overflow — it is silently
+/// truncated, one event destroyed per read boundary, with no `FAN_Q_OVERFLOW` to
+/// say so. Measured: at a soft limit of 64, 49 of 3000 events vanished without a
+/// marker. Raising the soft limit to the hard one is free and moves the failure
+/// into the band where the kernel *does* report an overflow, which the resync
+/// walk then heals.
+fn raise_fd_limit() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 && lim.rlim_cur < lim.rlim_max
+    {
+        lim.rlim_cur = lim.rlim_max;
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+    }
+}
+
 /// Both threads, running until the connection breaks.
 ///
 /// Spawned by the worker *after* `fork`. A thread that exists before a fork
@@ -81,7 +102,20 @@ impl Reporter {
         notifier: Notifier,
         batch_every: Duration,
     ) -> std::io::Result<Self> {
-        let dirty = Arc::new(Mutex::new(Dirty::default()));
+        // Starts out knowing it has missed something, so the very first batch
+        // carries a `Resync`.
+        //
+        // The daemon sets its own resync flag when it accepts the connection,
+        // and its walk can begin before the mark below is live — in which case
+        // edits in the gap produce no event and no later walk. Announcing a
+        // resync once the mark exists makes the ordering hold by construction
+        // rather than by luck.
+        let dirty = Arc::new(Mutex::new(Dirty {
+            lost: true,
+            ..Dirty::default()
+        }));
+
+        raise_fd_limit();
 
         let mut watcher = Watcher::new(mount, ignore_pids)?;
         let drain = Arc::clone(&dirty);
@@ -101,10 +135,24 @@ impl Reporter {
                         d.note(o.file, o.what);
                     }
                 }
-                // A watcher that cannot read has nothing left to contribute, and
-                // spinning on the error would burn a core. The daemon still has
-                // its periodic walk, which is what makes this survivable.
-                Err(_) => return,
+                // Read failures are usually `EMFILE`: every queued event costs
+                // a descriptor when it is read, so a large backlog against a low
+                // limit fails the whole read. Returning here was wrong twice
+                // over — it killed change detection permanently with no log
+                // line, in a worker that went on looking healthy, and it did so
+                // without recording that anything had been missed.
+                //
+                // Now it is treated as what it is: lost changes. The daemon is
+                // told to walk, and the drainer keeps going, because the
+                // condition is transient — the backlog drains as the kernel
+                // discards it.
+                Err(e) => {
+                    eprintln!("[worker] change detection lost events: {e}");
+                    if let Ok(mut d) = drain.lock() {
+                        d.lost = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
             }
         });
 
@@ -115,6 +163,9 @@ impl Reporter {
                 let Ok(mut d) = send.lock() else { return };
                 d.take()
             };
+            if !lost && files.is_empty() {
+                continue;
+            }
             // Resync first. It says "what follows is incomplete", and a daemon
             // that acted on the batch before hearing that would believe it had
             // the whole story for a moment.

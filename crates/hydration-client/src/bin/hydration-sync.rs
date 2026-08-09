@@ -104,6 +104,7 @@ fn default_socket() -> PathBuf {
 struct QueueChanges {
     queue: Arc<Mutex<Queue<SystemClock>>>,
     resync: Arc<AtomicBool>,
+    exposures: Arc<Mutex<Vec<String>>>,
 }
 
 impl Changes for QueueChanges {
@@ -111,6 +112,12 @@ impl Changes for QueueChanges {
         let Ok(mut q) = self.queue.lock() else { return };
         for f in files {
             q.touch(*f);
+        }
+    }
+
+    fn exposed(&mut self, mounts: &[String]) {
+        if let Ok(mut e) = self.exposures.lock() {
+            *e = mounts.to_vec();
         }
     }
 
@@ -122,13 +129,25 @@ impl Changes for QueueChanges {
     }
 }
 
-/// Everything in the sync directory that no longer looks the way the framework
-/// left it.
+/// Everything in the sync directory the framework has not sent in its current
+/// form.
 ///
-/// Deliberately not "everything with a cloud id", and deliberately not
-/// "everything": a file the framework has never written is the user's own and is
-/// left to change detection, or it would be queued for upload on every resync
-/// forever. Only files that were once clean and are no longer count.
+/// Two kinds, and the second one took a review to see:
+///
+/// - **Dirty** — stamped, and no longer matching. An ordinary in-place edit that
+///   nobody told us about.
+/// - **Unstamped with content and no cloud id** — a file the framework has never
+///   made clean. That covers a file the user simply created, and it also covers
+///   the shape most editors actually use: write a temporary file, rename it over
+///   the target. A rename replaces the inode, and the stamp lives on the inode,
+///   so the replacement carries neither stamp nor cloud id. The event path
+///   catches those; the resync walk exists precisely for when the event path
+///   did not, and it was skipping the most common edit shape there is.
+///
+/// This does not queue the world, because everything the framework has placed,
+/// hydrated or uploaded is stamped — so an unstamped file with content is, by
+/// construction, one that has never been sent. It also retries uploads that
+/// failed, which nothing else does.
 fn dirty_files(root: &std::path::Path) -> io::Result<Vec<FileId>> {
     use hydration_protocol::stamp::{self, State};
     use std::os::unix::fs::MetadataExt;
@@ -151,7 +170,31 @@ fn dirty_files(root: &std::path::Path) -> io::Result<Vec<FileId>> {
             {
                 continue;
             }
-            if matches!(stamp::state(&path), Ok(State::Dirty)) {
+            let worth_sending = match stamp::state(&path) {
+                Ok(State::Dirty) => true,
+                Ok(State::Unstamped) => {
+                    // A placeholder is never "unsent content" — it has no
+                    // content — and reading one to upload it would hydrate the
+                    // very file we are trying to leave alone.
+                    md.len() > 0
+                        && !matches!(
+                            hydration_client::store::get_xattr(
+                                &path,
+                                hydration_protocol::xattr::DEHYDRATED
+                            ),
+                            Ok(Some(_))
+                        )
+                        && !matches!(
+                            hydration_client::store::get_xattr(
+                                &path,
+                                hydration_client::store::XATTR_ID
+                            ),
+                            Ok(Some(_))
+                        )
+                }
+                _ => false,
+            };
+            if worth_sending {
                 out.push(FileId {
                     fsid: md.dev(),
                     ino: md.ino(),
@@ -192,6 +235,8 @@ fn main() -> io::Result<()> {
     // Set when the helper says its change channel has a hole in it, so the
     // upload driver walks instead of trusting what it was told.
     let resync = Arc::new(AtomicBool::new(true));
+    // Reported by the helper, shown by the status thread. §6.4a.
+    let exposures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Unix socket paths are capped at roughly 108 bytes by the kernel, which is
     // short enough to hit with an ordinary XDG_RUNTIME_DIR under a long home.
@@ -347,7 +392,12 @@ fn main() -> io::Result<()> {
 
     // Status, and the manifest that makes a backup honest.
     {
-        let (q, stop, mount) = (Arc::clone(&queue), Arc::clone(&stop), args.mount.clone());
+        let (q, stop, mount, exposures) = (
+            Arc::clone(&queue),
+            Arc::clone(&stop),
+            args.mount.clone(),
+            Arc::clone(&exposures),
+        );
         std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 if let Ok(m) = Manifest::build(&mount) {
@@ -360,6 +410,20 @@ fn main() -> io::Result<()> {
                         q.lock().unwrap().pending(),
                         hydration_client::manifest::status_line(BackupPolicy::Exclude, m.len())
                     );
+                    // §6.4a. Not a log detail: another mount over the same files
+                    // bypasses hydration entirely, and anything reading through
+                    // it gets the zeros a placeholder is made of. The framework
+                    // cannot prevent it, so the one thing it owes the user is
+                    // that it never happens quietly.
+                    let seen = exposures.lock().unwrap();
+                    if !seen.is_empty() {
+                        eprintln!(
+                            "hydration-sync: WARNING — {} other mount(s) expose these files \
+                             and bypass hydration: {:?}",
+                            seen.len(),
+                            *seen
+                        );
+                    }
                 }
                 std::thread::sleep(Duration::from_secs(30));
             }
@@ -386,6 +450,7 @@ fn main() -> io::Result<()> {
                 daemon.on_change(Box::new(QueueChanges {
                     queue: Arc::clone(&queue),
                     resync: Arc::clone(&resync),
+                    exposures: Arc::clone(&exposures),
                 }));
                 let mut c = DaemonConn::new(conn)?;
                 if let Err(e) = daemon.serve(&mut c) {

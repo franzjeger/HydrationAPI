@@ -1235,9 +1235,21 @@ og en placeholder som ble stående som `Dirty` ville blitt nektet oppfrisking av
 delta-passet *og* lagt i opplastingskø av en resync-vandring — der opplasting
 betyr å lese den, og å lese den hydrerer den tilbake.
 
-`Unstamped` er bevisst ikke det samme som `Dirty`: en fil rammeverket aldri har
-skrevet er brukerens egen, og å kalle den «endret» ville lagt hele katalogen i
-opplastingskø ved første resync.
+`Unstamped` er bevisst ikke det samme som `Dirty` for delta-passets del: en fil
+rammeverket aldri har skrevet må ikke overskrives. Men for *opplastingsretningen*
+er den signalet som mangler, og det tok en gjennomgang å se. De fleste editorer
+skriver ved å lage en midlertidig fil og døpe den over målet. En omdøping bytter
+inoden, og stempelet ligger på inoden — så erstatningen bærer verken stempel
+eller sky-id. Hendelsesstien fanger dem; resync-vandringen, som finnes nettopp
+for når hendelsesstien ikke gjorde det, hoppet over den vanligste redigeringsformen
+som finnes.
+
+Vandringen tar nå to slag: `Dirty`, og `Unstamped` med innhold og uten sky-id.
+Det andre er per definisjon en fil rammeverket aldri har *sendt* — enten fordi
+brukeren nettopp laget den, eller fordi en omdøping erstattet en som var sendt.
+Det legger ikke hele katalogen i kø, fordi alt rammeverket har plassert, hydrert
+eller lastet opp er stemplet. Det henter også opp opplastinger som feilet, som
+ingenting annet gjorde.
 
 Kanalen sier fra når den har hull. `FromHelper::Resync` sendes ved køoverløp —
 markøren kommer uten deskriptor og ble tidligere kastet sammen med alt annet
@@ -1347,6 +1359,19 @@ lesing av en fil med innhold. To konsekvenser:
 ---
 
 ## 9. Det jeg ikke fikk verifisert
+
+**Gjenopprettingskjeden i systemd-enhetene.** Hjelperen avslutter med en
+feilkode når den ikke kan komme seg — en fastlåst henter, eller en synk-daemon
+som forsvant. Den kobler fra monteringen først, siden det å avslutte ville lukket
+fanotify-gruppen, og en merket montering uten gruppe feiler *åpent*. Tanken er at
+`Restart=always` henter den opp igjen og `BindsTo` drar monteringen med.
+Usikkerheten er om systemd behandler stoppet som `BindsTo` utløser som en
+*bevisst* stopp, som ville undertrykt omstarten, framfor som den feilen
+exitkoden melder. Det er ikke testet mot en kjørende systemd, og hvis det slår
+feil trenger enheten en eksplisitt omstartssti framfor denne kjeden.
+
+Det finnes ingen gjentilkobling i prosessen. En klientomstart overlever ved at
+paret bygges opp på nytt, ikke ved at forbindelsen repareres.
 
 I ærlighetens navn, siden dette skal være beslutningsgrunnlag:
 

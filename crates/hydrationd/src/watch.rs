@@ -110,7 +110,13 @@ impl Watcher {
             return Ok(Vec::new());
         }
 
-        let mut buf = vec![0u8; 64 * 1024];
+        // Deliberately small. Every event in a batch costs a descriptor for the
+        // length of the loop below, and a batch larger than the free-descriptor
+        // count is silently truncated rather than refused — one event destroyed
+        // per read boundary, with no overflow marker. 16 KiB is about 680
+        // events, which sits well under a default limit even with the rest of
+        // the process's descriptors in use.
+        let mut buf = vec![0u8; 16 * 1024];
         let len = self.group.read_events(&mut buf)?;
         let mut out = Vec::new();
 

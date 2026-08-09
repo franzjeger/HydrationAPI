@@ -96,6 +96,13 @@ pub trait Changes: Send {
     fn changed(&mut self, files: &[FileId]);
     /// The change channel has a hole in it; walk the directory instead.
     fn resync(&mut self);
+    /// Other mounts now expose the sync files (§6.4a).
+    ///
+    /// Defaulted, because a client that does nothing with it still works — but
+    /// §6.4a is explicit that the framework cannot prevent this and therefore
+    /// owes the user visibility, so a client that leaves it defaulted is
+    /// choosing not to tell them.
+    fn exposed(&mut self, _mounts: &[String]) {}
 }
 
 impl<P: Provider> Daemon<P> {
@@ -166,6 +173,9 @@ impl<P: Provider> Daemon<P> {
                     Err(refusal) => conn.send(refusal.into_response(req.id))?,
                 },
                 FromHelper::ExposureChanged { mounts } => {
+                    if let Some(sink) = self.changes.as_mut() {
+                        sink.exposed(&mounts);
+                    }
                     self.exposures = mounts;
                 }
                 FromHelper::Changed { files } => {

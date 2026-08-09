@@ -18,6 +18,9 @@ Documentation=https://github.com/franzjeger/HydrationAPI
 # So the mount goes with the helper. With no helper the files are *unreachable*,
 # which is a bad afternoon; without this line they are readable and full of
 # zeros, which is a restore from backup.
+# BindsTo implies Requires, so starting this pulls the mount in; and the mount
+# going away takes this with it, which is what stops a marked mount from
+# outliving the process that answers its events.
 BindsTo=hydration-mount.mount
 After=hydration-mount.mount
 StopPropagatedFrom=hydration-mount.mount
@@ -25,6 +28,21 @@ StopPropagatedFrom=hydration-mount.mount
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/hydrationd --mount /home/CHANGE-ME/OneDrive --socket /run/user/CHANGE-ME/hydration-sync.sock --peer-uid CHANGE-ME
+# The helper exits non-zero when it cannot recover: a wedged fetcher, or a sync
+# daemon that went away and left it with no way to fetch anything. Before
+# exiting it detaches the mount itself, because exiting first would close the
+# fanotify group and a marked mount with no group fails *open* — every
+# placeholder becomes a source of zeros.
+#
+# The intended chain is: helper detaches and exits non-zero -> Restart=always
+# brings it back -> BindsTo pulls the mount up again -> it reconnects to the
+# sync daemon on startup. That is how a client restart is survived; there is no
+# in-process reconnect path.
+#
+# NOT VERIFIED against a running systemd (see DESIGN.md §9). The uncertainty is
+# whether systemd treats the BindsTo-driven stop as a deliberate stop, which
+# would suppress the restart, rather than as the failure the exit code reports.
+# If it does, the unit needs an explicit restart path rather than this chain.
 Restart=always
 RestartSec=1
 

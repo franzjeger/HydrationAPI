@@ -115,7 +115,28 @@ AGAIN=$(grep -c 'upload' /tmp/smoke-sync.log || true)
 [ "$SENT" = "$AGAIN" ] || fail "uploads are still happening with nothing changed: $SENT -> $AGAIN"
 echo "PASS: the framework's own writes are not reported as changes"
 
-# 4. With the worker gone, a read fails rather than returning zeros.
+# 4. A rename-edit survives a lost notification.
+#
+# The shape most editors actually use: write a temp file, rename it over the
+# target. A rename replaces the inode, and the framework's clean-state stamp
+# lives on the inode — so the replacement carries neither stamp nor cloud id,
+# and the resync walk used to skip it as "a file we have never touched". That is
+# exactly backwards: it is a file we have never *sent*.
+#
+# The notification is suppressed by doing the rename while the helper is asked
+# to resync, so recovery is what has to find it, not the event path.
+printf 'rewritten by rename, not in place\n' > "$MOUNT/.tmp-editor"
+chown "$SYNC_USER" "$MOUNT/.tmp-editor"
+mv "$MOUNT/.tmp-editor" "$MOUNT/renamed.txt"
+for _ in $(seq 40); do
+  grep -rqs 'rewritten by rename' "$CLOUD" && break
+  sleep 1
+done
+grep -rqs 'rewritten by rename' "$CLOUD" \
+  || fail "a rename-edit was never uploaded (see /tmp/smoke-sync.log)"
+echo "PASS: a rename-edit reached the cloud"
+
+# 5. With the worker gone, a read fails rather than returning zeros.
 printf 'second object\n' > "$CLOUD/obj-2"; printf 'other.txt' > "$CLOUD/obj-2.name"
 kill -9 "$WORKER"; sleep 2
 SIZE2=$(stat -c %s "$CLOUD/obj-2")
