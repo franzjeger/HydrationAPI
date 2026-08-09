@@ -697,6 +697,67 @@ ikke henging. Og: drep begge, krev at monteringspunktet er borte innen N sekunde
 
 ---
 
+## 6a-bis. En hengt arbeider er verre enn en død arbeider
+
+Funnet under implementasjonen, og det utvider §6a på en måte designet ikke
+forutså.
+
+**En prosess som står i en pre-content-hendelse kan ikke drepes med et signal.**
+Hendelsen må besvares først. Målt: `SIGKILL` mot en blokkert leser gjør
+ingenting; prosessen blir reapbar først når noen svarer på hendelsen, eller når
+gruppen lukkes.
+
+Konsekvensen er ubehagelig. §6a løser at arbeideren *dør* — vakten holder gruppen
+og nekter. Den løser ikke at arbeideren **henger**: da står hendelsen ubesvart,
+prosessen kan ikke drepes, og gruppen kan ikke lukkes fordi den døde prosessen
+fortsatt holder sin deskriptor. Hver senere operasjon på monteringen blokkerer,
+inkludert `ftruncate` og filoppretting. «Start daemonen på nytt» er ikke et
+tilgjengelig svar.
+
+Det skjedde flere ganger under utviklingen, og hver gang var symptomet det samme:
+monteringen så frisk ut, `mountpoint` sa ja, `touch` virket, og alt annet hang.
+
+**Hva som må inn i v1:**
+
+- Arbeideren må ha en **tidsfrist per hendelse**. Går fetch over den, svarer den
+  `EIO` og går videre. En treg sky er ikke en grunn til å låse et filsystem.
+- Vakten må overvåke *fremdrift*, ikke bare liv. En arbeider som ikke har svart
+  på noe på N sekunder skal behandles som død: vakten svarer på det som står i
+  `InFlight` og tar over.
+- Monteringen må rives ned når enheten ikke kan gjenopprettes. `BindsTo=` fra §6a
+  dekker dette, og er nå begrunnet av to ting i stedet for én.
+
+---
+
+## 6a-ter. Å skrive inn i en merket montering er prosjektets skarpeste kant
+
+Samme feil har oppstått **fire ganger, i fire forkledninger**, hver gang av noen
+som visste om de tre foregående:
+
+| Hvor | Hva som ble skrevet |
+|---|---|
+| Arbeiderens hydrering | åpnet stien på nytt for å fylle filen |
+| Dehydrering | punchet hull uten et ignore-merke |
+| Utkastelsestesten | fylte filen etter at monteringen var merket |
+| `eventtrace`-proben | laget placeholderen etter markeringen |
+
+Formen er alltid den samme: **en skriving inne i en merket montering, utført av
+den eneste prosessen som kunne besvart hendelsen den utløser.** Resultatet er en
+permanent låsing, uten feilmelding, med en handler som ser helt frisk ut i
+`poll()`.
+
+Fire ganger er ikke fire slurvefeil. Det er formen på APIet, og rammeverket må
+gjøre den umulig å treffe framfor å advare mot den:
+
+- Skriv aldri ved å åpne en sti inne i den merkede monteringen. Bruk hendelsens
+  egen fd, som ikke avskjæres — det er derfor kjernen gir den fra seg.
+- Der en sti må åpnes, skal ignore-merket settes først og fjernes etterpå, og de
+  to skal ligge inne i samme funksjon. `evict()` gjør det; ingen skal kunne
+  sekvensere det selv.
+- Testrigger skal opprette og fylle filer **før** monteringen merkes.
+
+---
+
 ## 6b. Privilegieseparasjon
 
 Dette er skissert i §4 og skal stå som et krav, ikke en illustrasjon:
@@ -919,16 +980,19 @@ risikoprofil enn `ksmbd`-sammenligningen.
    Kravet i §6.4a kan ikke håndheves, bare oppdages — og da skal det ikke være stille.
 3. **Super/worker-delt privilegert hjelper med fail-closed-vakt (§6a).** Ikke valgfritt —
    uten den er arkitekturen usikrere enn FUSE.
-4. **Privilegieseparasjon med spesifisert protokoll (§6b).** Root-siden ser aldri et token.
-5. Placeholder: sparsom fil, riktig størrelse, sky-ID og modus i xattr, `chattr +d`.
-6. Hydrering ved `FAN_PRE_ACCESS` — hele filen, ikke områder (se under).
-7. `FAN_MARK_IGNORE_SURV` på hydrerte filer, så de koster null.
-8. Endringsdeteksjon → debounce → opplasting, med de fem reglene i §5.
-9. Dehydrering: `PUNCH_HOLE` + fjern ignore-merke + sett nodump. Manuelt utløst i v1.
-10. **Hydreringspolicy (§6c):** pidfd→cgroup, standardliste, `FAN_DENY_ERRNO(EPERM)`,
+4. **Tidsfrist per hendelse, og en vakt som overvåker fremdrift (§6a-bis).** En hengt
+   arbeider kan ikke drepes og låser hele monteringen; det er en annen feil enn en
+   død arbeider, og §6a dekker bare den siste.
+5. **Privilegieseparasjon med spesifisert protokoll (§6b).** Root-siden ser aldri et token.
+6. Placeholder: sparsom fil, riktig størrelse, sky-ID og modus i xattr, `chattr +d`.
+7. Hydrering ved `FAN_PRE_ACCESS` — hele filen, ikke områder (se under).
+8. `FAN_MARK_IGNORE_SURV` på hydrerte filer, så de koster null.
+9. Endringsdeteksjon → debounce → opplasting, med de fem reglene i §5.
+10. Dehydrering: `PUNCH_HOLE` + fjern ignore-merke + sett nodump. Manuelt utløst i v1.
+11. **Hydreringspolicy (§6c):** pidfd→cgroup, standardliste, `FAN_DENY_ERRNO(EPERM)`,
    synlig nektelseslogg.
-11. Konformanstestpakken. Alle åtte invariantene, pluss fail-closed-testen fra §6a.
-12. `FAN_DENY_ERRNO(EIO)` ved nedlastingsfeil — aldri stille nuller.
+12. Konformanstestpakken. Alle åtte invariantene, pluss fail-closed-testen fra §6a.
+13. `FAN_DENY_ERRNO(EIO)` ved nedlastingsfeil — aldri stille nuller.
 
 **Utenfor v1, bevisst:**
 - **Områdevis hydrering.** Hendelsen gir `offset`/`count`, men målingen viste at
