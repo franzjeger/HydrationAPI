@@ -703,6 +703,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydration-graph"
+version = "0.1.0"
+dependencies = [
+ "hydration-client",
+ "hydration-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hydration-protocol"
 version = "0.1.0"
 dependencies = [

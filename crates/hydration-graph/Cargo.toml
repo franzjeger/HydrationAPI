@@ -1,0 +1,15 @@
+[package]
+name = "hydration-graph"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Microsoft Graph delta feed to hydration-client namespace items"
+
+[dependencies]
+hydration-client = { path = "../hydration-client" }
+hydration-protocol = { path = "../hydration-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"
