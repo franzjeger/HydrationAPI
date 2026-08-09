@@ -781,7 +781,7 @@ ferdig. Målt på 6.17 (`probes/tmpfile.c`):
 
 ```
 events after create:            0
-events observed while sizing:   1   <- nlink=0, byggemerket satt
+events observed while sizing:   1   <- nlink=0, size=0
 events during linkat:           0
 result: size=4096 blocks=0, dehydrated mark present
 ```
@@ -873,6 +873,53 @@ gjør at et kompromittert klientdaemon ikke blir root.
 
 Presedensen er `fusermount3`, som er setuid root på denne maskinen av nøyaktig samme
 grunn: en liten, revidert bro over et privilegiegjerde.
+
+---
+
+### Hvem grensen faktisk går mot
+
+Fiksen over reiste et spørsmål den ikke besvarte, og det må stå eksplisitt i
+kontrakten framfor å ligge underforstått: **er en kompromittert `hydration-sync`,
+som kjører som brukeren, i omfang for garantien om at ingen lesing stille
+returnerer nuller?**
+
+Anbefalingen er **nei**, og grunnen er ikke bekvemmelighet:
+
+- Merket `user.hydration.dehydrated` er det som forteller arbeideren at en fil er
+  en placeholder. Alle `user.*`-attributter kan skrives av enhver prosess med
+  filens uid. Fjernes merket, konkluderer arbeideren med at innholdet allerede er
+  der, og serverer hullet. **Målt og testfestet**
+  (`stripping_the_placeholder_mark_does_not_permanently_disable_interception`).
+- Det er ingen ny evne. Den samme prosessen kan skrive nuller rett over filen.
+  Forskjellen er at merkefjerning er stillere: ingen byte skrives, så mtime står
+  stille, ingen opplasting utløses, og ingen disk brukes.
+- Å lukke det krever at merket ligger i `trusted.*`, som krever `CAP_SYS_ADMIN` å
+  skrive. Da må hjelperen sette merket, altså delta i opprettelsen — og da er vi
+  tilbake til nøyaktig eskaleringen §6a-ter nettopp fjernet: root som går en
+  daemon-valgt sti, og `mode = 06755` som blir en setuid-root-binær.
+
+Grensen rammeverket **faktisk** håndhever er derfor smalere, og verdt å si rett
+ut:
+
+> Den privilegerte hjelperen blir aldri en skriv-hvor-som-helst-som-root-primitiv,
+> og en lesing returnerer aldri nuller på grunn av **svikt** — daemon-død,
+> nettverksfeil, hengt arbeider, policy-avslag. Mot en *ondsinnet prosess med
+> brukerens egen uid* er ikke rammeverket et forsvar, fordi den prosessen eier
+> filene uansett.
+
+Det som likevel ble gjort, fordi det er billig og begrenser skaden: arbeideren
+setter **ikke** lenger et permanent ignore-merke på en fil som oppgir størrelse
+men ikke opptar disk. Uten det ble én xattr-fjerning til stille nuller *for
+alltid*, uten videre involvering og uten noe å observere. Nå varer skaden bare så
+lenge merket er borte, og filen leges når merket kommer tilbake. Prisen er en
+rundtur per lesing av en ekte sparse hydrert fil, som er sjelden og er den trygge
+retningen å ta feil i. Det når ikke små filer — btrfs lagrer dem inline, så en
+strippet liten placeholder oppgir fortsatt blokker.
+
+**Hvis dette svaret er feil**, er konsekvensen en egen designrunde: merket må
+flyttes til `trusted.*`, hjelperen må sette det, og opprettelsen må tilbake over
+privilegiegrensen med de kostnadene §6a-ter beskriver. Det er ikke en liten
+endring, og derfor står valget her framfor i en commit-melding.
 
 ---
 
@@ -1088,6 +1135,30 @@ risikoprofil enn `ksmbd`-sammenligningen.
 - Multikonto, delte mapper, båndbreddegrenser, kryptering — som du sa.
 - Automatisk utkastelse ved diskpress.
 - Andre filsystemer enn ext4/btrfs/xfs.
+
+---
+
+## 8a. En lesing forbi EOF utløser en hendelse
+
+Verdt å skrive ned fordi antagelsen om det motsatte er nærliggende og feil.
+`probes/emptyread.c`, 6.17:
+
+```
+empty (0)      size=0     events=1  read completed
+sized (4096)   size=4096  events=1  read completed
+```
+
+En lesing av en fil uten byte fyrer altså en pre-content-hendelse, akkurat som en
+lesing av en fil med innhold. To konsekvenser:
+
+- **Enhver tom fil i synkkatalogen koster en rundtur** ved første lesing, til
+  ignore-merket settes. Uunngåelig, og billig.
+- **Tom-fil-regelen i §6a-ter mister ingen kappløp**, men ikke av den grunnen man
+  først tror. Den blokkerte leseren finnes. Det som lukker det er at regelen bare
+  gjelder inoder uten navn: en placeholder med innhold har `st_size > 0` og
+  treffer aldri grenen, og en anonym inode har ikke noe skyobjekt å hente. Det
+  finnes altså ingen tilstand der regelen hopper over en hydrering som skulle
+  skjedd.
 
 ---
 

@@ -420,3 +420,88 @@ fn set_xattr(p: &std::path::Path, name: &str, v: &[u8]) {
     };
     assert_eq!(rc, 0, "setxattr failed: {}", io::Error::last_os_error());
 }
+
+/// The other direction of the same attack, and the harder one.
+///
+/// The forged-mark test above covers *adding* an xattr the helper trusts. This
+/// covers *removing* one: `user.hydration.dehydrated` is what tells the worker a
+/// file is a placeholder, and it is owner-writable like every `user.*` attribute.
+/// Strip it and the worker concludes the content is already present.
+///
+/// A same-uid attacker could overwrite the file with zeros directly, so this is
+/// not a new capability — but it is a quieter one: no bytes are written, so the
+/// mtime does not change, no upload is triggered, and no disk is used. What this
+/// test pins down is the blast radius: the read must not become permanently
+/// zero-serving, so that restoring the mark restores the file.
+#[test]
+fn stripping_the_placeholder_mark_does_not_permanently_disable_interception() {
+    let Some(mnt) = mount() else {
+        skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
+        return;
+    };
+    let target = mnt.join("stripped-mark.bin");
+    let _ = std::fs::remove_file(&target);
+    std::fs::write(&target, vec![0u8; 4096]).expect("seed");
+    hydrationd::placeholder::dehydrate(&target).expect("dehydrate");
+
+    let group = Group::new_pre_content().expect("pre-content group");
+    group.mark_mount(&mnt).expect("mark");
+    let mut worker = Worker::new(
+        group.try_clone().expect("clone"),
+        Canned(b"HYDRATED-CONTENT".to_vec()),
+        Policy::permissive(),
+        InFlight::new(),
+    );
+
+    // The attack: one xattr removal, no privilege, no race.
+    remove_xattr(&target, "user.hydration.dehydrated");
+    read_through(&mut worker, &target);
+
+    // Restoring the mark must restore interception. If the first read installed
+    // a surviving ignore mark, it will not — and the file is silently zeros
+    // forever, with no further attacker involvement and nothing to observe.
+    hydrationd::placeholder::mark_dehydrated(&target, true).expect("re-mark");
+    let out = read_through(&mut worker, &target);
+    assert!(
+        out.starts_with(b"HYDRATED"),
+        "restoring the placeholder mark did not restore interception: one xattr \
+         removal disabled hydration for this file permanently"
+    );
+
+    let _ = std::fs::remove_file(&target);
+}
+
+/// Read `path` in a child while the worker answers, and return what it got.
+fn read_through(worker: &mut Worker<Canned>, path: &std::path::Path) -> Vec<u8> {
+    let out = path.with_extension("readback");
+    let _ = std::fs::remove_file(&out);
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        let got = std::fs::read(path).unwrap_or_default();
+        // Written outside the marked mount, so recording the answer does not
+        // itself fire an event that nobody is left to answer.
+        let _ = std::fs::write(std::env::temp_dir().join("hydration-readback"), &got);
+        unsafe { libc::_exit(0) };
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut status = 0;
+    while Instant::now() < deadline {
+        let _ = worker.run(Instant::now() + Duration::from_millis(200));
+        if unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) } == child {
+            return std::fs::read(std::env::temp_dir().join("hydration-readback"))
+                .unwrap_or_default();
+        }
+    }
+    unsafe {
+        libc::kill(child, libc::SIGKILL);
+        libc::waitpid(child, &mut status, 0);
+    }
+    panic!("the read never completed");
+}
+
+fn remove_xattr(p: &std::path::Path, name: &str) {
+    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    let n = std::ffi::CString::new(name).unwrap();
+    let rc = unsafe { libc::removexattr(c.as_ptr(), n.as_ptr()) };
+    assert_eq!(rc, 0, "removexattr failed: {}", io::Error::last_os_error());
+}

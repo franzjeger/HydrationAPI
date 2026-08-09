@@ -130,8 +130,42 @@ impl<F: Fetch> Worker<F> {
                 // Content is already there. Suppress future events for it —
                 // this is the zero-cost claim in §2.4, and without it every
                 // read of every hydrated file pays a round trip forever.
+                //
+                // Except when the file does not look like it has content. A
+                // sized file occupying no disk is either genuinely sparse or a
+                // placeholder whose mark was removed, and the helper cannot tell
+                // which: `user.hydration.dehydrated` is owner-writable, so a
+                // same-uid process can strip it and make this branch serve the
+                // hole as though it were content.
+                //
+                // That is not a new capability — the same process could write
+                // zeros over the file directly — but the ignore mark would make
+                // it *permanent* and unobservable, surviving every later read
+                // with no further involvement. Declining to install it bounds
+                // the damage to the reads that actually happen while the mark is
+                // missing, so restoring the mark restores the file. The price is
+                // a round trip per read of a genuinely sparse hydrated file,
+                // which is rare and is the safe direction to be wrong in.
+                //
+                // It is a limit, not a fix, and it does not reach small files:
+                // btrfs stores those inline, so a stripped small placeholder
+                // still reports blocks and still gets the mark. See §6b for why
+                // the underlying hole cannot be closed without taking placeholder
+                // creation back across the privilege boundary.
                 if let Some(p) = &path {
-                    let _ = self.group.ignore(p);
+                    if self.looks_stripped(ev.fd) {
+                        // The reader's cgroup is deliberately not looked up: the
+                        // pidfd is consumed by the policy check further down,
+                        // and who read it is not the point. What is worth
+                        // recording is that a file in this state was served.
+                        self.log.record(
+                            "-",
+                            "sized file occupying no disk; not suppressing future events",
+                            Some(p),
+                        );
+                    } else {
+                        let _ = self.group.ignore(p);
+                    }
                 }
                 return Handled::AlreadyPresent;
             }
@@ -220,6 +254,19 @@ impl<F: Fetch> Worker<F> {
                 reason: format!("hydration refused: {e}"),
             },
         }
+    }
+
+    /// A file that claims a size but occupies no disk.
+    ///
+    /// Ambiguous by construction — a legitimately sparse hydrated file looks
+    /// exactly like a placeholder someone stripped the mark from — so this is
+    /// only ever used to withhold an optimisation, never to decide an answer.
+    fn looks_stripped(&self, fd: i32) -> bool {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } < 0 {
+            return false;
+        }
+        st.st_size > 0 && st.st_blocks == 0
     }
 
     /// `Some(Empty)` when there is provably nothing to serve.

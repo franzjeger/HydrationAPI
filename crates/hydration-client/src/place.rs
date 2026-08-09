@@ -22,17 +22,24 @@
 //!
 //! ```text
 //!   events after create:            0
-//!   events observed while sizing:   1   <- nlink=0, construction mark set
+//!   events observed while sizing:   1   <- nlink=0, size=0
 //!   events during linkat:           0
 //!   result: size=4096 blocks=0, dehydrated mark present
 //! ```
 //!
-//! So sizing is *not* silent, and the one event it fires is what
-//! [`hydrationd`'s worker rule] answers: an inode with `nlink == 0` carrying the
-//! construction mark has no reader that could be served wrong data, because
-//! nothing can open it. Everything else about the placeholder — its xattrs, its
-//! mode, its identity — is set before it has a name, and is therefore never
-//! observable in a half-built state.
+//! So sizing is *not* silent. The one event it fires is answered by the worker
+//! on a property rather than a claim: the event precedes the truncate taking
+//! effect, so the inode is still **empty** when the worker looks, and an empty
+//! file has no bytes that a reader could be served instead of real content.
+//! Allowing it is not a shortcut past hydration — it is what hydrating a
+//! zero-length file would do.
+//!
+//! An earlier version of this module set a `user.hydration.building` xattr and
+//! the worker trusted it. That was exploitable: every `user.*` attribute is
+//! writable by any process sharing the file's uid, so forging it on a real
+//! placeholder, letting a reader block on it and then unlinking it made the
+//! helper serve zeros. The rule has to rest on something the file *is*, not on
+//! something someone *says*.
 //!
 //! [`hydrationd`'s worker rule]: ../../hydrationd/daemon/struct.Worker.html
 //!
