@@ -2458,3 +2458,249 @@ fn item_id(item: &Item) -> &str {
         Item::Root { id } | Item::Upsert { id, .. } | Item::Delete { id } => id,
     }
 }
+
+// ---------------------------------------------------------------------------
+// The write seam
+//
+// The read half sends typed requests through `PageSource` because everything it
+// has to prove is about *which page* was asked for. The write half has to prove
+// things about the request itself — which URL an update was addressed at,
+// whether a create declared a conflict behaviour, which `if-match` a
+// conditional write carried, what a fragment's `content-range` said, and
+// whether the account credential was attached — so its seam is one request and
+// one reply, and the sink builds both.
+//
+// Same three properties as the read seam: injected, so no socket; recording, so
+// the *interleaving* of a request and a sleep is observable; and scriptable, so
+// the wrong branch can be made to succeed and only the log tells right from
+// wrong.
+// ---------------------------------------------------------------------------
+
+/// The verbs the write half uses.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Method {
+    Get,
+    Put,
+    Post,
+    Delete,
+}
+
+impl Method {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Method::Get => "GET",
+            Method::Put => "PUT",
+            Method::Post => "POST",
+            Method::Delete => "DELETE",
+        }
+    }
+}
+
+/// One request, as the sink hands it to the transport.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Request {
+    pub method: Method,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// Whether the transport may attach the account's bearer token.
+    ///
+    /// The decision belongs to the sink, not to the transport, because the sink
+    /// is the only layer that knows where a URL came from. An upload session's
+    /// `uploadUrl` is named by a *response body* and carries its own
+    /// pre-authorisation — attaching the Graph token to it would hand a live
+    /// write credential for the user's whole drive to whatever host that body
+    /// named. A transport that decides for itself has no way to tell that URL
+    /// apart from one this crate composed.
+    pub authorize: bool,
+}
+
+impl Request {
+    pub fn new(method: Method, url: impl Into<String>) -> Self {
+        Self {
+            method,
+            url: url.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            authorize: true,
+        }
+    }
+
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    pub fn with_body(mut self, body: Vec<u8>) -> Self {
+        self.body = body;
+        self
+    }
+
+    /// Send this one without the account credential. See [`Request::authorize`].
+    pub fn unauthorized(mut self) -> Self {
+        self.authorize = false;
+        self
+    }
+
+    /// Header lookup, case-insensitive: HTTP field names are.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// One reply, before anything reads it as a `driveItem` or a session.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Reply {
+    pub status: u16,
+    pub retry_after: Option<std::time::Duration>,
+    pub body: Vec<u8>,
+}
+
+/// Where writes go. The only thing the `http` feature implements.
+pub trait Transport: Send {
+    fn send(&mut self, request: &Request) -> io::Result<Reply>;
+}
+
+/// Graph's fragment quantum. Every fragment but the last must be a whole
+/// multiple of it, or the *commit* fails — after the entire file has crossed
+/// the wire.
+pub const FRAGMENT_QUANTUM: usize = 320 * 1024;
+
+/// The service's ceiling on one fragment.
+pub const MAX_FRAGMENT_BYTES: usize = 60 * 1024 * 1024;
+
+/// The largest body sent as a single PUT rather than through a session.
+pub const MAX_SIMPLE_UPLOAD: u64 = 4 * 1024 * 1024;
+
+/// The deepest a name may sit, counted over the whole decoded path from the
+/// drive root.
+pub const MAX_PATH_CHARS: usize = 400;
+
+/// The byte ceiling on one path segment.
+pub const MAX_NAME_BYTES: usize = 255;
+
+/// How a large upload is chopped up, and where the session threshold sits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct UploadPolicy {
+    /// Must be a multiple of [`FRAGMENT_QUANTUM`] and below
+    /// [`MAX_FRAGMENT_BYTES`].
+    pub fragment_bytes: usize,
+    /// Files at or below this go as one PUT.
+    pub simple_upload_max: u64,
+}
+
+impl Default for UploadPolicy {
+    fn default() -> Self {
+        Self {
+            // 10 MiB: inside the recommended 5–10 MiB band *and* exactly 32
+            // quanta. 4 MiB is the tempting round number and 4194304 / 327680
+            // is 12.8, which fails at the commit and nowhere earlier.
+            fragment_bytes: 32 * FRAGMENT_QUANTUM,
+            simple_upload_max: MAX_SIMPLE_UPLOAD,
+        }
+    }
+}
+
+/// The conflict behaviour a create declares.
+///
+/// Never defaulted, because the two v1.0 pages disagree about what the default
+/// is: the `driveItem` resource says `replace` for PUT, `createUploadSession`
+/// says `fail`. An omitted parameter is a bet on which page is right, per
+/// endpoint, with the user's data.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConflictBehavior {
+    Fail,
+    Rename,
+    Replace,
+}
+
+impl ConflictBehavior {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConflictBehavior::Fail => "fail",
+            ConflictBehavior::Rename => "rename",
+            ConflictBehavior::Replace => "replace",
+        }
+    }
+}
+
+/// The write half: content up, objects removed.
+///
+/// Holds the two things the framework's `Sink` signature does not carry and the
+/// write cannot be made safe without: the sync root, so a path can be resolved
+/// to a drive-relative name at the moment the bytes are sent rather than from a
+/// name captured earlier; and the content tags the last completed round
+/// recorded, so a conditional write has a precondition that means something.
+/// The tag comes from the persisted tree — not from a `GET` issued just before
+/// the write, which is a precondition that can never fail.
+pub struct GraphSink<T: Transport, K: Sleeper> {
+    scope: DriveScope,
+    root: std::path::PathBuf,
+    tags: TagSource,
+    known: std::collections::BTreeMap<String, String>,
+    policy: UploadPolicy,
+    transport: T,
+    sleeper: K,
+}
+
+impl<T: Transport, K: Sleeper> GraphSink<T, K> {
+    pub fn new(
+        scope: DriveScope,
+        root: impl Into<std::path::PathBuf>,
+        tags: TagSource,
+        transport: T,
+        sleeper: K,
+    ) -> Self {
+        Self {
+            scope,
+            root: root.into(),
+            tags,
+            known: std::collections::BTreeMap::new(),
+            policy: UploadPolicy::default(),
+            transport,
+            sleeper,
+        }
+    }
+
+    pub fn with_policy(mut self, policy: UploadPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// What the last completed round recorded as this object's content tag.
+    ///
+    /// The tag an upload is *based on*, which is the only value an `if-match`
+    /// may carry. A drive whose source is not [`TagSource::CTag`] has no value
+    /// here that Graph will accept as a precondition, and that is a fact about
+    /// the drive rather than a gap to be filled in with something else.
+    pub fn record_tag(&mut self, cloud_id: &str, tag: &str) {
+        self.known.insert(cloud_id.to_string(), tag.to_string());
+    }
+
+    pub fn scope(&self) -> &DriveScope {
+        &self.scope
+    }
+
+    pub fn policy(&self) -> UploadPolicy {
+        self.policy
+    }
+}
+
+impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K> {
+    fn upload(
+        &mut self,
+        path: &std::path::Path,
+        existing: Option<&str>,
+    ) -> io::Result<hydration_client::upload::Uploaded> {
+        let _ = (path, existing);
+        unimplemented!("GraphSink::upload")
+    }
+
+    fn remove(&mut self, cloud_id: &str) -> io::Result<()> {
+        let _ = cloud_id;
+        unimplemented!("GraphSink::remove")
+    }
+}

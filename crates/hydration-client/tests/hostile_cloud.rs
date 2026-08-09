@@ -17,11 +17,10 @@
 //! Where the framework's answer is "refuse", that is a pass. Where it is
 //! "quietly accept", that is the bug.
 
-use hydration_client::delta::{apply, safe_join, Applied, Change, Materialise};
+use hydration_client::delta::{apply, safe_join, Applied, Change};
 use hydration_client::place::TmpfilePlacer;
 use hydration_client::store::{self, Store};
 use hydration_client::upload::{run_upload, Outcome, Queue, Sink, TestClock, Uploaded};
-use hydration_client::Provider;
 use hydration_protocol::{stamp, FileId};
 use std::collections::HashSet;
 use std::io;
