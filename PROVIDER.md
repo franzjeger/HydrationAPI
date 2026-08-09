@@ -147,13 +147,60 @@ does. Map `eTag` and every remote move looks like a new version — which for a
 a placeholder. A folder move in the web UI would dehydrate the whole tree, on a
 laptop that may be offline by evening.
 
-**Folder moves are yours to expand, and this is the largest hidden piece of
-work.** Graph's delta does not re-enumerate a folder's descendants when the
-folder moves: you get one change for the folder and nothing for the thousand
-files inside it. The framework only knows about files. So a provider has to keep
-its own id→path map of the remote namespace and turn a folder move into one
-`Upserted` per descendant. Skip this and the local tree splits — old files stay
-under the old directory, new ones appear under the new.
+**Folder moves are yours to expand, and the framework now does it for you.**
+Graph's delta does not re-enumerate a folder's descendants when the folder moves:
+you get one change for the folder and nothing for the thousand files inside it.
+Skip that and the local tree splits — old files stay under the old directory, new
+ones appear under the new, and no single change looks wrong.
+
+`hydration_client::namespace::Namespace` holds the remote tree and turns items
+into the changes they actually mean. Feed it `Item::{Root, Upsert, Delete}` and
+it returns `Change`s at correct paths, expanding a folder move into one
+`Upserted` per descendant and a folder delete into one `Removed` per file.
+
+Mapping Graph onto it has six traps, and each one has bitten somebody:
+
+- **Detect the `root` facet** and emit `Item::Root`. The drive root genuinely has
+  no `parentReference`, so a provider that misses the facet has an item with no
+  parent — which the type will not let you express, deliberately.
+- **`parentReference.id` can be absent** on shared items, `remoteItem` links and
+  some recycle-bin entries. That is not a root. Hold or refuse it; do not invent
+  a parent.
+- **`root` appears in every delta page.** Re-sending it is fine; sending a
+  *different* id is a second drive, and one tracker holds one drive.
+- **A delete is a `deleted` facet on an otherwise normal item**, not a separate
+  object — it still carries `parentReference` and `name`. Check facets in the
+  wrong order and a deletion maps as an upsert, which resurrects the file.
+  Recycle-bin moves arrive as deletes with no counterpart create.
+- **`remoteItem`**: the `file`/`folder`/`name`/`size` facets live *inside* it;
+  the top-level item is a link. Read the top level and a shared folder looks like
+  a file. Its children live on another `driveId`, so item ids are unique only per
+  drive — key your own state by `(driveId, itemId)`.
+- **The `package` facet** (a OneNote notebook) is a folder that must be opaque.
+  Map it to `Kind::Opaque`: tracked for pathing, never walked into. As a folder
+  you sync a notebook's internals and corrupt it; as a file its size is not real
+  and every read is refused by the length check.
+
+**Reject names the path grammar cannot hold** — empty, `.`, `..`, anything
+containing `/` or NUL — before they reach the framework. `Namespace` does this
+and records why in `problems()`. The framework refuses them too, but silently and
+terminally: the change lands in `Applied::failed`, the pass is not marked
+retryable, the cursor advances, and the service never mentions the item again.
+
+**Persist the tree, and persist it before the token.** A delta token is worthless
+without the tree it described. `Namespace::snapshot()` and `restore()` round-trip
+through the public `Item` type, so store them however you already store anything.
+The ordering is not a preference:
+
+> Write the tree first, then the token. On any doubt, discard the token and keep
+> the tree.
+
+A tree newer than its token is harmless — the replayed items are no-ops. A token
+newer than its tree is unrecoverable: every move in between is lost, and a delta
+feed never re-reports an unchanged item, so nothing self-corrects. And note what
+recovery cannot do: `listing()` says what exists, never what stopped existing, so
+a provider resuming after an expired token must diff a fresh enumeration against
+its previous snapshot to find remote deletions it slept through.
 
 **Report each object at its full root-relative path**, not its basename. The
 framework translates a path change into a local rename, so a provider that
