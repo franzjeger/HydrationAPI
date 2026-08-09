@@ -42,6 +42,9 @@ pub struct Entry {
 #[derive(Debug, Default)]
 pub struct Store {
     index: HashMap<FileId, PathBuf>,
+    /// Where the last scan started, so a caller can look again without having to
+    /// be told the root a second time — and without being able to get it wrong.
+    root: Option<std::path::PathBuf>,
 }
 
 impl Store {
@@ -55,6 +58,7 @@ impl Store {
     /// pre-content event, which is the measured fact that makes a full scan
     /// affordable at all.
     pub fn scan(&mut self, root: &Path) -> io::Result<usize> {
+        self.root = Some(root.to_path_buf());
         self.index.clear();
         let mut stack = vec![root.to_path_buf()];
         let mut found = 0;
@@ -135,6 +139,11 @@ impl Store {
     /// own files most of all, since including them is silent rather than loud.
     pub fn paths(&self) -> impl Iterator<Item = &Path> {
         self.index.values().map(|p| p.as_path())
+    }
+
+    /// The root the last [`Store::scan`] walked, if there has been one.
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
     }
 
     pub fn len(&self) -> usize {

@@ -84,6 +84,14 @@ pub struct Applied {
     /// lost. Not an error, and not silent: these are what a conflict UI is for.
     pub kept_local: Vec<String>,
     pub failed: Vec<String>,
+    /// At least one failure could succeed on a later pass — a rename blocked by
+    /// a destination that another change will free, most often.
+    ///
+    /// The caller must not advance its cursor past a pass with this set. A delta
+    /// service does not replay a consumed change, so a transient refusal that is
+    /// never retried is indistinguishable from a permanent one: the local name
+    /// stays wrong until the object happens to change again.
+    pub retryable: bool,
 }
 
 /// Apply a set of changes to the sync directory.
@@ -107,9 +115,18 @@ pub fn apply<M: Materialise>(
 
     // Cloud id -> local file, for the removal half. Built once rather than per
     // change, because a removal names an object and not a path.
-    let by_cloud_id = store.by_cloud_id();
+    let mut by_cloud_id = store.by_cloud_id();
 
-    for change in changes {
+    // At most one change per object, last one winning.
+    //
+    // Not tidiness. Microsoft documents that a single delta enumeration may
+    // return the same item more than once across pages, with the last occurrence
+    // authoritative — so a provider that concatenates pages hands us two changes
+    // for one object as a matter of course. Applying both in sequence created a
+    // second local file claiming the same id, which is the exact corruption the
+    // rename handling below exists to prevent.
+    for change in coalesce(changes) {
+        let change = &change;
         match change {
             Change::Upserted {
                 cloud_id,
@@ -121,6 +138,21 @@ pub fn apply<M: Materialise>(
                     out.failed.push(path.clone());
                     continue;
                 };
+
+                // The size is untrusted in the same way the path is.
+                //
+                // It becomes the placeholder's length, and every hydration then
+                // allocates that many bytes to serve it. A service reporting an
+                // exabyte — through a bug, a signed/unsigned slip, or malice —
+                // produces a sparse file the filesystem creates happily and a
+                // daemon that tries to allocate it on first read. Refused rather
+                // than clamped: a placeholder promising a length nobody meant is
+                // the §5.7 failure, and silently choosing a different one would
+                // be inventing an object.
+                if *size > MAX_OBJECT {
+                    out.failed.push(path.clone());
+                    continue;
+                }
 
                 // The object may already be here under a different name.
                 //
@@ -139,11 +171,18 @@ pub fn apply<M: Materialise>(
                 if let Some(existing) = by_cloud_id.get(cloud_id) {
                     if existing.path != abs && existing.path.exists() {
                         if abs.exists() {
-                            // Something else is already at the destination.
-                            // Placing anyway would produce the two-claimant state
-                            // this branch exists to prevent, so it is reported
-                            // rather than resolved by guessing.
+                            // Something else is already at the destination —
+                            // two objects swapping paths, most likely. Placing
+                            // anyway would produce the two-claimant state this
+                            // branch exists to prevent, so it is reported rather
+                            // than resolved by guessing.
+                            //
+                            // Marked retryable, because a refusal nothing ever
+                            // retries is a permanent wrong state: the caller
+                            // advances its cursor and the service never mentions
+                            // these objects again.
                             out.failed.push(path.clone());
+                            out.retryable = true;
                             continue;
                         }
                         if let Some(parent) = abs.parent() {
@@ -151,9 +190,17 @@ pub fn apply<M: Materialise>(
                         }
                         if std::fs::rename(&existing.path, &abs).is_err() {
                             out.failed.push(path.clone());
+                            out.retryable = true;
                             continue;
                         }
                         out.moved += 1;
+                        // The index has to follow, or the next change naming
+                        // this object looks it up at a path that no longer
+                        // exists and creates a second file for it.
+                        if let Some(e) = by_cloud_id.get_mut(cloud_id) {
+                            e.path = abs.clone();
+                        }
+                        store.remember(file_id(&std::fs::metadata(&abs)?), &abs);
                     }
                 }
 
@@ -176,7 +223,20 @@ pub fn apply<M: Materialise>(
                         // Local content that has never been uploaded is in the
                         // same position, even with nothing queued: there is no
                         // remote copy of it to fall back on.
-                        let known = store.lookup(&id).and_then(|e| e.cloud_id);
+                        // Read off the file, not out of the index.
+                        //
+                        // The index was built before the loop and the rename
+                        // above invalidates it — `Store::lookup` re-verifies
+                        // against the filesystem, so after a move it answers
+                        // `None` for a file that plainly exists. Every move then
+                        // tripped the "never uploaded" guard and was reported as
+                        // a conflict, and its size and version update was
+                        // silently dropped. The id travels with the inode; the
+                        // index is redundant for this question.
+                        let known = crate::store::get_xattr(&abs, crate::store::XATTR_ID)
+                            .ok()
+                            .flatten()
+                            .filter(|v| !v.is_empty());
                         if known.is_none() && md.len() > 0 {
                             out.kept_local.push(path.clone());
                             continue;
@@ -298,6 +358,37 @@ fn is_current(abs: &Path, cloud_id: &str, etag: Option<&str>, size: u64) -> bool
         // current.
         (Some(_), None) => false,
     }
+}
+
+/// The largest object a change may claim, beyond which it is refused.
+///
+/// 1 TiB, which is above any single file a consumer service will hold and far
+/// below the point where a sparse placeholder's promised length becomes a
+/// denial of service against the daemon that has to allocate it.
+pub const MAX_OBJECT: u64 = 1 << 40;
+
+/// One change per object, last occurrence winning, order otherwise preserved.
+fn coalesce(changes: &[Change]) -> Vec<Change> {
+    let mut last: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, c) in changes.iter().enumerate() {
+        let id = match c {
+            Change::Upserted { cloud_id, .. } | Change::Removed { cloud_id } => cloud_id.as_str(),
+        };
+        last.insert(id, i);
+    }
+    changes
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| {
+            let id = match c {
+                Change::Upserted { cloud_id, .. } | Change::Removed { cloud_id } => {
+                    cloud_id.as_str()
+                }
+            };
+            last.get(id) == Some(i)
+        })
+        .map(|(_, c)| c.clone())
+        .collect()
 }
 
 fn file_id(md: &std::fs::Metadata) -> FileId {

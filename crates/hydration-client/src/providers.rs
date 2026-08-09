@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 /// mapping survives a restart the way a real service's metadata would.
 pub struct FolderCloud {
     root: PathBuf,
+    /// The sync directory, when the caller has said where it is. Without it this
+    /// falls back to basenames, which flattens subdirectories — see `upload`.
+    sync_root: Option<PathBuf>,
     next: u64,
     /// What the last delta pass was told about, so this one can say what
     /// disappeared. A real service hands out a delta token and remembers this
@@ -51,9 +54,17 @@ impl FolderCloud {
             .unwrap_or(0);
         Ok(Self {
             root: root.to_path_buf(),
+            sync_root: None,
             next,
             seen: BTreeMap::new(),
         })
+    }
+
+    /// Tell it which directory the files it uploads live under, so it can record
+    /// their paths rather than their names.
+    pub fn rooted_at(mut self, sync_root: &Path) -> Self {
+        self.sync_root = Some(sync_root.to_path_buf());
+        self
     }
 
     fn object(&self, id: &str) -> PathBuf {
@@ -140,7 +151,22 @@ impl Sink for FolderCloud {
     fn upload(&mut self, path: &Path, existing: Option<&str>) -> io::Result<Uploaded> {
         // Read at send time, like the name — see upload rule 2.
         let content = std::fs::read(path)?;
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        // The *root-relative* path, not the basename.
+        //
+        // Recording only the file name was harmless while nothing acted on the
+        // path a listing reported. It stopped being harmless the moment the
+        // delta pass learned to translate a remote move into a local rename: a
+        // file uploaded from `Documents/report.pdf` came back listed as
+        // `report.pdf`, and the next pass dutifully moved the user's file to the
+        // sync root. This is also the code implementors copy, so it modelled the
+        // mistake.
+        let name = self
+            .sync_root
+            .as_deref()
+            .and_then(|r| path.strip_prefix(r).ok())
+            .unwrap_or_else(|| Path::new(path.file_name().unwrap_or_default()))
+            .to_string_lossy()
+            .to_string();
 
         let id = match existing {
             Some(e) => e.to_string(),

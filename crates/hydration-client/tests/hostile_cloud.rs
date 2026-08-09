@@ -537,3 +537,181 @@ fn a_change_for_a_vanished_file_is_not_an_error() {
         "{outcome:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Renames, in the batch shapes a real service actually produces
+// ---------------------------------------------------------------------------
+
+/// A move with nothing else changed must not be reported as a conflict.
+///
+/// The rename fix consults an index built once, before the loop — and its own
+/// rename invalidates that index. Every later consultation in the same pass then
+/// answers about a path that no longer exists, and the "never uploaded" guard
+/// fires on a file that plainly was. The user is shown a conflict that does not
+/// exist, and the size and etag refresh is skipped.
+#[test]
+fn a_move_is_not_reported_as_a_conflict() {
+    let dir = scratch("move-clean");
+    run(&dir, &[upserted("old/name.txt", 64, "cloud-1", Some("e1"))]);
+    let out = run(&dir, &[upserted("new/name.txt", 64, "cloud-1", Some("e1"))]);
+
+    assert_eq!(out.moved, 1, "{out:?}");
+    assert!(
+        out.kept_local.is_empty(),
+        "a byte-identical move was reported as a conflict: {out:?}"
+    );
+}
+
+/// On Graph a move bumps the version tag, so "same id, new path, new version" is
+/// the normal representation of dragging a file in the web UI — not an exotic
+/// batch. The move must not swallow the update.
+#[test]
+fn a_move_that_also_changes_the_content_applies_both() {
+    let dir = scratch("move-and-edit");
+    run(&dir, &[upserted("old/a.bin", 5, "cloud-1", Some("e1"))]);
+    let out = run(&dir, &[upserted("new/a.bin", 9999, "cloud-1", Some("e2"))]);
+
+    let p = dir.join("new/a.bin");
+    assert_eq!(out.moved, 1, "{out:?}");
+    assert_eq!(
+        std::fs::metadata(&p).unwrap().len(),
+        9999,
+        "the placeholder still promises the old size; every read of it is refused \
+         by the length check until the object changes again: {out:?}"
+    );
+    assert_eq!(
+        store::get_xattr(&p, store::XATTR_ETAG).unwrap().unwrap(),
+        b"e2"
+    );
+}
+
+/// Microsoft documents that one delta enumeration may return the same item more
+/// than once across pages, last occurrence winning. A provider that concatenates
+/// pages produces exactly this, and the first version of the rename fix answered
+/// it by recreating the two-claimant corruption it was written to prevent.
+#[test]
+fn the_same_object_twice_in_one_batch_leaves_one_file() {
+    let dir = scratch("repeated");
+    run(&dir, &[upserted("a.txt", 10, "cloud-1", Some("e1"))]);
+    run(
+        &dir,
+        &[
+            upserted("b.txt", 10, "cloud-1", Some("e1")),
+            upserted("c.txt", 10, "cloud-1", Some("e1")),
+        ],
+    );
+    assert_eq!(
+        claimants(&dir, b"cloud-1").len(),
+        1,
+        "one object ended up claimed by {:?}",
+        claimants(&dir, b"cloud-1")
+    );
+    assert!(dir.join("c.txt").exists(), "the last occurrence did not win");
+}
+
+/// Two objects swapping paths in one batch. Both renames see an occupied
+/// destination and refuse, which is right — but a refusal that nothing ever
+/// retries is a permanent wrong state, because the cursor has already moved on.
+#[test]
+fn two_objects_swapping_paths_are_retried_not_abandoned() {
+    let dir = scratch("swap");
+    run(
+        &dir,
+        &[
+            upserted("a.txt", 10, "cloud-A", Some("e")),
+            upserted("b.txt", 20, "cloud-B", Some("e")),
+        ],
+    );
+    let out = run(
+        &dir,
+        &[
+            upserted("b.txt", 10, "cloud-A", Some("e")),
+            upserted("a.txt", 20, "cloud-B", Some("e")),
+        ],
+    );
+    assert!(
+        out.failed.is_empty() || out.retryable,
+        "a swap was refused with nothing to retry it: {out:?}"
+    );
+}
+
+fn claimants(dir: &Path, id: &[u8]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            } else if store::get_xattr(&e.path(), store::XATTR_ID)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(id)
+            {
+                found.push(e.path());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// A file uploaded from a subdirectory must not be moved to the root by the
+/// next delta pass.
+///
+/// The reference provider recorded only the basename. That was harmless while
+/// nothing acted on the path a listing reported — and stopped being harmless the
+/// moment the delta pass learned to translate a remote move into a local rename.
+/// It is also the code an implementor copies, so it modelled the mistake.
+#[test]
+fn an_upload_from_a_subdirectory_keeps_its_path() {
+    use hydration_client::delta::Discover;
+    use hydration_client::providers::FolderCloud;
+
+    let dir = scratch("subdir-path");
+    let cloud = dir.join(".cloud");
+    std::fs::create_dir_all(dir.join("Documents")).unwrap();
+    let p = dir.join("Documents/report.pdf");
+    std::fs::write(&p, b"a report in a subdirectory").unwrap();
+
+    let mut sink = FolderCloud::open(&cloud).unwrap().rooted_at(&dir);
+    let mut store = Store::new();
+    store.scan(&dir).unwrap();
+    let outcome = run_upload(file_id(&p), &mut store, &mut sink);
+    assert!(matches!(outcome, Outcome::Sent { .. }), "{outcome:?}");
+
+    let (changes, _) = sink.changes(&Default::default()).unwrap();
+    let paths: Vec<String> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::Upserted { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["Documents/report.pdf".to_string()],
+        "the upload recorded a name instead of a path; the next delta pass would \
+         move the user's file to the sync root"
+    );
+}
+
+/// A size no real object has.
+///
+/// It becomes the placeholder's length, and every hydration allocates that many
+/// bytes to serve it — so an exabyte upsert is a sparse file the filesystem
+/// creates happily and a daemon that tries to allocate it on first read.
+#[test]
+fn an_absurd_size_is_refused_rather_than_becoming_a_placeholder() {
+    let dir = scratch("absurd-size");
+    let out = run(
+        &dir,
+        &[
+            upserted("huge.bin", u64::MAX / 2, "cloud-1", Some("e")),
+            upserted("ok.bin", 1024, "cloud-2", Some("e")),
+        ],
+    );
+    assert_eq!(out.created, 1, "{out:?}");
+    assert_eq!(out.failed, vec!["huge.bin".to_string()], "{out:?}");
+    assert!(!dir.join("huge.bin").exists());
+}

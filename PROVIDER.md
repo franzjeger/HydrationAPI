@@ -31,6 +31,12 @@ rule below exists because some way of being helpful turns into that.
 
 ## `Provider::fetch`
 
+**Verify the content, not just its length.** The framework's only integrity
+check is the length, in both halves — so a service that returns the right number
+of wrong bytes passes. OneDrive supplies `quickXorHash` and often `sha1`; check
+one. "A wrong byte that arrives with success" is the failure this whole project
+is arranged against, and length alone does not catch it.
+
 **Return exactly `size` bytes, or an error.** There is no partial success in this
 framework and adding one is not a small change — §5.7 exists because a
 half-hydrated file is indistinguishable from a real one afterwards. If the
@@ -106,10 +112,41 @@ not report sizes reliably, that is a reason not to create the placeholder yet.
 you get two local files claiming one object, which is how a later delete removes
 the wrong one.
 
-**`Cursor` is yours.** Return whatever lets you resume; the framework stores it
-and hands it back. If your token expires — Graph's do — return a full listing and
-a fresh cursor. That is a supported outcome, not a failure, and it costs nothing
-because a replayed listing is a no-op.
+**`Cursor` is yours, and it does not survive a restart.** The framework holds it
+in memory and hands it back for the life of the process; it does not persist it.
+Every restart is therefore a full enumeration — for a 100k-item drive that is
+several hundred paged requests against a throttling endpoint. **Persist it
+yourself** if that matters, which it will.
+
+If your token expires — Graph's do — return a full listing and a fresh cursor.
+That is a supported outcome, not a failure, and it costs nothing because a
+replayed listing is a no-op.
+
+**At most one change per object per batch.** If you page through a delta
+enumeration and concatenate the pages, deduplicate first: Microsoft documents
+that one enumeration may return the same item more than once, last occurrence
+authoritative. The framework coalesces defensively, but a provider that relies on
+that is relying on an implementation detail.
+
+**Use a *content* version tag, not `eTag`.** On Graph, `eTag` changes when an
+item is renamed or its metadata is touched; `cTag` changes when the content
+does. Map `eTag` and every remote move looks like a new version — which for a
+*hydrated* file means the framework discards the local copy and replaces it with
+a placeholder. A folder move in the web UI would dehydrate the whole tree, on a
+laptop that may be offline by evening.
+
+**Folder moves are yours to expand, and this is the largest hidden piece of
+work.** Graph's delta does not re-enumerate a folder's descendants when the
+folder moves: you get one change for the folder and nothing for the thousand
+files inside it. The framework only knows about files. So a provider has to keep
+its own id→path map of the remote namespace and turn a folder move into one
+`Upserted` per descendant. Skip this and the local tree splits — old files stay
+under the old directory, new ones appear under the new.
+
+**Report each object at its full root-relative path**, not its basename. The
+framework translates a path change into a local rename, so a provider that
+reports `report.pdf` for a file it was given as `Documents/report.pdf` will have
+the user's file moved to the sync root on the next pass.
 
 ---
 
@@ -118,9 +155,14 @@ because a replayed listing is a no-op.
 - **It never asks for a range.** v1 fetches whole objects. The pre-content event
   does carry an offset, but the measured `count` is the readahead window rather
   than what the application asked for, so range-based fetching would be guessing.
-- **It never calls you concurrently.** Fetches are serialised on one connection.
-  This is a known limitation, not a promise you should rely on forever — but
-  today you do not need to be thread-safe beyond `Send`.
+- **Each instance is called from one thread at a time.** The shipped daemon
+  builds a *separate* instance per role — the startup check, the upload thread,
+  the delta thread, the fetch loop — and three of those run concurrently. So one
+  instance never races itself, but your implementation does race itself, and for
+  a Graph provider that is the difference between working and signing the user
+  out: MSAL rotates the refresh token on use, and two concurrent refreshes of a
+  single-use token produce `invalid_grant`. **Share the token cache across
+  instances and make the refresh single-flight.**
 - **It never hands you a path outside the sync root**, and never a path it
   constructed from something you said without checking it first.
 - **It handles every POSIX question**: identity across renames, size and mtime
@@ -145,6 +187,8 @@ because a replayed listing is a no-op.
 
 Run these against your provider, not against a fake:
 
+0. Move a folder with a thousand children in the web UI. You must end with the
+   tree moved, not split.
 1. Kill the network mid-fetch. A reader must get `EIO`, never a short file.
 2. Kill the sync daemon while a file is dehydrated. Reading it must fail, not
    return zeros. (`deploy/smoke.sh` does this against the reference provider.)
@@ -153,9 +197,42 @@ Run these against your provider, not against a fake:
 4. Move a file in the web UI. You must end with one local file, not two.
 5. Let the delta token expire. Sync must resume without re-downloading the world
    or re-uploading it.
-6. Fill the disk during a hydration. The placeholder must be left as it was, not
+6. Edit the same file on two machines, then let both sync. Decide what you want
+   to happen *before* you find out what does — the framework protects the local
+   copy on the way down and has no opinion on the way up.
+7. Create a file the service will refuse — `aux.c`, `report .pdf`, `a:b.txt`.
+8. Read a file bigger than 30 seconds of your bandwidth. It will fail; see the
+   size ceiling below.
+9. Fill the disk during a hydration. The placeholder must be left as it was, not
    half-filled.
 
 The conformance suite (`conformance/`) covers the framework's side of all eight
 contract invariants. These six are the provider's side, and nothing else checks
 them.
+
+---
+
+## Two ceilings to know about before you design around them
+
+**Whole-object fetches, with a 30-second deadline.** `fetch` returns a `Vec<u8>`
+and must complete before the first byte reaches the reader, and the privileged
+helper gives up after 30 seconds. So an object larger than roughly thirty seconds
+of your bandwidth — a few hundred megabytes on a home connection — cannot be
+served at all, and the failure is not confined to that file: fetches are
+serialised, and three consecutive misses put the helper in a state where every
+dehydrated file on the mount returns `EIO` until it recovers. A file manager
+generating thumbnails over a video folder reaches this on day one.
+
+Until the framework grows streaming fetches, a provider should refuse
+oversized objects with a clear error rather than letting them consume the
+deadline, and a client should avoid creating placeholders it knows it cannot
+serve.
+
+**Restoring from a backup needs a procedure you have to write.** A restore
+reproduces content without extended attributes, so every restored file looks like
+content the framework has never seen: it will be uploaded as a *new* object,
+while the delta side still reports the old objects at the same paths. The result
+is duplicates remotely and permanent conflicts locally. The manifest (§6d) tells
+a user what a backup was missing; nothing yet helps them come back. If your
+client offers restore, it needs an adopt step that reattaches ids before sync
+resumes.

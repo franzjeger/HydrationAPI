@@ -272,6 +272,53 @@ pub fn run_upload<S: Sink>(file: FileId, store: &mut Store, sink: &mut S) -> Out
         // The bug this replaces read the same absence as "I have no fresh data"
         // and uploaded its stale in-memory copy anyway, which put a deleted file
         // back complete with its contents.
+        // Renamed and deleted look identical from here, and they are not.
+        //
+        // `lookup` re-verifies the recorded path, so a file that moved during
+        // the upload answers exactly like one that was removed. Treating both as
+        // a deletion was survivable while only a user's `mv` could cause it; the
+        // delta pass now renames files itself whenever an object moves in the
+        // cloud, so the framework could reach here about its own rename and
+        // delete the object it had just created — a real remote delete, which
+        // every other device then applies.
+        //
+        // So it looks again, the same way the fetch path does before giving up.
+        // A file found under a *different* name was renamed, and the object we
+        // just created carries the wrong one — an atomic save is exactly this:
+        // written as `x.tmp`, uploaded, renamed to `x` (§5.4). Sending it once
+        // more under the name it now has is bounded, and it is the only answer
+        // that leaves neither an orphaned object nor a wrongly named one.
+        if store.lookup(&file).is_none() {
+            if let Some(root) = store.root().map(|r| r.to_path_buf()) {
+                let _ = store.scan(&root);
+            }
+            if let Some(moved) = store.lookup(&file) {
+                if moved.path != path {
+                    return match sink.upload(&moved.path, Some(&uploaded.cloud_id)) {
+                        Ok(again) => {
+                            if let Err(e) = store.adopt_cloud_id(
+                                &moved.path,
+                                &again.cloud_id,
+                                again.etag.as_deref(),
+                            ) {
+                                return Outcome::Failed(format!(
+                                    "could not record the cloud id after a rename: {e}"
+                                ));
+                            }
+                            if let Ok(md) = std::fs::metadata(&moved.path) {
+                                let _ = hydration_protocol::stamp::write_as(&moved.path, &md);
+                            }
+                            Outcome::Sent {
+                                cloud_id: again.cloud_id,
+                            }
+                        }
+                        Err(e) => Outcome::Failed(format!(
+                            "the file was renamed mid-upload and the resend failed: {e}"
+                        )),
+                    };
+                }
+            }
+        }
         if store.lookup(&file).is_none() {
             if let Err(e) = sink.remove(&uploaded.cloud_id) {
                 return Outcome::Failed(format!(

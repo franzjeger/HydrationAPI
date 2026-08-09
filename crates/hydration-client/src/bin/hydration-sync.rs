@@ -26,7 +26,7 @@ use hydration_client::place::TmpfilePlacer;
 use hydration_client::providers::FolderCloud;
 use hydration_client::reclaim;
 use hydration_client::store::Store;
-use hydration_client::upload::{run_upload, Queue, SystemClock};
+use hydration_client::upload::{run_upload, Outcome, Queue, SystemClock};
 use hydration_client::{Changes, Daemon};
 use hydration_protocol::transport::DaemonConn;
 use hydration_protocol::FileId;
@@ -364,9 +364,13 @@ fn main() -> io::Result<()> {
             Arc::clone(&resync),
         );
         std::thread::spawn(move || {
-            let Ok(mut sink) = FolderCloud::open(&clouddir) else {
+            let Ok(sink) = FolderCloud::open(&clouddir) else {
                 return;
             };
+            // Rooted, so an upload from a subdirectory records its path and not
+            // just its name — otherwise the next delta pass moves the file to
+            // the sync root.
+            let mut sink = sink.rooted_at(&mount);
             let mut store = Store::new();
             while !stop.load(Ordering::SeqCst) {
                 // Close the holes in the change channel by looking, rather than
@@ -401,7 +405,22 @@ fn main() -> io::Result<()> {
                 for file in due {
                     q.lock().unwrap().begin(file);
                     let outcome = run_upload(file, &mut store, &mut sink);
-                    q.lock().unwrap().finish(file);
+                    {
+                        let mut queue = q.lock().unwrap();
+                        queue.finish(file);
+                        // A failure has to go back in the queue.
+                        //
+                        // `begin` takes the file out and `finish` releases the
+                        // claim; without this, a failed upload is simply gone —
+                        // the resync walk would find it again, but that runs only
+                        // at startup, on a helper reconnect, or after an event
+                        // overflow, which on a stable system is days. An initial
+                        // sync meeting a service that throttles would park most
+                        // of its queue on the first refusal and not notice.
+                        if matches!(outcome, Outcome::Failed(_)) {
+                            queue.touch(file);
+                        }
+                    }
                     eprintln!("hydration-sync: upload {file:?} -> {outcome:?}");
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -434,7 +453,6 @@ fn main() -> io::Result<()> {
             while !stop.load(Ordering::SeqCst) {
                 match cloud.changes(&cursor) {
                     Ok((changes, next)) if !changes.is_empty() => {
-                        cursor = next;
                         // Snapshotted, then released — not held across the pass.
                         //
                         // The lock is the same one the change-notification
@@ -446,6 +464,24 @@ fn main() -> io::Result<()> {
                         let waiting = q.lock().unwrap().waiting_set();
                         let applied =
                             delta::apply(&mount, &changes, &mut store, &waiting, &mut placer);
+                        // The cursor moves only past a pass that finished.
+                        //
+                        // A delta service does not replay a consumed change, so
+                        // advancing past a pass that refused something means the
+                        // refusal is permanent however transient its cause —
+                        // two objects swapping paths refuse each other on one
+                        // pass and would succeed on the next, if there were one.
+                        match &applied {
+                            Ok(a) if a.retryable => {
+                                eprintln!(
+                                    "hydration-sync: delta pass incomplete ({} deferred); \
+                                     not advancing",
+                                    a.failed.len()
+                                );
+                            }
+                            Ok(_) => cursor = next,
+                            Err(_) => {}
+                        }
                         match applied {
                             Ok(a) if a != Applied::default() => {
                                 eprintln!(
