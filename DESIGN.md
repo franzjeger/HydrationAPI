@@ -1438,6 +1438,41 @@ den er skrevet ned framfor bare rettet.
 
 ---
 
+## 8c. Delvis fylling er trygt — målt før det ble bygget
+
+Taket på hva rammeverket kan servere er i dag hele objektet i minnet innen én
+frist. Å heve det betyr å fylle placeholderen mens bytene kommer, og det skaper
+en tilstand som ikke finnes i dag: en placeholder som er *delvis* fylt, fortsatt
+merket, med leseren sin parkert inne i pre-content-hendelsen.
+
+Fire spørsmål avgjorde om den tilstanden er trygg. `probes/stream.c`, 6.17,
+btrfs:
+
+```
+event held for a 1 MiB placeholder
+  wrote 262144 of 1048576 bytes so far
+  events fired by our own partial writes: 0
+  a second reader: BLOCKED (its own event is queued behind ours)
+  after rollback: size=1048576 blocks=0
+  the reader got an error, as it should
+```
+
+- **En annen leser kan ikke se det halvskrevne innholdet.** Hennes egen hendelse
+  køes bak den som betjenes. Det var det avgjørende: kunne en tilskuer lest det
+  halve, ville streaming latt noen tro på en halv fil, som er nøyaktig utfallet
+  rammeverket finnes for å hindre.
+- **Egne delskrivinger utløser ingen hendelser**, så fella i §6a-ter dukker ikke
+  opp i en niende forkledning her.
+- **Tilbakerulling gjenoppretter nøyaktig**: størrelsen beholdt, blokkene tilbake
+  til null. §5.7s «hele objektet eller ingenting» holder altså på
+  filsystemnivå, ikke bare i bufferlogikken.
+- Og leseren får en feil, ikke nuller.
+
+Målt før noe ble bygget, fordi svaret på det første spørsmålet ville avgjort om
+streaming i det hele tatt er en mulig vei.
+
+---
+
 ## 9. Det jeg ikke fikk verifisert
 
 Det finnes ingen gjentilkobling i prosessen. En klientomstart overlever ved at
