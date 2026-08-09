@@ -1287,6 +1287,20 @@ Forskjellen fra å punsje på stedet, og begge er verdt å vite:
   har aldri hatt et — så filen avskjæres igjen ved konstruksjon framfor ved et
   privilegert kall som må sekvenseres riktig.
 
+Innelukkingen er strukturell, ikke sjekket, og det tok en gjennomgang å få
+riktig. Første versjon tok en absolutt sti og spurte om den *begynte* med roten.
+`Path::starts_with` sammenligner komponenter leksikalsk og løser ikke `..` — så
+hver eneste stien som rømte begynte med roten og slapp gjennom. `evict
+../SECRET.txt` erstattet en fil utenfor synkkatalogen med en placeholder hvis
+sky-id ikke løser noe sted, altså den filens innhold ødelagt og lest som nuller
+for alltid. Og det er ikke en eksotisk situasjon: en omdøping ut av synktreet
+beholder xattr-ene, og en annen synkrot under samme forelder er `../andre/x`.
+
+`safe_join` fantes allerede for nøyaktig dette, på delta-siden, og ble ikke
+brukt. Nå tar `reclaim` en relativ sti og går gjennom den — og deretter gjennom
+filsystemet, siden en symlenket underkatalog gir en sti som er helt `Normal` og
+likevel lander utenfor.
+
 Utløseren ligger i den kjørende daemonen, ikke i verktøyet, og det er poenget:
 et frittstående verktøy kunne kastet ut en fil daemonen laster opp akkurat nå, og
 regelen om sletting under opplasting (§5.5) ville da sett at inoden byttet og

@@ -67,6 +67,12 @@ pub struct Reclaimed {
 
 /// Turn a file with content back into a placeholder.
 ///
+/// `rel` is relative to `root` and is untrusted: it comes from whoever asked for
+/// the eviction, which in practice is a socket. It is resolved through the same
+/// [`crate::delta::safe_join`] the cloud's paths go through, and then through
+/// the filesystem, so neither `..` nor a symlinked subdirectory can lead this
+/// out of the sync directory.
+///
 /// `waiting` and `sending` are snapshots of the upload queue: edits waiting out
 /// the debounce, and uploads already under way. Both are consulted rather than locked, for the reason
 /// [`crate::delta::apply`] documents: holding the queue across this would block
@@ -74,12 +80,28 @@ pub struct Reclaimed {
 /// eviction could not reach the queue in time to do it.
 pub fn reclaim(
     root: &Path,
-    path: &Path,
+    rel: &str,
     store: &mut Store,
     waiting: &HashSet<FileId>,
     sending: &HashSet<FileId>,
 ) -> io::Result<Result<Reclaimed, Refused>> {
-    let md = match std::fs::metadata(path) {
+    // Confinement is structural, not checked.
+    //
+    // The first version took an absolute path and asked whether it began with
+    // the root. `Path::starts_with` compares components lexically and does not
+    // resolve `..`, so *every* escaping path began with the root and passed —
+    // `evict ../SECRET.txt` replaced a file outside the sync directory with a
+    // placeholder whose cloud id resolves nowhere, which is that file's content
+    // destroyed and read as zeros forever. `safe_join` already existed for
+    // exactly this, on the delta side, and refuses `..`, absolute paths and the
+    // framework's own names outright.
+    let Some(joined) = crate::delta::safe_join(root, rel) else {
+        return Ok(Err(Refused::NotEligible(format!(
+            "{rel:?} is not a path inside the sync directory"
+        ))));
+    };
+
+    let md = match std::fs::metadata(&joined) {
         Ok(md) if md.is_file() => md,
         Ok(_) => {
             return Ok(Err(Refused::NotEligible(
@@ -88,20 +110,23 @@ pub fn reclaim(
         }
         Err(e) => return Err(e),
     };
-    if !path.starts_with(root) {
+
+    // And then symlinks, which no amount of component checking catches: a
+    // symlinked subdirectory inside the root gives a path that is entirely
+    // `Normal` and still lands outside. Resolved forms contain no `..` and no
+    // links, so comparing them is sound in a way comparing the originals is not.
+    let (Ok(real), Ok(real_root)) = (joined.canonicalize(), root.canonicalize()) else {
         return Ok(Err(Refused::NotEligible(
-            "outside the sync directory".to_string(),
+            "could not resolve the path".to_string(),
+        )));
+    };
+    if !real.starts_with(&real_root) {
+        return Ok(Err(Refused::NotEligible(
+            "resolves outside the sync directory".to_string(),
         )));
     }
-    if path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(hydration_protocol::names::is_internal)
-    {
-        return Ok(Err(Refused::NotEligible(
-            "one of the framework's own files".to_string(),
-        )));
-    }
+    let path = &real;
+
     if store::get_xattr(path, hydration_protocol::xattr::DEHYDRATED)?.is_some() {
         return Ok(Err(Refused::AlreadyDehydrated));
     }
@@ -174,10 +199,10 @@ mod tests {
         p
     }
 
-    fn run(dir: &Path, p: &Path) -> Result<Reclaimed, Refused> {
+    fn run(dir: &Path, rel: &str) -> Result<Reclaimed, Refused> {
         let mut store = Store::new();
         store.scan(dir).unwrap();
-        reclaim(dir, p, &mut store, &HashSet::new(), &HashSet::new()).unwrap()
+        reclaim(dir, rel, &mut store, &HashSet::new(), &HashSet::new()).unwrap()
     }
 
     #[test]
@@ -186,7 +211,7 @@ mod tests {
         let dir = scratch("basic");
         let p = synced(&dir, "report.pdf", &vec![b'x'; 8192]);
 
-        assert_eq!(run(&dir, &p).unwrap(), Reclaimed { bytes: 8192 });
+        assert_eq!(run(&dir, "report.pdf").unwrap(), Reclaimed { bytes: 8192 });
 
         let md = std::fs::metadata(&p).unwrap();
         assert_eq!(md.len(), 8192, "the size no longer describes the object");
@@ -212,7 +237,7 @@ mod tests {
         std::fs::write(&p, b"written offline, never sent").unwrap();
         stamp::write(&p).unwrap();
 
-        assert_eq!(run(&dir, &p), Err(Refused::NotUploaded));
+        assert_eq!(run(&dir, "draft.md"), Err(Refused::NotUploaded));
         assert_eq!(std::fs::read(&p).unwrap(), b"written offline, never sent");
     }
 
@@ -224,7 +249,7 @@ mod tests {
         let p = synced(&dir, "notes.txt", b"the version we sent");
         std::fs::write(&p, b"a later version that was never sent anywhere").unwrap();
 
-        assert_eq!(run(&dir, &p), Err(Refused::ChangedSinceUpload));
+        assert_eq!(run(&dir, "notes.txt"), Err(Refused::ChangedSinceUpload));
         assert_eq!(
             std::fs::read(&p).unwrap(),
             b"a later version that was never sent anywhere"
@@ -246,12 +271,13 @@ mod tests {
         store.scan(&dir).unwrap();
         let waiting: HashSet<FileId> = [id].into_iter().collect();
         assert_eq!(
-            reclaim(&dir, &p, &mut store, &waiting, &HashSet::new()).unwrap(),
+            reclaim(&dir, "doc.txt", &mut store, &waiting, &HashSet::new()).unwrap(),
             Err(Refused::UploadPending)
         );
         // And the same file being sent right now.
         assert_eq!(
-            reclaim(&dir, &p, &mut store, &HashSet::new(), &[id].into_iter().collect()).unwrap(),
+            reclaim(&dir, "doc.txt", &mut store, &HashSet::new(), &[id].into_iter().collect())
+                .unwrap(),
             Err(Refused::UploadPending)
         );
         assert_eq!(std::fs::read(&p).unwrap(), b"content");
@@ -260,9 +286,9 @@ mod tests {
     #[test]
     fn evicting_a_placeholder_is_refused_rather_than_repeated() {
         let dir = scratch("already");
-        let p = synced(&dir, "a.bin", &vec![b'y'; 256]);
-        run(&dir, &p).unwrap();
-        assert_eq!(run(&dir, &p), Err(Refused::AlreadyDehydrated));
+        synced(&dir, "a.bin", &vec![b'y'; 256]);
+        run(&dir, "a.bin").unwrap();
+        assert_eq!(run(&dir, "a.bin"), Err(Refused::AlreadyDehydrated));
     }
 
     /// The trigger names a file, so the name is untrusted input.
@@ -275,10 +301,117 @@ mod tests {
         let mut store = Store::new();
         store.scan(&dir).unwrap();
         assert!(matches!(
-            reclaim(&dir, &outside, &mut store, &HashSet::new(), &HashSet::new()).unwrap(),
+            reclaim(
+                &dir,
+                outside.to_str().unwrap(),
+                &mut store,
+                &HashSet::new(),
+                &HashSet::new()
+            )
+            .unwrap(),
             Err(Refused::NotEligible(_))
         ));
         assert_eq!(std::fs::read(&outside).unwrap(), b"someone else's file");
+    }
+
+    /// The shape the first guard let through.
+    ///
+    /// It compared components lexically, and `Path::starts_with` does not
+    /// resolve `..` — so every escaping path *began* with the root and passed.
+    /// Eviction then replaced a file outside the sync directory with a
+    /// placeholder whose cloud id resolves nowhere, which is that file's content
+    /// destroyed and reading it as zeros forever.
+    ///
+    /// The escape is only interesting for a file that has hydration xattrs, and
+    /// that is not exotic: a rename out of the sync tree preserves them, and a
+    /// second sync root under a shared parent is reachable as `../other/x`.
+    #[test]
+    fn a_path_that_walks_out_of_the_sync_directory_is_refused() {
+        let dir = scratch("escape");
+        let victim = dir.parent().unwrap().join("escape-victim.txt");
+        std::fs::write(&victim, b"the only copy of this").unwrap();
+        // Given the same marks a file that had once been synced would carry.
+        store::set_xattr(&victim, store::XATTR_ID, b"cloud-1").unwrap();
+        stamp::write(&victim).unwrap();
+
+        let mut store = Store::new();
+        store.scan(&dir).unwrap();
+        assert!(
+            matches!(
+                reclaim(
+                    &dir,
+                    "../escape-victim.txt",
+                    &mut store,
+                    &HashSet::new(),
+                    &HashSet::new()
+                )
+                .unwrap(),
+                Err(Refused::NotEligible(_))
+            ),
+            "a `..` walked out of the sync directory and evicted someone else's file"
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"the only copy of this");
+    }
+
+    /// Every shape a caller might send, refused without the daemon minding.
+    ///
+    /// The control socket is line-oriented and takes the argument verbatim, so
+    /// these are literally what arrives. A refusal has to be a value, not a
+    /// panic: the daemon serving this is the same one holding every reader's
+    /// hydration open.
+    #[test]
+    fn hostile_arguments_are_refused_and_none_of_them_panic() {
+        let dir = scratch("hostile");
+        let mut store = Store::new();
+        store.scan(&dir).unwrap();
+        for arg in [
+            "../../../etc/hosts",
+            "/etc/passwd",
+            "..",
+            "",
+            ".",
+            "./x",
+            "a/../../b",
+            "sub/../../../out",
+            ".hydration-manifest",
+            "\u{0}weird",
+        ] {
+            let out = reclaim(&dir, arg, &mut store, &HashSet::new(), &HashSet::new());
+            assert!(
+                matches!(out, Ok(Err(Refused::NotEligible(_))) | Err(_)),
+                "{arg:?} was not refused: {out:?}"
+            );
+        }
+    }
+
+    /// And the same escape through a symlinked subdirectory, which no amount of
+    /// component checking catches — the path is entirely `Normal`.
+    #[test]
+    fn a_symlinked_subdirectory_cannot_be_used_to_escape() {
+        let dir = scratch("symlink-escape");
+        let victim = dir.parent().unwrap().join("symlink-victim.txt");
+        std::fs::write(&victim, b"also the only copy").unwrap();
+        store::set_xattr(&victim, store::XATTR_ID, b"cloud-1").unwrap();
+        stamp::write(&victim).unwrap();
+        std::os::unix::fs::symlink(dir.parent().unwrap(), dir.join("out")).unwrap();
+
+        let mut store = Store::new();
+        store.scan(&dir).unwrap();
+        assert!(
+            matches!(
+                reclaim(
+                    &dir,
+                    "out/symlink-victim.txt",
+                    &mut store,
+                    &HashSet::new(),
+                    &HashSet::new()
+                )
+                .unwrap(),
+                Err(Refused::NotEligible(_))
+            ),
+            "a symlinked subdirectory led eviction out of the sync directory"
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"also the only copy");
     }
 
     /// And the framework's own files are not the user's to reclaim.
@@ -291,7 +424,14 @@ mod tests {
         let mut store = Store::new();
         store.scan(&dir).unwrap();
         assert!(matches!(
-            reclaim(&dir, &p, &mut store, &HashSet::new(), &HashSet::new()).unwrap(),
+            reclaim(
+                &dir,
+                hydration_protocol::names::MANIFEST,
+                &mut store,
+                &HashSet::new(),
+                &HashSet::new()
+            )
+            .unwrap(),
             Err(Refused::NotEligible(_))
         ));
     }

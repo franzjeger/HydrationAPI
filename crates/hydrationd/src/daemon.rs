@@ -753,7 +753,8 @@ pub struct SuperviseReport {
     pub stranded_answered: Option<i32>,
     pub denied_after: usize,
     /// The worker was alive but had stopped answering. §6a-bis: this is the
-    /// unrecoverable case, and the mount has to come down — the binary turns it
-    /// into a non-zero exit so `BindsTo=` tears the mount unit down with it.
+    /// unrecoverable case, and the mount has to come down. The binary detaches
+    /// it itself and then exits non-zero, in that order — exiting first would
+    /// close the group, and a marked mount with no group fails *open*.
     pub stalled: bool,
 }

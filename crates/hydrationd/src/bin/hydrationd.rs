@@ -283,9 +283,12 @@ fn main() -> io::Result<()> {
     // new access, while this process stays alive to answer everything already in
     // flight with EIO.
     //
-    // `BindsTo=` in the unit covers the same ground from systemd's side. Doing it
-    // here too means the guarantee does not depend on having been deployed with
-    // the supplied units.
+    // Done here rather than left to systemd, so the guarantee does not depend on
+    // having been deployed with the supplied units. The unit's dependency runs
+    // the other way round — it makes the service depend on the mount — and what
+    // it contributes is the recovery: this process exits non-zero, systemd
+    // restarts it, and `RequiresMountsFor=` brings the mount back with it
+    // (measured; DESIGN.md §8b).
     let detached = unsafe {
         let c = std::ffi::CString::new(args.mount.as_os_str().as_encoded_bytes()).unwrap();
         libc::umount2(c.as_ptr(), libc::MNT_DETACH) == 0
@@ -295,7 +298,8 @@ fn main() -> io::Result<()> {
         if detached {
             "mount detached"
         } else {
-            "could not detach the mount (see the unit's BindsTo=)"
+            "could not detach the mount — anything still reading through it is \
+             unprotected until the unit comes back"
         }
     );
 

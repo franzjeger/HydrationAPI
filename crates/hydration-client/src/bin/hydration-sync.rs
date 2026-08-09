@@ -234,6 +234,12 @@ fn control(
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
 
     for conn in listener.incoming().flatten() {
+        // A peer that connects and never speaks must not become the reason
+        // nobody else can. Connections are handled on the accept thread, so
+        // without this a single silent client parks the user's only status and
+        // eviction channel indefinitely — and it is the channel they would
+        // reach for to find out why nothing is responding.
+        let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
         let reader = BufReader::new(match conn.try_clone() {
             Ok(c) => c,
             Err(_) => continue,
@@ -243,7 +249,12 @@ fn control(
             let (verb, arg) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
             let reply = match verb {
                 "evict" => {
-                    let target = mount.join(arg.trim_start_matches('/'));
+                    // The argument goes through unchanged. Trimming or joining
+                    // it here would mean two places decide what a path means,
+                    // and `reclaim` is the one that has to be right — it
+                    // resolves through `safe_join` and then through the
+                    // filesystem, so neither `..` nor a symlinked subdirectory
+                    // can lead it out of the sync directory.
                     // Snapshotted, so the control socket never holds the queue
                     // across a directory walk.
                     let (waiting, sending) = {
@@ -252,7 +263,7 @@ fn control(
                     };
                     let mut store = Store::new();
                     let _ = store.scan(&mount);
-                    match reclaim::reclaim(&mount, &target, &mut store, &waiting, &sending) {
+                    match reclaim::reclaim(&mount, arg, &mut store, &waiting, &sending) {
                         Ok(Ok(r)) => format!("reclaimed {} bytes", r.bytes),
                         Ok(Err(why)) => format!("kept: {why:?}"),
                         Err(e) => format!("error: {e}"),

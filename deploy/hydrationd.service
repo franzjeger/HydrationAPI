@@ -44,15 +44,14 @@ ExecStart=/usr/local/bin/hydrationd --mount /home/CHANGE-ME/OneDrive --socket /r
 # fanotify group and a marked mount with no group fails *open* — every
 # placeholder becomes a source of zeros.
 #
-# The intended chain is: helper detaches and exits non-zero -> Restart=always
-# brings it back -> BindsTo pulls the mount up again -> it reconnects to the
-# sync daemon on startup. That is how a client restart is survived; there is no
-# in-process reconnect path.
+# The mount coming down is the helper's own `umount2(MNT_DETACH)`, not a systemd
+# dependency: the dependency here runs the other way, and makes this service
+# depend on the mount rather than the reverse. What systemd contributes is the
+# recovery — this restarts, and RequiresMountsFor= brings the mount back with
+# it. Measured; see DESIGN.md §8b.
 #
-# NOT VERIFIED against a running systemd (see DESIGN.md §9). The uncertainty is
-# whether systemd treats the BindsTo-driven stop as a deliberate stop, which
-# would suppress the restart, rather than as the failure the exit code reports.
-# If it does, the unit needs an explicit restart path rather than this chain.
+# A client restart is survived the same way: the helper's socket dies, it gives
+# up, and the pair is rebuilt. There is no in-process reconnect path.
 Restart=always
 RestartSec=1
 
