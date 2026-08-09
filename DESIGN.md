@@ -1364,17 +1364,35 @@ lesing av en fil med innhold. To konsekvenser:
 
 ---
 
-## 9. Det jeg ikke fikk verifisert
+## 8b. `BindsTo=` river ned og kommer ikke tilbake
 
-**Gjenopprettingskjeden i systemd-enhetene.** Hjelperen avslutter med en
-feilkode når den ikke kan komme seg — en fastlåst henter, eller en synk-daemon
-som forsvant. Den kobler fra monteringen først, siden det å avslutte ville lukket
-fanotify-gruppen, og en merket montering uten gruppe feiler *åpent*. Tanken er at
-`Restart=always` henter den opp igjen og `BindsTo` drar monteringen med.
-Usikkerheten er om systemd behandler stoppet som `BindsTo` utløser som en
-*bevisst* stopp, som ville undertrykt omstarten, framfor som den feilen
-exitkoden melder. Det er ikke testet mot en kjørende systemd, og hvis det slår
-feil trenger enheten en eksplisitt omstartssti framfor denne kjeden.
+Enhetene ble skrevet med `BindsTo=` fordi det uttrykker kravet presist: en merket
+montering må ikke overleve prosessen som svarer på hendelsene dens. Det gjør det
+også. Men hjelperen kobler selv fra monteringen på vei ut (§6a-bis), og da leser
+systemd den resulterende stoppen som *bevisst* og undertrykker omstarten helt.
+
+Målt med kastbare enheter som speiler paret:
+
+| Avhengighet | Etter at hjelperen kobler fra og avslutter med 75 |
+|---|---|
+| `BindsTo=` (som levert) | tjeneste inaktiv, montering inaktiv, **0 omstarter** |
+| `Requires=` | tjeneste inaktiv, montering inaktiv, **0 omstarter** |
+| `Wants=` | tjeneste aktiv, **montering inaktiv** |
+| `RequiresMountsFor=` | tjeneste aktiv, montering aktiv, 2 omstarter |
+
+Med `BindsTo=` ville altså enhver uopprettelig tilstand — en fastlåst henter,
+en synk-daemon som forsvant — tatt utrullingen permanent ned. `Wants=` starter
+tjenesten igjen uten monteringen, som bare gir en omstartsløkke.
+`RequiresMountsFor=` gjenoppretter fullt, tre av tre, og beholder
+sikkerhetsegenskapen: en administrators `umount` stopper fortsatt tjenesten
+(målt).
+
+Forskjellen er usynlig i enhetsfilen og total i praksis, som er grunnen til at
+den er skrevet ned framfor bare rettet.
+
+---
+
+## 9. Det jeg ikke fikk verifisert
 
 Det finnes ingen gjentilkobling i prosessen. En klientomstart overlever ved at
 paret bygges opp på nytt, ikke ved at forbindelsen repareres.
