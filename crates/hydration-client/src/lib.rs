@@ -82,6 +82,20 @@ pub struct Daemon<P: Provider> {
     /// Mounts other than our own that expose the sync files, most recently
     /// reported by the helper. §6.4a: we cannot prevent these, only surface them.
     exposures: Vec<String>,
+    changes: Option<Box<dyn Changes>>,
+}
+
+/// What to do about a local edit the helper noticed.
+///
+/// A trait rather than a channel, so the daemon loop hands the change over and
+/// returns to reading immediately. Implementations must not block: this runs on
+/// the thread that answers fetches, and a reader is waiting inside `read()` for
+/// every moment it spends elsewhere.
+pub trait Changes: Send {
+    /// These inodes were written by someone other than the framework.
+    fn changed(&mut self, files: &[FileId]);
+    /// The change channel has a hole in it; walk the directory instead.
+    fn resync(&mut self);
 }
 
 impl<P: Provider> Daemon<P> {
@@ -92,6 +106,7 @@ impl<P: Provider> Daemon<P> {
             provider,
             store,
             root: root.to_path_buf(),
+            changes: None,
             exposures: Vec::new(),
         })
     }
@@ -112,6 +127,16 @@ impl<P: Provider> Daemon<P> {
     /// not be silent.
     pub fn exposures(&self) -> &[String] {
         &self.exposures
+    }
+
+    /// Where local changes go once the helper reports them.
+    ///
+    /// Injected rather than owned, because the queue belongs to the upload
+    /// driver and this loop must never wait on its lock: a fetch reply that
+    /// queued behind an upload's bookkeeping would hold a reader inside `read()`
+    /// for no reason.
+    pub fn on_change(&mut self, sink: Box<dyn Changes>) {
+        self.changes = Some(sink);
     }
 
     /// Serve until the helper goes away.
@@ -142,6 +167,21 @@ impl<P: Provider> Daemon<P> {
                 },
                 FromHelper::ExposureChanged { mounts } => {
                     self.exposures = mounts;
+                }
+                FromHelper::Changed { files } => {
+                    if let Some(sink) = self.changes.as_mut() {
+                        sink.changed(&files);
+                    }
+                }
+                FromHelper::Resync => {
+                    // Not an error. The helper is saying its change channel has
+                    // a hole in it, which is a normal state — the notify queue
+                    // overflows in seconds under an unpack — and the only honest
+                    // recovery is to look at the directory rather than believe
+                    // the channel.
+                    if let Some(sink) = self.changes.as_mut() {
+                        sink.resync();
+                    }
                 }
             }
         }

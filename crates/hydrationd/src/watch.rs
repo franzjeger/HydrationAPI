@@ -26,6 +26,9 @@ use std::path::Path;
 
 /// Content events, which arrive with a file descriptor.
 pub const FAN_MODIFY: u64 = 0x0000_0002;
+/// The kernel had to drop events. Delivered as a bare marker with no descriptor
+/// and no file — there is nothing left to say which changes were lost.
+pub const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
 pub const FAN_CLOSE_WRITE: u64 = 0x0000_0008;
 
 // Deliberately not watched here: FAN_MOVED_FROM, FAN_MOVED_TO, FAN_DELETE and
@@ -65,6 +68,8 @@ pub struct Watcher {
     group: Group,
     /// Writes from these processes are ours and are not changes.
     ignore_pids: Vec<i32>,
+    /// The kernel dropped events because its queue was full.
+    overflowed: bool,
 }
 
 impl Watcher {
@@ -76,7 +81,21 @@ impl Watcher {
     pub fn new(mount: &Path, ignore_pids: Vec<i32>) -> io::Result<Self> {
         let group = Group::new_notify()?;
         group.mark_mount_events(mount, FAN_MODIFY | FAN_CLOSE_WRITE)?;
-        Ok(Self { group, ignore_pids })
+        Ok(Self {
+            group,
+            ignore_pids,
+            overflowed: false,
+        })
+    }
+
+    /// Whether the kernel dropped events since this was last asked.
+    ///
+    /// Reports and clears, so a caller cannot see the same overflow twice and
+    /// resync forever. Asking is the caller's obligation: after an overflow the
+    /// only honest recovery is to walk the directory, and the events that were
+    /// dropped are gone.
+    pub fn take_overflow(&mut self) -> bool {
+        std::mem::take(&mut self.overflowed)
     }
 
     /// Collect whatever has happened, without blocking indefinitely.
@@ -97,6 +116,16 @@ impl Watcher {
 
         for ev in fanotify::events(&buf, len) {
             if ev.fd < 0 {
+                // The queue-overflow marker arrives with no descriptor. It was
+                // being skipped with everything else fd-less, which meant the
+                // one signal that says "you have missed changes" was the one
+                // thing silently discarded. Measured: the queue holds 16384
+                // distinct objects and overflows in under two seconds when
+                // something unpacks an archive, so this is a normal event, not
+                // an exotic one.
+                if ev.mask & FAN_Q_OVERFLOW != 0 {
+                    self.overflowed = true;
+                }
                 continue;
             }
             // Ours. Dropping it here is what stops hydration from looking like a

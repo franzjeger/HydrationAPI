@@ -51,7 +51,7 @@ use crate::delta::Materialise;
 use crate::store;
 use hydration_protocol::xattr;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 /// Builds placeholders on anonymous inodes and links them into place.
@@ -231,6 +231,13 @@ impl Materialise for TmpfilePlacer {
         if unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) } < 0 {
             return Err(io::Error::last_os_error());
         }
+
+        // Stamped while still anonymous, so the file has never existed under a
+        // name in an unstamped state. A placeholder with no stamp reads as
+        // "content the framework has never touched", which is what protects a
+        // user's own files from being replaced — so a placeholder that arrived
+        // without one would be protected from the very refresh it needs.
+        let _ = hydration_protocol::stamp::write_fd(fd.as_fd());
 
         self.seq += 1;
         Self::link_into_place(&fd, path, self.seq)

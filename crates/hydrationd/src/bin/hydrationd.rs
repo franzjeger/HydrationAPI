@@ -17,6 +17,7 @@ use hydrationd::daemon::{Worker, DEFAULT_STALL};
 use hydrationd::exposure::ExposureWatch;
 use hydrationd::fanotify::Group;
 use hydrationd::policy::Policy;
+use hydrationd::report;
 use hydrationd::remote::SocketFetch;
 use hydrationd::supervisor::{deny, InFlight};
 use std::io;
@@ -54,7 +55,21 @@ fn parse() -> Args {
 }
 
 /// Who is on the other end of this socket, from the kernel rather than from them.
+/// The peer's pid, from the same kernel-filled structure as its uid.
+///
+/// Needed because writes by the sync daemon are not local edits: it is the
+/// process that writes hydrated content back through the socket, and reporting
+/// its writes as changes would upload every hydration straight back. Taken from
+/// `SO_PEERCRED` rather than from anything the peer says about itself.
+fn peer_pid(sock: &UnixStream) -> io::Result<i32> {
+    peer_cred(sock).map(|c| c.0)
+}
+
 fn peer_uid(sock: &UnixStream) -> io::Result<u32> {
+    peer_cred(sock).map(|c| c.1)
+}
+
+fn peer_cred(sock: &UnixStream) -> io::Result<(i32, u32)> {
     use std::os::fd::AsRawFd;
     #[repr(C)]
     struct Ucred {
@@ -80,7 +95,7 @@ fn peer_uid(sock: &UnixStream) -> io::Result<u32> {
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(cred.uid)
+    Ok((cred.pid, cred.uid))
 }
 
 fn connect(args: &Args) -> io::Result<UnixStream> {
@@ -137,6 +152,10 @@ fn main() -> io::Result<()> {
         }
     };
 
+    // Read before the fork, because after it the child needs it and the parent
+    // has no reason to ask again.
+    let watched_pid = peer_pid(&stream).unwrap_or(0);
+
     let group = Group::new_pre_content()?;
     group.mark_mount(&args.mount)?;
     let in_flight = InFlight::new();
@@ -150,7 +169,30 @@ fn main() -> io::Result<()> {
     }
 
     if child == 0 {
-        let fetch = SocketFetch::new(HelperConn::new(stream).unwrap(), &args.mount);
+        let conn = HelperConn::new(stream).unwrap();
+
+        // Change detection, on its own threads so the event loop never waits on
+        // the socket. Spawned after the fork, never before.
+        //
+        // Both pids are ignored: our own, because the worker writes hydrated
+        // content, and the daemon's, because it writes uploads and placeholders.
+        // Reporting either as a local edit would upload the framework's own work
+        // straight back. Pid filtering is an optimisation rather than the
+        // correctness boundary — the daemon checks content before uploading —
+        // but without it the loop is tight enough to matter.
+        match report::Reporter::spawn(
+            &args.mount,
+            vec![unsafe { libc::getpid() }, watched_pid],
+            conn.notifier(),
+            Duration::from_millis(250),
+        ) {
+            Ok(_) => eprintln!("[worker] watching {} for local changes", args.mount.display()),
+            // Not fatal. Hydration is the guarantee; change detection is the
+            // feature, and the daemon walks the directory anyway.
+            Err(e) => eprintln!("[worker] change detection unavailable: {e}"),
+        }
+
+        let fetch = SocketFetch::new(conn, &args.mount);
         let mut w = Worker::new(group, fetch, Policy::default(), worker_view);
         // No deadline on the loop itself: this is the service, not a test. The
         // per-event deadline is what bounds any single reader's wait.

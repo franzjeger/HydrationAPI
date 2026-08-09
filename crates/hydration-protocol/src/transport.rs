@@ -12,11 +12,40 @@
 use crate::{decode, encode, FetchResponse, FromHelper, ToHelper};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex};
 
 /// The helper's end.
+///
+/// The writer is shared and the reader is not, which is what lets the helper
+/// send unsolicited messages — change notifications — from a thread other than
+/// the one waiting on a fetch reply. Two writers on one socket would interleave
+/// their lines and destroy the framing, so every write goes through the same
+/// lock; the lock is never held across a read, so a slow reply cannot stall a
+/// notification or the other way round.
 pub struct HelperConn {
     reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    writer: Arc<Mutex<UnixStream>>,
+}
+
+/// A send-only handle onto a [`HelperConn`], for threads that only report.
+///
+/// Deliberately cannot receive. A second reader on the socket would take replies
+/// belonging to the fetch path and match them to the wrong request, which is the
+/// one failure this framing exists to make impossible.
+#[derive(Clone)]
+pub struct Notifier {
+    writer: Arc<Mutex<UnixStream>>,
+}
+
+impl Notifier {
+    pub fn send(&self, msg: &FromHelper) -> io::Result<()> {
+        let line = encode(msg).map_err(io::Error::other)?;
+        let mut w = self.writer.lock().map_err(|_| {
+            io::Error::other("the connection lock was poisoned by a panicking writer")
+        })?;
+        w.write_all(line.as_bytes())?;
+        w.flush()
+    }
 }
 
 /// The sync daemon's end.
@@ -33,13 +62,21 @@ fn split(stream: UnixStream) -> io::Result<(BufReader<UnixStream>, UnixStream)> 
 impl HelperConn {
     pub fn new(stream: UnixStream) -> io::Result<Self> {
         let (reader, writer) = split(stream)?;
-        Ok(Self { reader, writer })
+        Ok(Self {
+            reader,
+            writer: Arc::new(Mutex::new(writer)),
+        })
+    }
+
+    /// A handle for reporting from another thread.
+    pub fn notifier(&self) -> Notifier {
+        Notifier {
+            writer: Arc::clone(&self.writer),
+        }
     }
 
     pub fn send(&mut self, msg: &FromHelper) -> io::Result<()> {
-        let line = encode(msg).map_err(io::Error::other)?;
-        self.writer.write_all(line.as_bytes())?;
-        self.writer.flush()
+        self.notifier().send(msg)
     }
 
     /// Read one response, and its content if it has any.

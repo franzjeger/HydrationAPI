@@ -140,6 +140,27 @@ pub fn apply<M: Materialise, C: crate::upload::Clock>(
                             out.kept_local.push(path.clone());
                             continue;
                         }
+                        // And the queue is not enough on its own.
+                        //
+                        // `is_waiting` only knows about edits somebody told us
+                        // about, and change detection is lossy in ways that have
+                        // been measured: the notify queue overflows in under two
+                        // seconds under an unpack, `truncate(2)` produces no
+                        // event at all, and nothing at all is reported while the
+                        // helper is down. Every one of those gaps ends here — at
+                        // a `place()` that renames a placeholder over content
+                        // that exists nowhere else, counted as a successful
+                        // update.
+                        //
+                        // So the file is asked directly whether it still looks
+                        // the way the framework left it. Silence is not evidence.
+                        if matches!(
+                            hydration_protocol::stamp::state(&abs),
+                            Ok(hydration_protocol::stamp::State::Dirty)
+                        ) {
+                            out.kept_local.push(path.clone());
+                            continue;
+                        }
                         match mat.place(&abs, *size, cloud_id, etag.as_deref()) {
                             Ok(()) => out.updated += 1,
                             Err(_) => out.failed.push(path.clone()),
@@ -162,6 +183,16 @@ pub fn apply<M: Materialise, C: crate::upload::Clock>(
                 // delete, because the edit is the newer intention *here* and
                 // nothing else has a copy of it.
                 if queue.is_waiting(&id) {
+                    out.kept_local.push(entry.path.display().to_string());
+                    continue;
+                }
+                // Same check as the upsert side, for the same reason: a delete
+                // is the more destructive of the two, and a lost notification
+                // must not be what decides it.
+                if matches!(
+                    hydration_protocol::stamp::state(&entry.path),
+                    Ok(hydration_protocol::stamp::State::Dirty)
+                ) {
                     out.kept_local.push(entry.path.display().to_string());
                     continue;
                 }

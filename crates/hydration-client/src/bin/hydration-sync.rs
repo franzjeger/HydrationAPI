@@ -26,8 +26,9 @@ use hydration_client::place::TmpfilePlacer;
 use hydration_client::providers::FolderCloud;
 use hydration_client::store::Store;
 use hydration_client::upload::{run_upload, Queue, SystemClock};
-use hydration_client::Daemon;
+use hydration_client::{Changes, Daemon};
 use hydration_protocol::transport::DaemonConn;
+use hydration_protocol::FileId;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
@@ -94,6 +95,73 @@ fn default_socket() -> PathBuf {
         .join("hydration-sync.sock")
 }
 
+/// Local edits, from the helper into the upload queue.
+///
+/// Deliberately does almost nothing: this runs on the thread that answers
+/// fetches, and a reader is blocked inside `read()` for every moment it spends
+/// elsewhere. Touching the queue takes a lock the upload driver holds only for
+/// bookkeeping, never across an upload.
+struct QueueChanges {
+    queue: Arc<Mutex<Queue<SystemClock>>>,
+    resync: Arc<AtomicBool>,
+}
+
+impl Changes for QueueChanges {
+    fn changed(&mut self, files: &[FileId]) {
+        let Ok(mut q) = self.queue.lock() else { return };
+        for f in files {
+            q.touch(*f);
+        }
+    }
+
+    fn resync(&mut self) {
+        // The channel admitted it is incomplete. Walking is the only honest
+        // recovery: the dropped events are gone, and nothing else will mention
+        // those files again.
+        self.resync.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Everything in the sync directory that no longer looks the way the framework
+/// left it.
+///
+/// Deliberately not "everything with a cloud id", and deliberately not
+/// "everything": a file the framework has never written is the user's own and is
+/// left to change detection, or it would be queued for upload on every resync
+/// forever. Only files that were once clean and are no longer count.
+fn dirty_files(root: &std::path::Path) -> io::Result<Vec<FileId>> {
+    use hydration_protocol::stamp::{self, State};
+    use std::os::unix::fs::MetadataExt;
+
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir)?.flatten() {
+            let path = e.path();
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !md.is_file()
+                || path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(hydration_protocol::names::is_internal)
+            {
+                continue;
+            }
+            if matches!(stamp::state(&path), Ok(State::Dirty)) {
+                out.push(FileId {
+                    fsid: md.dev(),
+                    ino: md.ino(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn main() -> io::Result<()> {
     let args = parse();
     if !args.mount.is_dir() {
@@ -121,6 +189,9 @@ fn main() -> io::Result<()> {
         SystemClock::default(),
     )));
     let stop = Arc::new(AtomicBool::new(false));
+    // Set when the helper says its change channel has a hole in it, so the
+    // upload driver walks instead of trusting what it was told.
+    let resync = Arc::new(AtomicBool::new(true));
 
     // Unix socket paths are capped at roughly 108 bytes by the kernel, which is
     // short enough to hit with an ordinary XDG_RUNTIME_DIR under a long home.
@@ -151,11 +222,12 @@ fn main() -> io::Result<()> {
     // The upload driver keeps its own store: a held upload must never block a
     // status query behind a shared lock.
     {
-        let (q, stop, mount, clouddir) = (
+        let (q, stop, mount, clouddir, resync) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             args.mount.clone(),
             args.cloud.clone(),
+            Arc::clone(&resync),
         );
         std::thread::spawn(move || {
             let Ok(mut sink) = FolderCloud::open(&clouddir) else {
@@ -163,6 +235,31 @@ fn main() -> io::Result<()> {
             };
             let mut store = Store::new();
             while !stop.load(Ordering::SeqCst) {
+                // Close the holes in the change channel by looking, rather than
+                // by trusting that nothing was missed.
+                //
+                // Set at startup, whenever the helper reconnects, and whenever
+                // it reports an overflow — three states in which edits happened
+                // that produced no event anyone will ever see. The walk costs a
+                // stat per file, and this thread already walks the tree before
+                // every batch.
+                if resync.swap(false, Ordering::SeqCst) {
+                    match dirty_files(&mount) {
+                        Ok(found) if !found.is_empty() => {
+                            eprintln!(
+                                "hydration-sync: resync found {} file(s) changed with no event",
+                                found.len()
+                            );
+                            let mut queue = q.lock().unwrap();
+                            for f in found {
+                                queue.touch(f);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("hydration-sync: resync walk failed: {e}"),
+                    }
+                }
+
                 let due = q.lock().unwrap().due();
                 if !due.is_empty() {
                     let _ = store.scan(&mount);
@@ -278,6 +375,14 @@ fn main() -> io::Result<()> {
         ) {
             (Ok(_), Ok(mut daemon)) => {
                 eprintln!("hydration-sync: helper connected");
+                // Every new connection is a resync point. The helper may have
+                // been restarted, and anything edited while it was gone produced
+                // no event at all.
+                resync.store(true, Ordering::SeqCst);
+                daemon.on_change(Box::new(QueueChanges {
+                    queue: Arc::clone(&queue),
+                    resync: Arc::clone(&resync),
+                }));
                 let mut c = DaemonConn::new(conn)?;
                 if let Err(e) = daemon.serve(&mut c) {
                     eprintln!("hydration-sync: helper connection ended: {e}");

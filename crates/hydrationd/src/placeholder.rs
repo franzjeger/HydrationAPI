@@ -259,6 +259,16 @@ pub fn hydrate_fd(
         Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
         Err(e) => return Err(e),
     }
+
+    // And record what we just wrote, so a later pass can tell this content from
+    // a user's edit without having been told about either. Last, because it
+    // records the mtime the write produced — and safely last, because setting an
+    // extended attribute moves ctime rather than mtime.
+    //
+    // A failure here is not a failed hydration: the content is in place and the
+    // reader is entitled to it. It costs an unnecessary upload later, which is
+    // the harmless direction.
+    let _ = hydration_protocol::stamp::write_fd(fd);
     Ok(())
 }
 

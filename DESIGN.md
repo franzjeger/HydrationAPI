@@ -1162,6 +1162,64 @@ disken.
 
 ---
 
+## 6g. Endringsdeteksjon: kanalen er en optimalisering, aldri en autoritet
+
+Vakten fantes og var testet, men ingen binær opprettet en. En lokal redigering
+ble derfor aldri lastet opp i en ekte kjøring. Det er nå koblet, og formen er
+styrt av to målinger.
+
+**Sending kan ikke skje i hendelsesløkken.** En AF_UNIX-strøm tar imot ~278
+korte meldinger på standard `SO_SNDBUF` før avsenderen blokkerer — kjernen
+belaster en hel skb per liten sending, ikke nyttelasten. En arbeider som
+blokkerer i `write()` slutter å svare på pre-content-hendelser, og verre: vakten
+fra §6a-bis ser det ikke. Stallvakten fyrer på *å holde en hendelse uten
+fremdrift*, og en arbeider som blokkerer mellom hendelser holder ingenting. Den
+klassifiseres som ledig, for alltid, mens hver leser på monteringen henger.
+Monteringen ser frisk ut. Ingenting kommer seg.
+
+Derfor tre tråder, alle startet etter `fork`:
+
+```
+drainer  ── leser varselgruppen, folder hver hendelse inn i et skittent sett
+              blokkerer aldri på annet enn en mutex
+sender   ── bytter ut settet, skriver én samlet linje
+              får gjerne blokkere; blokkerer bare seg selv, mens settet absorberer
+arbeider ── svarer på pre-content-hendelser, rører ingen av delene
+```
+
+Å folde inn i et sett er ikke en påplussing: det er den samme sammenslåingen
+kjernen allerede gjør. Målt — 10 000 vekslende skrivinger til to filer ga to
+hendelser, med `MODIFY` og `CLOSE_WRITE` slått sammen per objekt. Settet
+fortsetter det forbi kjernens grense på 16 384 objekter, og størrelsen er
+begrenset av antall filer på monteringen, ikke av hvor mye som skrives.
+
+**Ingen destruktiv sti får stole på stillhet.** Endringsdeteksjon er tapsutsatt
+oppstrøms for socketen uansett hva som bygges: varselkøen renner over på under to
+sekunder under en arkivutpakking, `truncate(2)` gir ingen hendelse i det hele
+tatt, og redigeringer mens hjelperen er nede gir aldri noen. Hvert av de hullene
+ender samme sted — i et `place()` som døper en placeholder over innhold som ikke
+finnes noe annet sted, og teller det som en vellykket oppdatering.
+
+Så filen spørres direkte. På de tre øyeblikkene rammeverket selv gjør innhold
+rent — plassering, hydrering, opplasting — skriver det ned størrelsen og mtime-en
+det nettopp produserte (`user.hydration.stamp`). Alt annet som skriver flytter
+mtime, og uenigheten er synlig uten å ha blitt fortalt om. Delta-passet nekter nå
+å skrive over en fil som er `Dirty`, uavhengig av hva køen sier.
+
+`Unstamped` er bevisst ikke det samme som `Dirty`: en fil rammeverket aldri har
+skrevet er brukerens egen, og å kalle den «endret» ville lagt hele katalogen i
+opplastingskø ved første resync.
+
+Kanalen sier fra når den har hull. `FromHelper::Resync` sendes ved køoverløp —
+markøren kommer uten deskriptor og ble tidligere kastet sammen med alt annet
+fd-løst, altså var det ene signalet som sier «du har mistet endringer» det eneste
+som ble stille forkastet. Klienten vandrer da katalogen og sammenligner stempel
+mot `stat`. Det samme skjer ved oppstart og hver gang hjelperen kobler til på
+nytt, siden begge er tilstander der endringer skjedde som ingen hendelse
+noensinne vil nevne.
+
+---
+
 ## 7. Kostnad
 
 Forutsatt at klienten (auth, Graph-API, delta-sync) allerede finnes, som den gjør i

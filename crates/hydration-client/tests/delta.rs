@@ -62,6 +62,10 @@ impl Materialise for Recorder {
         if let Some(e) = etag {
             store::set_xattr(path, store::XATTR_ETAG, e.as_bytes())?;
         }
+        // The real placer stamps what it wrote; a stand-in that did not would
+        // leave every placeholder looking like content the framework has never
+        // touched.
+        hydration_protocol::stamp::write(path)?;
         Ok(())
     }
 
@@ -261,4 +265,66 @@ fn a_cloud_path_that_escapes_the_sync_root_is_refused() {
         "a remote service placed a file outside the sync directory: {:?}",
         m.placed
     );
+}
+
+/// The case that has no notification at all.
+///
+/// Every other protection here starts from the queue, and the queue only knows
+/// about edits somebody reported. Change detection is measurably lossy: the
+/// kernel's notify queue holds 16384 objects and overflows in under two seconds
+/// under an archive unpack, `truncate(2)` generates no event whatsoever, and
+/// nothing is reported while the helper is not running. Each of those ends in
+/// the same place — here, at a `place()` that renames a placeholder over content
+/// that exists nowhere else and counts it as a successful update.
+///
+/// So this test deliberately never touches the queue. The edit is invisible in
+/// exactly the way a dropped event makes it invisible, and the file itself is
+/// the only remaining witness.
+#[test]
+fn an_edit_nobody_reported_is_still_not_overwritten() {
+    let dir = scratch("lost-notification");
+    let mut m = Recorder::default();
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+
+    // A file that has been through the framework: placed, then uploaded. Both
+    // stamp it, so it is a file we are otherwise entitled to refresh.
+    run(&dir, &[upserted("doc.txt", 32, "cloud-1")], &q, &mut m);
+    let p = dir.join("doc.txt");
+    hydration_protocol::stamp::write(&p).expect("stamp");
+    assert_eq!(
+        hydration_protocol::stamp::state(&p).unwrap(),
+        hydration_protocol::stamp::State::Clean
+    );
+
+    // The user edits it. Nobody hears about it.
+    std::fs::write(&p, b"an edit that no event was ever delivered for").unwrap();
+
+    let out = run(&dir, &[upserted("doc.txt", 99, "cloud-1")], &q, &mut m);
+
+    assert_eq!(
+        out.kept_local,
+        vec!["doc.txt".to_string()],
+        "a delta pass overwrote an edit it had not been told about: {out:?}"
+    );
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        b"an edit that no event was ever delivered for"
+    );
+}
+
+/// The other half: a file the framework itself last wrote must stay refreshable,
+/// or nothing would ever update again.
+#[test]
+fn a_file_the_framework_last_wrote_is_still_refreshed() {
+    let dir = scratch("clean-refresh");
+    let mut m = Recorder::default();
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+
+    run(&dir, &[upserted("a.bin", 100, "cloud-1")], &q, &mut m);
+    let p = dir.join("a.bin");
+    hydration_protocol::stamp::write(&p).expect("stamp");
+
+    let out = run(&dir, &[upserted("a.bin", 250, "cloud-1")], &q, &mut m);
+    assert_eq!(out.updated, 1, "{out:?}");
+    assert_eq!(std::fs::metadata(&p).unwrap().len(), 250);
 }

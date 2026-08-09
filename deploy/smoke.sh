@@ -22,6 +22,11 @@ cleanup() {
   pkill -x hydrationd 2>/dev/null || true
   pkill -f 'hydration-sync --mount' 2>/dev/null || true
   rm -rf "$CLOUD" "$SOCK"
+  # Part 4 kills the worker, and the supervisor's response to an unrecoverable
+  # unit is to detach the mount (§6a-bis) — so by the end of a successful run
+  # the mount is deliberately gone. Saying so here rather than leaving whoever
+  # runs this next to wonder why their scratch mount vanished.
+  mountpoint -q "$MOUNT" || echo "note: $MOUNT was detached by the supervisor, as designed"
 }
 trap cleanup EXIT
 
@@ -85,7 +90,32 @@ GOT2=$(timeout 15 cat "$MOUNT/arrived.txt") || fail "reading the created placeho
 [ "$GOT2" = "arrived from the cloud after we started" ] || fail "wrong content: $GOT2"
 echo "PASS: a placeholder the framework created hydrated on first read"
 
-# 3. With the worker gone, a read fails rather than returning zeros.
+# 3. A local edit is noticed and uploaded.
+#
+# The part that had no wiring at all until now: the watcher existed and was
+# tested, but no binary constructed one, so an edit in the sync directory was
+# never uploaded in a real run. This is the whole path — fanotify in the helper,
+# a batched report across the socket, the debounce queue, the upload.
+printf 'edited by the user locally\n' > "$MOUNT/arrived.txt"
+chown "$SYNC_USER" "$MOUNT/arrived.txt"
+for _ in $(seq 40); do
+  grep -q 'edited by the user locally' "$CLOUD/obj-9" 2>/dev/null && break
+  sleep 1
+done
+grep -q 'edited by the user locally' "$CLOUD/obj-9" \
+  || fail "a local edit was never uploaded (see /tmp/smoke-sync.log)"
+echo "PASS: a local edit reached the cloud"
+
+# And the framework's own writing must not come back as a change. If hydration
+# looked like a user edit, the file just hydrated in part 2 would be uploaded
+# straight back and the two ends would never stop.
+SENT=$(grep -c 'upload' /tmp/smoke-sync.log || true)
+sleep 6
+AGAIN=$(grep -c 'upload' /tmp/smoke-sync.log || true)
+[ "$SENT" = "$AGAIN" ] || fail "uploads are still happening with nothing changed: $SENT -> $AGAIN"
+echo "PASS: the framework's own writes are not reported as changes"
+
+# 4. With the worker gone, a read fails rather than returning zeros.
 printf 'second object\n' > "$CLOUD/obj-2"; printf 'other.txt' > "$CLOUD/obj-2.name"
 kill -9 "$WORKER"; sleep 2
 SIZE2=$(stat -c %s "$CLOUD/obj-2")

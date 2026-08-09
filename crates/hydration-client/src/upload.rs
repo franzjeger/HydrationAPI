@@ -260,6 +260,14 @@ pub fn run_upload<S: Sink>(file: FileId, store: &mut Store, sink: &mut S) -> Out
         if let Err(e) = store.adopt_cloud_id(&path, &uploaded.cloud_id, uploaded.etag.as_deref()) {
             return Outcome::Failed(format!("could not record the cloud id: {e}"));
         }
+
+        // The third moment the framework makes content clean, and the reason
+        // this is not merely bookkeeping: without it, every file that has ever
+        // been uploaded looks unstamped, and a resync walk would queue the whole
+        // directory. Stamped from the file as it is *now*, so an edit that
+        // landed during the upload still reads as dirty and gets sent again.
+        let _ = hydration_protocol::stamp::write(&path);
+
         Outcome::Sent {
             cloud_id: uploaded.cloud_id,
         }

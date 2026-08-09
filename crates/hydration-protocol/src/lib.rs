@@ -160,6 +160,141 @@ pub mod xattr {
     // file rather than a claim about it.
 }
 
+/// What the framework last wrote, so "has the user touched this" is a question
+/// with an answer.
+///
+/// Change notifications are an optimisation, never an authority. Measured: the
+/// notify queue holds 16384 distinct objects and overflows in under two seconds
+/// under an archive unpack, `truncate(2)` produces no event at all, and every
+/// edit made while the helper was not running produced none either. So a
+/// destructive decision — replacing a file with a placeholder, or throwing its
+/// content away to reclaim disk — must never rest on *not having heard* about a
+/// change.
+///
+/// The stamp is what it rests on instead. At each of the three moments the
+/// framework itself makes a file's content clean — placing a placeholder,
+/// finishing a hydration, finishing an upload — it records the size and mtime it
+/// just produced. Anything else that writes to the file moves the mtime, and the
+/// disagreement is visible without having been told about.
+///
+/// A property of the file rather than a claim about it, for the same reason the
+/// empty-inode rule is: a same-uid process can forge this, and forging it can
+/// only cause the framework to *upload* content it need not have — never to
+/// destroy any. The dangerous direction is closed by the stamp being *absent* or
+/// *stale*, which is the direction an attacker cannot arrange without also
+/// changing the file.
+pub mod stamp {
+    use std::io;
+    use std::path::Path;
+
+    pub const XATTR: &str = "user.hydration.stamp";
+
+    /// `<mtime_sec>.<mtime_nsec>:<size>`. Readable on purpose — someone
+    /// debugging a sync loop at 2am should be able to `getfattr` it.
+    pub fn of(md: &std::fs::Metadata) -> String {
+        use std::os::unix::fs::MetadataExt;
+        format!("{}.{}:{}", md.mtime(), md.mtime_nsec(), md.size())
+    }
+
+    /// Record the current state of `path` as clean.
+    pub fn write(path: &Path) -> io::Result<()> {
+        let md = std::fs::metadata(path)?;
+        set(path, of(&md).as_bytes())
+    }
+
+    /// As [`write`], through a descriptor.
+    ///
+    /// What hydration uses: re-opening a path inside a marked mount is the trap
+    /// the whole design is arranged to avoid. Note that setting an extended
+    /// attribute moves ctime and not mtime, so stamping after writing does not
+    /// invalidate the stamp it just took.
+    pub fn write_fd(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let v = format!("{}.{}:{}", st.st_mtime, st.st_mtime_nsec, st.st_size);
+        let n = std::ffi::CString::new(XATTR).unwrap();
+        let rc = unsafe {
+            libc::fsetxattr(
+                fd.as_raw_fd(),
+                n.as_ptr(),
+                v.as_ptr() as *const libc::c_void,
+                v.len(),
+                0,
+            )
+        };
+        (rc == 0).then_some(()).ok_or_else(io::Error::last_os_error)
+    }
+
+    /// Whether the file still looks the way the framework left it.
+    ///
+    /// `Unstamped` is not the same as `Dirty` and the caller must not merge
+    /// them: a file the framework has never written is the user's own, and
+    /// deciding it is "changed" would queue every unrelated file in the
+    /// directory for upload the first time anything resyncs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum State {
+        /// Matches what we last wrote.
+        Clean,
+        /// Written by someone else since.
+        Dirty,
+        /// The framework has never made this file clean.
+        Unstamped,
+    }
+
+    pub fn state(path: &Path) -> io::Result<State> {
+        let Some(recorded) = get(path)? else {
+            return Ok(State::Unstamped);
+        };
+        let md = std::fs::metadata(path)?;
+        Ok(if recorded == of(&md) {
+            State::Clean
+        } else {
+            State::Dirty
+        })
+    }
+
+    fn set(path: &Path, v: &[u8]) -> io::Result<()> {
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has an interior nul"))?;
+        let n = std::ffi::CString::new(XATTR).unwrap();
+        let rc = unsafe {
+            libc::setxattr(
+                c.as_ptr(),
+                n.as_ptr(),
+                v.as_ptr() as *const libc::c_void,
+                v.len(),
+                0,
+            )
+        };
+        (rc == 0).then_some(()).ok_or_else(io::Error::last_os_error)
+    }
+
+    fn get(path: &Path) -> io::Result<Option<String>> {
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has an interior nul"))?;
+        let n = std::ffi::CString::new(XATTR).unwrap();
+        let mut buf = [0u8; 96];
+        let rc = unsafe {
+            libc::getxattr(
+                c.as_ptr(),
+                n.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if rc >= 0 {
+            return Ok(String::from_utf8(buf[..rc as usize].to_vec()).ok());
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ENODATA) | Some(libc::ENOTSUP) | Some(libc::ERANGE) => Ok(None),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+}
+
 /// Files the framework puts in the user's sync directory, and the one rule about
 /// them.
 ///
@@ -304,6 +439,31 @@ pub enum FromHelper {
     ExposureChanged {
         mounts: Vec<String>,
     },
+    /// These files were written by somebody other than us.
+    ///
+    /// Batched, because the helper coalesces per inode before sending: a long
+    /// write produces thousands of events for one file, and the kernel already
+    /// merges them per object until its queue fills. Sending one line per event
+    /// would put the worker's event loop behind a socket the daemon may not be
+    /// reading — measured at a 278-message cliff on a default `SO_SNDBUF` — and
+    /// a worker blocked in `write()` stops answering pre-content events, which
+    /// is §6a-bis reached by a road the supervisor cannot see.
+    ///
+    /// Identified the same way everything else is: by inode, never by path.
+    Changed {
+        files: Vec<FileId>,
+    },
+    /// Change detection lost track. Walk the sync directory instead of trusting
+    /// this channel.
+    ///
+    /// Not an error, and not rare enough to treat as one. The notify queue holds
+    /// 16384 distinct objects and overflows in under two seconds when something
+    /// unpacks an archive; `truncate(2)` produces no event at all; and every
+    /// edit made while the helper was not running produced none either. A change
+    /// channel is an optimisation over walking, never a substitute for it, and
+    /// saying so in the protocol is what stops a caller from believing silence
+    /// means nothing happened.
+    Resync,
 }
 
 /// Encode one message as a line.
