@@ -5,11 +5,55 @@ edition.workspace = true
 license.workspace = true
 description = "Microsoft Graph delta feed to hydration-client namespace items"
 
+[features]
+# Off by default. Everything above the transport seam — the wire model, the
+# mapper, the round driver, the sink — is testable with no socket, no
+# credential and no clock, and that stays true only as long as building this
+# crate does not require a TLS stack to be present. `--features http` adds the
+# one module that opens a connection; nothing else in the crate changes shape.
+default = []
+http = ["dep:ureq", "dep:httpdate"]
+
 [dependencies]
 hydration-client = { path = "../hydration-client" }
 hydration-protocol = { path = "../hydration-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# The blocking HTTP client. `PageSource` and `Transport` are synchronous
+# `&mut self` traits called from two dedicated threads, so an async client
+# would mean dragging in a runtime to block on it — tokio + hyper + tower to
+# reach one socket that is already on its own thread.
+#
+# ureq is the smallest thing that is still *correct* here: rustls with real
+# certificate verification, a connection pool, timeouts, and no executor. Its
+# tree under these features is ureq-proto, rustls, ring, webpki-roots, http,
+# httparse, flate2 — no runtime, no proc-macros.
+#
+# `default-features = false` and the two features named explicitly, so that a
+# later default in ureq (cookies, a proxy reader, a different root store)
+# cannot arrive in this binary without a diff here. `gzip` is kept: a delta
+# page is 200 items of JSON, it compresses about tenfold, and this runs on
+# every round.
+#
+# `Cargo.lock` pins 3.3.0 rather than the newest 3.x. That pin is an artefact of
+# where this was built — 3.3.0 is the version in the local registry cache — and
+# not a compatibility claim. `cargo update -p ureq` on a machine with a network
+# is the right thing to do; nothing here depends on 3.3 specifically.
+[dependencies.ureq]
+version = "3.3"
+default-features = false
+features = ["rustls", "gzip"]
+optional = true
+
+# `Retry-After` may be an HTTP-date, and RFC 9110 requires a recipient to
+# accept three date formats, two of them obsolete. Hand-rolling that is a
+# month-name table, a leap-year rule and two field orders, and every one of
+# those getting it wrong produces a plausible-looking `Duration` rather than an
+# error. httpdate is dependency-free and does exactly this.
+[dependencies.httpdate]
+version = "1.0"
+optional = true
 
 [dev-dependencies]
 serde_json = "1"

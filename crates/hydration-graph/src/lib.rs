@@ -17,10 +17,37 @@
 // one-line read.
 #![allow(dead_code)]
 
+/// OAuth: the device code flow and the shared token cache.
+///
+/// The one part of this crate that is *not* flattened into the root. Its names
+/// are credential names — `Secret`, `AccessToken`, `RefreshToken` — and they are
+/// worth the `auth::` in front of them at every use site; and two of its seams,
+/// [`auth::TokenTransport`] and [`auth::Clock`], deliberately mirror
+/// [`Transport`] and [`Sleeper`] closely enough that flattening both sets into
+/// one namespace would make the wrong one easy to implement by accident.
+///
+/// Nothing above the [`PageSource`] and [`Transport`] seams may reach it. That
+/// is what lets every test in `tests/` run with no credential at all. Below
+/// them it is joined up: with the `http` feature, `auth::TokenCache` *is* a
+/// `TokenSource`, and [`auth::TokenTransport`] — the refresh POST's socket — is
+/// implemented by `GraphTokens` over the same client configuration as
+/// everything else.
+pub mod auth;
+
 use hydration_client::delta::{Change, Cursor};
 use hydration_client::namespace::{Item, Namespace, Problem, Kind};
 use serde::{Deserialize, Serialize};
 use std::io;
+
+// The only code in the crate that opens a socket — for pages, for uploads and
+// for the refresh POST alike. It is a child of the root so that it can reach
+// `on_the_graph_endpoint` — the origin check is private on purpose, and the one
+// place a credential is attached has to be the one place that consults it.
+// Re-exported flat, per the note above.
+#[cfg(feature = "http")]
+mod http;
+#[cfg(feature = "http")]
+pub use http::{GraphHttp, GraphTokens, StaticToken, TokenSource};
 
 // ---------------------------------------------------------------------------
 // Ids
@@ -1318,7 +1345,9 @@ pub struct RawPage {
     pub body: Vec<u8>,
 }
 
-/// Where pages come from. The only thing the `http` feature implements.
+/// Where pages come from. One of the three seams the `http` feature implements —
+/// with [`Transport`] for the write half and [`auth::TokenTransport`] for the
+/// credential.
 pub trait PageSource: Send {
     /// Start an enumeration from the beginning.
     fn first(&mut self, scope: &DriveScope) -> io::Result<RawPage>;
@@ -1374,6 +1403,21 @@ pub fn delta_url(scope: &DriveScope) -> String {
         scope.drive().as_str(),
         REQUIRED_SELECT.join(",")
     )
+}
+
+/// The URL that asks for a token describing "everything from now on".
+///
+/// Graph answers `delta?token=latest` with an empty `value` and a `deltaLink`,
+/// so a new sync root can be adopted without enumerating what is already in it.
+///
+/// Composed here rather than in the transport, for the same reason as
+/// [`delta_url`]: the URL a request goes to is policy, and a test that cannot
+/// see it without a socket is a test of nothing. `$select` is kept even though
+/// the answer carries no items — a service that ever *did* return one would
+/// return it with the fields the mapper needs, rather than a page this crate
+/// has to refuse.
+pub fn latest_url(scope: &DriveScope) -> String {
+    format!("{}&token=latest", delta_url(scope))
 }
 
 /// Whether a link the service handed us may be fetched with our credentials.
@@ -2561,7 +2605,9 @@ pub struct Reply {
     pub body: Vec<u8>,
 }
 
-/// Where writes go. The only thing the `http` feature implements.
+/// Where writes go. The write half of what the `http` feature implements — see
+/// [`PageSource`] for the read half and [`auth::TokenTransport`] for the
+/// credential.
 pub trait Transport: Send {
     fn send(&mut self, request: &Request) -> io::Result<Reply>;
 }

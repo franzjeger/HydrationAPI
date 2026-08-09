@@ -9,6 +9,7 @@
 //! four methods, none of them about POSIX. Everything the framework can own, it
 //! owns.
 
+use crate::daemon_loop::CloudAccess;
 use crate::delta::{Change, Cursor, Discover};
 use crate::upload::{Sink, Uploaded};
 use crate::Provider;
@@ -98,6 +99,60 @@ impl FolderCloud {
         }
         out.sort();
         Ok(out)
+    }
+}
+
+/// The folder-backed cloud as something the daemon can be pointed at.
+///
+/// `FolderCloud` itself is a live handle — it carries a counter and the previous
+/// listing — so it is what a role *is*, not what hands roles out. This is the
+/// factory: two paths and a `new` per role, which is exactly the shape a real
+/// provider has once its credential is loaded.
+///
+/// The sync root is here rather than in `Config` because it is the sink's
+/// business: [`Sink::upload`] is handed an absolute path, and turning that into
+/// the name an object should carry is a decision only the provider can make.
+/// Getting it wrong flattens subdirectories — see `rooted_at`.
+pub struct FolderAccess {
+    cloud: PathBuf,
+    sync_root: PathBuf,
+}
+
+impl FolderAccess {
+    /// `cloud` is the directory standing in for the service; `sync_root` is the
+    /// user's sync directory, so uploads record paths rather than basenames.
+    pub fn new(cloud: &Path, sync_root: &Path) -> Self {
+        Self {
+            cloud: cloud.to_path_buf(),
+            sync_root: sync_root.to_path_buf(),
+        }
+    }
+}
+
+impl CloudAccess for FolderAccess {
+    type Fetch = FolderCloud;
+    type Upload = FolderCloud;
+    type Changes = FolderCloud;
+
+    fn provider(&self) -> io::Result<FolderCloud> {
+        FolderCloud::open(&self.cloud)
+    }
+
+    fn sink(&self) -> io::Result<FolderCloud> {
+        // Rooted, so an upload from a subdirectory records its path and not just
+        // its name — otherwise the next delta pass moves the file to the sync
+        // root.
+        Ok(FolderCloud::open(&self.cloud)?.rooted_at(&self.sync_root))
+    }
+
+    fn discover(&self) -> io::Result<FolderCloud> {
+        FolderCloud::open(&self.cloud)
+    }
+
+    /// Opening creates the directory, so this is also where a path that cannot
+    /// be one becomes a startup failure rather than a dead upload thread.
+    fn preflight(&self) -> io::Result<()> {
+        FolderCloud::open(&self.cloud).map(drop)
     }
 }
 

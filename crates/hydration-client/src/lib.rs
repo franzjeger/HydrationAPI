@@ -9,6 +9,7 @@
 //! `hydration-protocol`, and it is deliberately too narrow to express a
 //! destination.
 
+pub mod daemon_loop;
 pub mod delta;
 pub mod manifest;
 pub mod namespace;
@@ -23,6 +24,7 @@ use hydration_protocol::{FetchResponse, FileId, FromHelper};
 use std::io;
 use std::path::Path;
 
+pub use daemon_loop::CloudAccess;
 pub use store::{Entry, Store};
 
 /// What a cloud client implements.

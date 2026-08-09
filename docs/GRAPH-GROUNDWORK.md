@@ -461,10 +461,10 @@ impl<P: PageSource, S: StateStore> Discover for GraphDiscover<P, S> { /* … */ 
 
 * `RawPage` is bytes plus status, so 410/429/5xx **policy** is tested without a network — only socket mechanics live below the seam.
 * Two `StateStore` methods, not one, so "write the tree first, then the token" is expressible and testable: a store double whose `save_token` fails must leave a readable tree.
-* Auth, MSAL, the shared token cache and single-flight refresh live **inside the `PageSource` implementation** (`http::HttpPages` holds `Arc<Auth>`). PROVIDER.md:216-224 — four provider instances, three concurrent, a single-use refresh token. The mapping layer has no concept of a credential, which is exactly why it can be tested with zero of them.
+* Auth, the shared token cache and single-flight refresh live **below the `PageSource` seam**. As built: `auth::TokenCache` owns the credential and the refresh; `http::GraphHttp` holds one as its `TokenSource` (`Arc<TokenCache<…>>`, cloned into the delta client and the upload client so both share the one refresh); and `http::GraphTokens` is the `auth::TokenTransport` the refresh POST goes out on, over the same agent configuration as every other request. PROVIDER.md:216-224 — four provider instances, three concurrent, a single-use refresh token. The mapping layer has no concept of a credential, which is exactly why it can be tested with zero of them.
 * Test double: `pub struct ScriptedPages { pages: VecDeque<io::Result<RawPage>> }` — constructed from JSON string literals in the test file.
 
-`crates/hydration-graph` builds and its whole test suite runs with `--no-default-features`; `reqwest` is behind `feature = "http"`. A test asserts the crate's non-`http` sources contain no `std::fs`, `std::net` or `std::time::SystemTime`.
+`crates/hydration-graph` builds and its whole test suite runs with `--no-default-features`; the HTTP client is behind `feature = "http"`. (As built that client is `ureq` rather than `reqwest`: `PageSource` and `Transport` are synchronous `&mut self` traits called from dedicated threads, so an async client would mean a runtime to block on. See the note in `Cargo.toml`.) A test asserts the crate's non-`http` sources contain no `std::fs`, `std::net` or `std::time::SystemTime`.
 
 ---
 
@@ -641,7 +641,7 @@ Written first. Every one must fail against an empty implementation.
 | `token_latest_yields_an_empty_round_and_a_token` | `{"value":[],"@odata.deltaLink":"d"}` from `latest()` | `changes()` = `Ok((vec![], Cursor(Some("d"))))`; `save_tree` still called first |
 | `a_persistent_retryable_stall_forces_a_re_enumeration` | feed three consecutive `Applied{retryable:true, failed:["a.txt","b.txt"]}` | `Escalation::StalledRetryable{passes:3,..}`; next `changes()` call uses `first()`, not `resume()` |
 | `a_shrinking_failed_set_does_not_trigger_the_stall_guard` | `failed` of 5, then 3, then 1 | positive control: no escalation |
-| `required_select_fields_are_all_requested` | built URL from `http::HttpPages` | URL contains every entry of `REQUIRED_SELECT` (`id,name,size,eTag,cTag,file,folder,package,deleted,root,remoteItem,parentReference,fileSystemInfo,lastModifiedDateTime`) |
+| `required_select_fields_are_all_requested` | URL built by `delta_url` (moved out of the `http` module per (b)10, so this runs with `--no-default-features`) | URL contains every entry of `REQUIRED_SELECT` (`id,name,size,eTag,cTag,file,folder,package,deleted,root,remoteItem,parentReference,fileSystemInfo,lastModifiedDateTime`) |
 
 ### L. Fan-out (`tests/fanout.rs`)
 
@@ -675,7 +675,7 @@ Written first. Every one must fail against an empty implementation.
 
 **Not in the mapping layer, and why:**
 
-* **HTTP, auth, MSAL, refresh-token rotation.** Below `PageSource`. The mapping layer must be testable with zero credentials, and a layer that can open a socket cannot honestly claim that. The single-flight refresh across the four provider instances (PROVIDER.md:216-224) is a property of the `Arc<Auth>` inside `http::HttpPages`, tested there.
+* **HTTP, auth, refresh-token rotation.** Below `PageSource`. The mapping layer must be testable with zero credentials, and a layer that can open a socket cannot honestly claim that. The single-flight refresh across the four provider instances (PROVIDER.md:216-224) is a property of the shared `auth::TokenCache` that `http::GraphHttp` holds as its `TokenSource`, and is tested in `auth` against a transport double that stops mid-request — including the failing case, where holding a lock serialises refreshes without deduplicating them.
 * **Throttling mechanics.** The *policy* — honour `Retry-After` exactly, retry the same URL, never restart the round from the deltaLink, page sequentially within a drive and concurrently across drives, decorate the User-Agent as `NONISV|…` — is tested at the round level against `RawPage` doubles. The sleeping and the socket are not.
 * **`Provider::fetch` and `Sink::upload`.** Different traits, different failure modes. In particular **QuickXorHash is not implemented here**; content verification belongs on the fetch path, where the bytes are. This layer only reads a hash as an opaque version string.
 * **Anything touching the filesystem.** No `safe_join` replacement, no symlink resolution, no `place()`. Claim 27 is a framework defect (§1.12) and is filed as a blocking dependency, not worked around here.
@@ -771,7 +771,7 @@ Read all three files plus `hydration-protocol/src/lib.rs`, `providers.rs`, and t
 
 9. **Cursor vs `StateStore` is two sources of truth, never reconciled.** PROVIDER.md:127-131: the framework does not persist the cursor and hands `Cursor::default()` after every restart. The design persists a token itself. Which wins is unstated — and both answers are wrong by default (obey the empty cursor → full enumeration every restart, defeating `StateStore`; ignore it → lose the signal in #8).
 
-10. **Test K13 cannot run under `--no-default-features`.** It builds a URL from `http::HttpPages`, which is `#[cfg(feature = "http")]`. Move `REQUIRED_SELECT` and a pure `fn delta_url(&DriveScope) -> String` into a non-`http` module; then the coupling is testable and §1.12's "the coupling is a test, not a type" costs nothing.
+10. **Test K13 cannot run under `--no-default-features`.** It builds a URL from the `http` module, which is `#[cfg(feature = "http")]`. Move `REQUIRED_SELECT` and a pure `fn delta_url(&DriveScope) -> String` into a non-`http` module; then the coupling is testable and §1.12's "the coupling is a test, not a type" costs nothing. *(Done: both live at the crate root.)*
 
 11. **`Sleeper` is not in the declared seam.** Test A2 asserts the round "slept ≥ 7 s", but §2 lists only `PageSource` and `StateStore` and claims the layer "takes no clock". As written the suite has a 7-second wall-clock floor. Declare `trait Sleeper` alongside `PageSource` and assert the *recorded* durations.
 

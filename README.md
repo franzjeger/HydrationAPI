@@ -174,9 +174,10 @@ Honest, because the interesting number is not the test count.
 finding fixed, 294 tests, 8/8 privileged suites against a real kernel. Two of the
 five Graph pieces.
 
-**Not done.** The upload half — no Graph `Sink` exists. Authentication. And there
-is no seam to plug a provider into `hydration-sync`, which is still wired to the
-demo `FolderCloud` in six places.
+**Not done.** The upload half — no Graph `Sink` exists. Authentication. The seam
+itself now exists — `CloudAccess` in `hydration-client/src/daemon_loop.rs`, and
+`hydration-sync` is a `main` that names one — but nothing except the demo
+`FolderCloud` has been run through it end to end.
 
 **Not verifiable here.** Nothing in this repository has spoken to live Microsoft
 Graph. The provider layers are tested against scripted responses, which catches

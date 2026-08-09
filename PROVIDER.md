@@ -22,6 +22,41 @@ trait Sink     { fn upload(&mut self, path: &Path, existing: Option<&str>) -> io
 trait Discover { fn changes(&mut self, cursor: &Cursor) -> io::Result<(Vec<Change>, Cursor)>; }
 ```
 
+And one factory that hands them out, which is the whole of how a provider is
+plugged in:
+
+```rust
+trait CloudAccess: Send + 'static {
+    type Fetch: Provider; type Upload: Sink; type Changes: Discover;
+    fn provider(&self) -> io::Result<Self::Fetch>;
+    fn sink(&self) -> io::Result<Self::Upload>;
+    fn discover(&self) -> io::Result<Self::Changes>;
+    fn preflight(&self) -> io::Result<()> { Ok(()) }  // defaulted
+}
+```
+
+Three roles rather than one object because the daemon runs them on separate
+threads — the fetch loop, the upload driver and the delta pass each get their own
+instance, and none of them shares a lock with the others. **If your roles share
+state — a token cache, most obviously — that state has to be `Sync` and it has to
+refresh single-flight**, because three instances will be alive at once and a
+token that expires expires for all three at the same moment.
+
+`preflight` is called once at startup and nowhere else. Put the credential check
+there: a missing token should stop the daemon starting, not surface as an `EIO`
+on somebody's first read an hour later.
+
+Then a binary is an argument parser and one call:
+
+```rust
+daemon_loop::run(Config { mount, socket, debounce }, MyCloudAccess::new(..))?;
+```
+
+`Config` carries no cloud directory, endpoint or credential — those are yours,
+and `hydration-sync` (about eighty lines, all of it argument parsing) is the
+worked example. See `providers::FolderAccess` for the smallest possible
+implementation.
+
 ---
 
 ## The one rule everything else serves
