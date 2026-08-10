@@ -8,7 +8,7 @@ the fail-closed order already enforced by `GraphDiscover`.
 
 This is deliberately not advertised as a complete end-user client yet. The remaining live gaps
 are device-code enrollment/UI, resolving the user's drive id and tag policy from Graph, live
-tenant coverage, streaming downloads (the HTTP seam currently returns a bounded response body),
+tenant coverage, resumable range downloads and integrity verification,
 credential storage in a platform keyring, packaging/service management and end-to-end testing
 with real Graph throttling, redirects and upload sessions. Until enrollment exists, preflight
 requires a refresh token created out of band and refuses to start when it is absent.
