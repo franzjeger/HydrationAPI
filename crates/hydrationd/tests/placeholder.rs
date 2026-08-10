@@ -25,18 +25,26 @@ fn scratch(name: &str) -> PathBuf {
 #[test]
 fn the_scratch_filesystem_can_actually_punch_holes() {
     let p = scratch("premise.bin");
+    // What an empty file with a placeholder's attributes costs here. Not zero
+    // everywhere: where the xattrs do not fit in the inode they take a block of
+    // their own, which `st_blocks` counts. The claim worth testing is that the
+    // *data* blocks come back, so that is what this compares against.
+    let floor = hydration_protocol::empty_file_block_floor(p.parent().unwrap())
+        .expect("measure this filesystem's empty-file block floor");
+
     create(&p, 65536, 0o644).expect("create");
     hydrate(&p, &vec![b'a'; 65536], 65536).expect("hydrate");
     assert!(
-        fs::metadata(&p).unwrap().blocks() > 0,
-        "a filled file reports no blocks — this filesystem is not telling the truth \
+        fs::metadata(&p).unwrap().blocks() > floor,
+        "a filled file reports no more blocks than an empty one — this filesystem is not telling the truth \
          about allocation, and the rest of these tests would prove nothing"
     );
     dehydrate(&p).expect("dehydrate");
-    assert_eq!(
-        fs::metadata(&p).unwrap().blocks(),
-        0,
-        "punching a hole did not free the blocks — is CARGO_TARGET_TMPDIR on tmpfs?"
+    let after = fs::metadata(&p).unwrap().blocks();
+    assert!(
+        after <= floor,
+        "punching a hole did not free the data blocks: {after} against a floor \
+         of {floor} — is CARGO_TARGET_TMPDIR on tmpfs?"
     );
 }
 
@@ -45,11 +53,12 @@ fn a_placeholder_has_size_and_no_blocks() {
     let p = scratch("basic.bin");
     create(&p, 65536, 0o644).expect("create");
 
+    let floor = hydration_protocol::empty_file_block_floor(p.parent().unwrap())
+        .expect("measure this filesystem's empty-file block floor");
     let md = fs::metadata(&p).expect("stat");
     assert_eq!(md.len(), 65536, "a placeholder must report the real size");
-    assert_eq!(
-        md.blocks(),
-        0,
+    assert!(
+        md.blocks() <= floor,
         "a placeholder reported {} blocks for content it does not hold; du would \
          claim disk that is not in use",
         md.blocks()
@@ -102,10 +111,16 @@ fn dehydrate_keeps_size_and_mode_and_drops_the_blocks() {
     assert!(!is_dehydrated(&p).unwrap());
 
     dehydrate(&p).expect("dehydrate");
+    let floor = hydration_protocol::empty_file_block_floor(p.parent().unwrap())
+        .expect("measure this filesystem's empty-file block floor");
     let md = fs::metadata(&p).unwrap();
     assert_eq!(md.len(), 8192, "size lost across dehydration");
     assert_eq!(md.permissions().mode() & 0o777, 0o750, "mode lost");
-    assert_eq!(md.blocks(), 0, "still occupying disk");
+    assert!(
+        md.blocks() <= floor,
+        "still occupying disk: {} blocks against a floor of {floor}",
+        md.blocks()
+    );
 }
 
 /// The identity half of §5.1, at this layer: nothing about dehydrating or

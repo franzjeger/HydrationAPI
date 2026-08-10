@@ -213,9 +213,15 @@ mod tests {
 
         assert_eq!(run(&dir, "report.pdf").unwrap(), Reclaimed { bytes: 8192 });
 
+        let floor = hydration_protocol::empty_file_block_floor(&dir)
+            .expect("measure this filesystem's empty-file block floor");
         let md = std::fs::metadata(&p).unwrap();
         assert_eq!(md.len(), 8192, "the size no longer describes the object");
-        assert_eq!(md.blocks(), 0, "the disk was not returned");
+        assert!(
+            md.blocks() <= floor,
+            "the disk was not returned: {} blocks against a floor of {floor}",
+            md.blocks()
+        );
         assert_eq!(
             store::get_xattr(&p, store::XATTR_ID).unwrap().unwrap(),
             b"cloud-1"

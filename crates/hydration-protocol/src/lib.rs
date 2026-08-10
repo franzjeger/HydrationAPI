@@ -128,13 +128,61 @@ pub mod flags {
     }
 }
 
-
 /// Extended attributes both halves agree on.
 ///
 /// Here rather than in either half because they are the shared vocabulary: the
 /// privileged side writes the dehydrated mark, the unprivileged side reads it to
 /// decide what a backup is missing. Duplicating the string in two crates is how
 /// they drift.
+/// The blocks a file occupies when it holds no data at all, on this filesystem.
+///
+/// `st_blocks == 0` is not portable. The identity xattrs are part of every
+/// placeholder, and where they do not fit in the inode they spill into a block
+/// of their own that `st_blocks` counts — measured at 8 blocks on ext4 with a
+/// 128-byte inode, 0 on btrfs, which keeps xattrs in its metadata tree.
+///
+/// So a test asserting "the disk was returned" has to compare against what an
+/// empty file with the same attributes costs here, rather than against zero.
+/// Measured rather than assumed: the answer depends on the filesystem, its
+/// inode size, and how many attributes are set.
+///
+/// Test support. It creates and removes a file in `dir`.
+pub fn empty_file_block_floor(dir: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let probe = dir.join(".hydration-block-floor-probe");
+    let _ = std::fs::remove_file(&probe);
+    std::fs::File::create(&probe)?;
+
+    // The same attributes a placeholder carries, so the floor includes them.
+    let c_path = std::ffi::CString::new(probe.as_os_str().as_bytes())?;
+    for name in [xattr::DEHYDRATED, xattr::ID, xattr::ETAG, xattr::MODE] {
+        let c_name = std::ffi::CString::new(name)?;
+        let value = b"probe";
+        // SAFETY: both strings are NUL-terminated and outlive the call, and the
+        // pointer and length describe the same buffer.
+        let rc = unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            let _ = std::fs::remove_file(&probe);
+            return Err(e);
+        }
+    }
+
+    let blocks = std::fs::metadata(&probe)?.blocks();
+    std::fs::remove_file(&probe)?;
+    Ok(blocks)
+}
+
 pub mod xattr {
     /// Set while a file is a placeholder, cleared when it is filled.
     ///

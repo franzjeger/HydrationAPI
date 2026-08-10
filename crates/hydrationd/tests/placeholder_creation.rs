@@ -128,10 +128,16 @@ fn a_placeholder_can_be_created_inside_the_watched_mount() {
         "the unprivileged side could not create a placeholder in the marked mount"
     );
 
+    let floor = hydration_protocol::empty_file_block_floor(target.parent().unwrap())
+        .expect("measure this filesystem's empty-file block floor");
     let md = std::fs::metadata(&target).expect("the placeholder does not exist");
     assert_eq!(md.len(), 64, "the placeholder has the wrong size");
     use std::os::unix::fs::MetadataExt;
-    assert_eq!(md.blocks(), 0, "the placeholder occupies disk");
+    assert!(
+        md.blocks() <= floor,
+        "the placeholder occupies disk: {} blocks against a floor of {floor}",
+        md.blocks()
+    );
     assert!(
         hydrationd::placeholder::has_mark(&target).unwrap_or(false),
         "the placeholder is not marked dehydrated — it would never be intercepted"

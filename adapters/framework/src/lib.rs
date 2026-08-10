@@ -420,10 +420,17 @@ impl Harness for Framework {
             .into_iter()
             .flatten()
             .flatten()
+            // The mark, not `st_blocks` — the rule the production code follows,
+            // for the reason its own doc comment gives: blocks do not separate
+            // the cases. A placeholder's xattrs can occupy a block of their own
+            // where they do not fit in the inode, so counting zero-block files
+            // finds none of them on such a filesystem.
             .filter(|e| {
-                e.metadata()
-                    .map(|m| m.is_file() && m.blocks() == 0)
-                    .unwrap_or(false)
+                e.metadata().map(|m| m.is_file()).unwrap_or(false)
+                    && matches!(
+                        store::get_xattr(&e.path(), hydration_protocol::xattr::DEHYDRATED),
+                        Ok(Some(_))
+                    )
             })
             .count()
     }

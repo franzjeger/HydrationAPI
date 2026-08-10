@@ -57,11 +57,17 @@ fn evicting_returns_the_disk_and_keeps_the_metadata() {
     let outcome = evict(&group, &path, Backup::Exclude, || true).expect("evict");
     assert_eq!(outcome, Ok(()));
 
+    let floor = hydration_protocol::empty_file_block_floor(path.parent().unwrap())
+        .expect("measure this filesystem's empty-file block floor");
     let md = std::fs::metadata(&path).unwrap();
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     assert_eq!(md.len(), 8192, "size lost");
     assert_eq!(md.permissions().mode() & 0o777, 0o750, "mode lost");
-    assert_eq!(md.blocks(), 0, "the disk was not actually returned");
+    assert!(
+        md.blocks() <= floor,
+        "the disk was not actually returned: {} blocks against a floor of {floor}",
+        md.blocks()
+    );
     let _ = std::fs::remove_file(&path);
 }
 

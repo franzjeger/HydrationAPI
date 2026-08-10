@@ -278,10 +278,16 @@ mod tests {
         let target = dir.join("sub/report.pdf");
         p.place(&target, 8192, "cloud-1", Some("etag-a")).unwrap();
 
+        let floor = hydration_protocol::empty_file_block_floor(&dir)
+            .expect("measure this filesystem's empty-file block floor");
         let md = std::fs::metadata(&target).unwrap();
         assert_eq!(md.len(), 8192);
         use std::os::unix::fs::MetadataExt;
-        assert_eq!(md.blocks(), 0, "the placeholder occupies disk");
+        assert!(
+            md.blocks() <= floor,
+            "the placeholder occupies disk: {} blocks against a floor of {floor}",
+            md.blocks()
+        );
         assert_eq!(
             store::get_xattr(&target, store::XATTR_ID).unwrap().unwrap(),
             b"cloud-1"
