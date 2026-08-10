@@ -15,6 +15,18 @@ MOUNT="${1:?usage: smoke.sh <mountpoint>}"
 CLOUD="$(mktemp -d)"
 SOCK="/tmp/hydration-smoke.sock"
 BIN="$(cd "$(dirname "$0")/.." && pwd)/target/debug"
+
+# These are built, not built by this script: it runs as root, and building as
+# root would put root-owned artefacts in the developer's target directory. Say
+# which one is missing rather than exiting 127 from a shell that could not find
+# it — that is what CI did, and "exit code 127" names nothing.
+for b in hydrationd hydration-sync hydration-ctl; do
+  [ -x "$BIN/$b" ] || {
+    echo "FAIL: $BIN/$b is missing. Build first, as yourself:" >&2
+    echo "        cargo build --workspace --bins" >&2
+    exit 1
+  }
+done
 SYNC_USER="${SUDO_USER:-$USER}"
 SYNC_UID="$(id -u "$SYNC_USER")"
 
