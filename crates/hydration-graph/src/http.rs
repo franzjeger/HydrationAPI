@@ -771,7 +771,8 @@ impl<T: TokenSource> GraphHttp<T> {
                         })?;
                     validate_content_range(range, offset, expected)?;
                 }
-                io::copy(response.body_mut().as_reader(), sink)?;
+                let mut reader = response.body_mut().as_reader();
+                io::copy(&mut reader, sink)?;
                 Ok(DownloadAttempt::Complete)
             },
             std::thread::sleep,
