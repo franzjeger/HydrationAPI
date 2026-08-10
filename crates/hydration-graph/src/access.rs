@@ -164,6 +164,21 @@ impl GraphAccess {
             MonotonicClock,
             FileCredentialStore::new(credential),
         ));
+        Self::with_token_cache(scope, root, state_dir, tags, cache)
+    }
+
+    /// Build every role around a cache the product shell already owns.
+    ///
+    /// Enrollment and account discovery happen before the daemon knows its
+    /// drive scope. Accepting that same cache here prevents the product from
+    /// constructing a second refresh-token authority after sign-in.
+    pub fn with_token_cache(
+        scope: DriveScope,
+        root: impl Into<PathBuf>,
+        state_dir: impl Into<PathBuf>,
+        tags: TagSource,
+        cache: SharedTokenCache,
+    ) -> Self {
         Self {
             scope,
             root: root.into(),
@@ -203,7 +218,7 @@ impl CloudAccess for GraphAccess {
         ))
     }
     fn preflight(&self) -> io::Result<()> {
-        if self.cache.resume()? {
+        if self.cache.is_signed_in() || self.cache.resume()? {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -239,6 +254,25 @@ mod tests {
         let _fetch = a.provider().unwrap();
         let _upload = a.sink().unwrap();
         let _discover = a.discover().unwrap();
+        assert_eq!(Arc::strong_count(&cache), 5);
+    }
+
+    #[test]
+    fn injected_cache_is_the_cache_every_role_shares() {
+        let d = tempfile::tempdir().unwrap();
+        let original = access(d.path());
+        let cache = original.shared_token_cache();
+        let access = GraphAccess::with_token_cache(
+            DriveScope::primary(crate::DriveId::parse("drive").unwrap()),
+            d.path().join("mount"),
+            d.path().join("state"),
+            TagSource::CTag,
+            Arc::clone(&cache),
+        );
+        drop(original);
+        let _fetch = access.provider().unwrap();
+        let _upload = access.sink().unwrap();
+        let _discover = access.discover().unwrap();
         assert_eq!(Arc::strong_count(&cache), 5);
     }
 
