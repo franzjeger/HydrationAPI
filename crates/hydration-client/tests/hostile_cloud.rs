@@ -28,12 +28,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 fn scratch(name: &str) -> PathBuf {
-    let d = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("hostile")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("scratch");
-    d
+    // `HYDRATION_TEST_DIR` overrides this at run time, so the suite can be
+    // pointed at a btrfs, ext4 or xfs mount without rebuilding.
+    test_scratch::scratch(env!("CARGO_TARGET_TMPDIR"), &format!("hostile/{name}"))
 }
 
 fn file_id(p: &Path) -> FileId {

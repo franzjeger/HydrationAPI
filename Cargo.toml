@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["conformance", "adapters/onedrive-reference", "crates/hydration-protocol", "crates/hydrationd", "crates/hydration-client", "crates/hydration-graph", "adapters/framework"]
+members = ["conformance", "adapters/onedrive-reference", "crates/hydration-protocol", "crates/hydrationd", "crates/hydration-client", "crates/hydration-graph", "adapters/framework", "crates/test-scratch"]
 
 [workspace.package]
 edition = "2021"
@@ -8,3 +8,4 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 tempfile = "3"
+test-scratch = { path = "crates/test-scratch" }

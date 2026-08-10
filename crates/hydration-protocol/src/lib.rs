@@ -235,7 +235,7 @@ pub mod stamp {
         set(path, of(md).as_bytes())
     }
 
-    /// As [`write`], through a descriptor.
+    /// As [`write()`], through a descriptor.
     ///
     /// What hydration uses: re-opening a path inside a marked mount is the trap
     /// the whole design is arranged to avoid. Note that setting an extended

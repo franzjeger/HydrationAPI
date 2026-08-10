@@ -614,12 +614,9 @@ impl Sleeper for RecordingSleeper {
 /// A sync root of this test's own, under the target directory. Real files,
 /// because half of what is being asserted is the bytes that went out.
 fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("upload")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch sync root");
-    dir
+    // `HYDRATION_TEST_DIR` overrides this at run time, so the suite can be
+    // pointed at a btrfs, ext4 or xfs mount without rebuilding.
+    test_scratch::scratch(env!("CARGO_TARGET_TMPDIR"), &format!("upload/{name}"))
 }
 
 /// A fragment policy small enough to make a 960 KiB file take three fragments.

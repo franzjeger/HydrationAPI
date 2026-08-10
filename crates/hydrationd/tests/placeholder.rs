@@ -13,7 +13,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 
 fn scratch(name: &str) -> PathBuf {
-    let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("placeholder");
+    // Shared directory, one file per test, so this must not empty it — see
+    // `test_scratch::scratch` for the callers that do want that.
+    let d = test_scratch::base(env!("CARGO_TARGET_TMPDIR")).join("placeholder");
     fs::create_dir_all(&d).expect("scratch dir");
     let p = d.join(name);
     let _ = fs::remove_file(&p);

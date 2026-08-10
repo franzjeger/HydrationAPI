@@ -9,4 +9,5 @@ description = "Executable specification for a Linux cloud-file hydration framewo
 libc = "0.2"
 
 [dev-dependencies]
+test-scratch.workspace = true
 tempfile.workspace = true

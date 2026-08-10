@@ -1253,6 +1253,93 @@ One user, one account, one machine — but correct.
 
 ---
 
+## 8z. What a placeholder costs, per filesystem — measured
+
+An empty file is not free, and how much it costs depends on the filesystem. This
+matters twice: the conformance suite asserts a bound on it (§5.8), and the
+eviction policy does arithmetic with it (§6h). Both were written against a
+number measured on one filesystem, and that number is wrong on others.
+
+Measured here, on this machine, with a placeholder's real attribute load — a
+48-character cloud ID, a size, a stamp and a mark — on 512 MiB loopback
+filesystems. `st_blocks` is in 512-byte units, so a 4 KiB block reads as 8:
+
+```text
+                empty   one byte   sparse 10 MiB  |  SEEK_DATA on empty / sparse
+  btrfs           0         8            0        |  ENXIO      ENXIO
+  ext4 -I 128     8        16            8        |  ENXIO      ENXIO
+  ext4 -I 256     8        16            8        |  ENXIO      ENXIO
+  ext4 -I 512     0         8            0        |  ENXIO      ENXIO
+  xfs             0         8            0        |  ENXIO      ENXIO
+```
+
+Read the first column as: **the floor is one filesystem block wherever the
+extended attributes do not fit in the inode, and zero wherever they do.** btrfs
+keeps them in its metadata tree and xfs in the inode's attribute fork, so
+neither charges the file. ext4 charges the file for a spill block, and whether
+it spills is decided by the inode size — 128 and 256 bytes are too small for
+this attribute set, 512 is not.
+
+"One block" is the whole statement, and it is worth stating in those terms
+rather than in blocks-of-512. An earlier measurement of the same thing gave a
+floor of 2, not 8, and the two looked like a contradiction until the filesystem
+block size was varied deliberately:
+
+```text
+  ext4 -I 128, 1 KiB blocks   floor 2      ( = 1024/512 )
+  ext4 -I 128, 2 KiB blocks   floor 4
+  ext4 -I 128, 4 KiB blocks   floor 8
+```
+
+Same fact, three block sizes. `mkfs.ext4` picks the block size from the
+filesystem size, so a small scratch image and a real volume disagree about the
+floor without disagreeing about anything real. **A constant in a test is
+therefore wrong even on the filesystem it was measured on.** §5.8 probes for the
+floor at runtime instead, which is why it survives this table.
+
+### Why the floor is a bound and not the test
+
+The tempting reading of the first column is that `st_blocks` separates a
+placeholder from a file with content: 0 against 8, or 8 against 16. It does, in
+this table. It is still the wrong predicate, for two reasons.
+
+The separation is a property of the attribute load, not of the filesystem. With
+short attribute values the spill block disappears and ext4/128 reports 2 for an
+empty file and 2 for a file with a byte in it — the same number, measured, which
+is where this investigation started. A predicate whose correctness depends on
+how long a cloud ID happens to be is not a predicate.
+
+And the third column is the one that matters. A placeholder is not an empty
+file; it is a file truncated to the size of the object it stands for — 10 MiB
+here — and it reports exactly the same block count as an empty one, on every
+filesystem in the table. Whatever `st_blocks` is measuring, it is not "does this
+file hold its content", which is the question being asked.
+
+`SEEK_DATA` answers that question directly and gives the same answer on all five
+configurations: `ENXIO` for a placeholder whether empty or sparse, an offset for
+a file holding anything at all. It is the filesystem-independent way to ask, and
+the framework asks it (`placeholder::holds_data`). The floor stays in §5.8 as an
+upper bound — a placeholder must not cost *more* than one block — which is a
+real thing to assert and not the same assertion.
+
+### Consequences for eviction
+
+§6h reclaims space by punching holes, and reports how much it reclaimed. On
+ext4 with a small inode it can never reclaim the last block of any file, so a
+quota that assumes evicted files cost nothing will overshoot by one block per
+file: at 100,000 files and 4 KiB blocks, 390 MiB unaccounted for. Eviction
+measures the floor rather than assuming it, for this reason.
+
+### A note on ext4 with 128-byte inodes
+
+`mkfs.ext4 -I 128` warns that it is deprecated and cannot represent dates past
+2038, so nothing new will be created this way. It stays in the conformance
+matrix regardless: filesystems made a decade ago are still mounted, this is the
+configuration that exposed the bug, and a framework that is a claim about
+filesystem behaviour does not get to choose which filesystems it meets.
+
+---
+
 ## 8a. A read past EOF triggers an event
 
 Worth writing down because the opposite assumption is the natural one, and wrong.

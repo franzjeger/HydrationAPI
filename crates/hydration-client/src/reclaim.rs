@@ -160,15 +160,39 @@ pub fn reclaim(
 
     let etag = store::get_xattr(path, store::XATTR_ETAG)?.and_then(|v| String::from_utf8(v).ok());
 
+    // What the old inode actually held. Not `md.len()`: that is the logical
+    // size, and the two differ in both directions. A file already partly
+    // sparse holds less than its length, and on a filesystem that spills
+    // extended attributes into a block of their own the placeholder that
+    // replaces it does not reach zero — §8z measures one full block on ext4
+    // with a 128- or 256-byte inode, and nothing at all on btrfs, xfs, or ext4
+    // with room in the inode.
+    //
+    // Reporting the length would therefore claim space back that was never
+    // freed, differently on different filesystems, and a quota built on that
+    // number overshoots by a block per file: 390 MiB across a hundred thousand
+    // files at a 4 KiB block size.
+    let held_before = md.blocks() * 512;
+
     // Built anonymously and swapped in, so the file is never observable in a
     // half-evicted state: it is either the full content or a complete
     // placeholder, and nothing in between is ever reachable by name.
     let mut placer = TmpfilePlacer::new(root);
     placer.place(path, md.len(), &cloud_id, etag.as_deref())?;
 
+    // Measured rather than assumed, for the same reason §5.8 probes for the
+    // floor instead of hard-coding it: the answer depends on the filesystem,
+    // its inode size, and its block size, and this code does not get to know
+    // which one it is running on.
+    let held_after = std::fs::symlink_metadata(path)
+        .map(|m| m.blocks() * 512)
+        .unwrap_or(0);
+
     // The store's entry pointed at the old inode, which no longer exists.
     store.forget(&id);
-    Ok(Ok(Reclaimed { bytes: md.len() }))
+    Ok(Ok(Reclaimed {
+        bytes: held_before.saturating_sub(held_after),
+    }))
 }
 
 #[cfg(test)]
@@ -179,12 +203,17 @@ mod tests {
     use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
-        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/reclaim-tests")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        // Not /tmp: this needs a filesystem with O_TMPFILE and user extended
+        // attributes. `HYDRATION_TEST_DIR` points it at whichever one is under
+        // test; unset, it lands beside the target directory as before.
+        //
+        // `CARGO_TARGET_TMPDIR` is not available to a unit test inside the
+        // library — cargo only sets it for integration tests — so the fallback
+        // is spelled out from the manifest directory.
+        test_scratch::scratch(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+            &format!("reclaim-tests/{name}"),
+        )
     }
 
     /// A file that has been sent and not touched since.

@@ -718,6 +718,7 @@ version = "0.1.0"
 dependencies = [
  "hydration-protocol",
  "libc",
+ "test-scratch",
 ]
 
 [[package]]
@@ -726,6 +727,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "tempfile",
+ "test-scratch",
 ]
 
 [[package]]
@@ -737,6 +739,7 @@ dependencies = [
  "hydration-protocol",
  "serde",
  "serde_json",
+ "test-scratch",
  "ureq",
 ]
 
@@ -756,6 +759,7 @@ dependencies = [
  "hydration-client",
  "hydration-protocol",
  "libc",
+ "test-scratch",
 ]
 
 [[package]]
@@ -1852,6 +1856,10 @@ dependencies = [
  "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "test-scratch"
+version = "0.1.0"
 
 [[package]]
 name = "thiserror"

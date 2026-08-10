@@ -17,12 +17,9 @@ use std::time::Duration;
 const DEBOUNCE: Duration = Duration::from_secs(900);
 
 fn scratch(name: &str) -> PathBuf {
-    let d = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("upload")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).expect("scratch");
-    d
+    // `HYDRATION_TEST_DIR` overrides this at run time, so the suite can be
+    // pointed at a btrfs, ext4 or xfs mount without rebuilding.
+    test_scratch::scratch(env!("CARGO_TARGET_TMPDIR"), &format!("upload/{name}"))
 }
 
 fn file_id(p: &Path) -> FileId {

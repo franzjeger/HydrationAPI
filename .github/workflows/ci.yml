@@ -72,7 +72,12 @@ jobs:
   # green tick over nothing.
   privileged:
     name: privileged (${{ matrix.fs.name }})
-    runs-on: ubuntu-latest
+    # Pinned, not `-latest`, because this job has a kernel floor and `-latest`
+    # moves without warning. Pre-content events are a 6.14 feature (March 2025);
+    # ubuntu-24.04 currently ships 6.17-azure and ubuntu-22.04 ships 6.8, which
+    # cannot run this suite at all. The probe below catches a migration that
+    # breaks the floor, and this pin means it should not happen by surprise.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -92,8 +97,10 @@ jobs:
           - name: ext4-512
             mkfs: mkfs.ext4 -q -F -I 512
             pkg: e2fsprogs
-          # xfs is the third filesystem §6.4 claims support for, and its block
-          # accounting is a third answer again.
+          # xfs, and this list is not a preference. The kernel gates pre-content
+          # events on a per-filesystem opt-in (`SB_I_ALLOW_HSM`), and exactly
+          # three filesystems set it: ext4, btrfs and xfs. There is no fourth to
+          # add, and tmpfs and FUSE are not omissions.
           - name: xfs
             mkfs: mkfs.xfs -q -f
             pkg: xfsprogs
@@ -105,16 +112,8 @@ jobs:
       - name: install ${{ matrix.fs.pkg }}
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.fs.pkg }}
 
-      - name: check the kernel offers pre-content events
-        run: |
-          # FAN_CLASS_PRE_CONTENT landed in 5.19 and the framework is nothing
-          # without it. Failing here names the reason; failing later would look
-          # like a bug in the code.
-          uname -r
-          grep -q 'FAN_PRE_ACCESS' /usr/include/linux/fanotify.h || {
-            echo "::error::this runner's headers have no FAN_PRE_ACCESS; the suite cannot mean anything here"
-            exit 1
-          }
+      - name: build the capability probe
+        run: gcc -O1 -Wall -Wextra -o /tmp/precontent probes/precontent.c
 
       - name: make a ${{ matrix.fs.name }} filesystem
         run: |
@@ -130,15 +129,59 @@ jobs:
           # Recorded so a failure can be read against the right numbers.
           stat -f -c 'blocksize=%s' "$RUNNER_TEMP/mnt"
 
-      # The temporary directory `CARGO_TARGET_TMPDIR` points at decides which
-      # filesystem the unprivileged tests actually exercise. Left at its default
-      # they all run on whatever the runner's /tmp is, and the matrix means
-      # nothing.
-      - name: tests on ${{ matrix.fs.name }}
+      # Ask the kernel, on the mount that will actually be used, whether the
+      # thing this framework is built on exists here. Grepping the headers
+      # would not answer it: <linux/fanotify.h> ships in a package and can
+      # easily define constants the running kernel has never implemented.
+      #
+      # Failing here names the reason. Failing thirty tests later looks like a
+      # bug in the code, and someone spends a day on it.
+      - name: can this kernel do pre-content events?
         run: |
-          mkdir -p "$RUNNER_TEMP/mnt/cargo-tmp"
-          CARGO_TARGET_TMPDIR="$RUNNER_TEMP/mnt/cargo-tmp" \
-            cargo test --workspace --no-fail-fast
+          uname -r
+          sudo /tmp/precontent "$RUNNER_TEMP/mnt" && exit 0
+          case $? in
+            1) echo "::error::this kernel has no usable pre-content events; the privileged suite cannot mean anything here" ;;
+            2) echo "::error::no CAP_SYS_ADMIN even under sudo" ;;
+            3) echo "::error::${{ matrix.fs.name }} cannot carry a FAN_PRE_ACCESS mark" ;;
+          esac
+          exit 1
+
+      # `HYDRATION_TEST_DIR` is what decides which filesystem the tests write
+      # to, and it has to be a runtime variable.
+      #
+      # The obvious spelling — exporting CARGO_TARGET_TMPDIR — does nothing.
+      # That is a compile-time macro and cargo sets it itself from the target
+      # directory, so the export is silently discarded, measured:
+      #
+      #   CARGO_TARGET_TMPDIR=/mnt/elsewhere cargo test  ->  ./target/tmp
+      #   CARGO_TARGET_DIR=/mnt/elsewhere cargo test     ->  /mnt/elsewhere/tmp
+      #
+      # Written the obvious way, all four legs of this matrix would run on the
+      # runner's own disk and report green. That is not a matrix with a bug in
+      # it; it is four identical jobs wearing four different names.
+      - name: tests on ${{ matrix.fs.name }}
+        run: cargo test --workspace --no-fail-fast
+        env:
+          # A subdirectory, not the mount root: `smoke.sh` below uses the mount
+          # as a sync root and expects it empty. Sharing it made the delta pass
+          # try to reconcile 34 files of test residue and fail — found by
+          # running these steps in order locally, which is the only way it shows
+          # up.
+          HYDRATION_TEST_DIR: ${{ runner.temp }}/mnt/tests
+
+      # And prove the variable was load-bearing rather than decorative: if the
+      # suite passes with it pointed somewhere unwritable, it was never reading
+      # it, and every green leg above meant nothing.
+      - name: the matrix is not decorative
+        run: |
+          mkdir -p "$RUNNER_TEMP/unwritable" && chmod 555 "$RUNNER_TEMP/unwritable"
+          if HYDRATION_TEST_DIR="$RUNNER_TEMP/unwritable" \
+             cargo test -p hydration-client --no-fail-fast >/dev/null 2>&1; then
+            echo "::error::the suite passed with its scratch directory unwritable, so it never used HYDRATION_TEST_DIR and this matrix tests one filesystem four times"
+            exit 1
+          fi
+          echo "ok: the suite genuinely follows HYDRATION_TEST_DIR"
 
       - name: privileged suites on ${{ matrix.fs.name }}
         run: sudo -E ./deploy/run-privileged-tests.sh "$RUNNER_TEMP/mnt" "$RUNNER_TEMP/fs.img"
@@ -146,8 +189,13 @@ jobs:
           HYDRATIOND_REQUIRE: "1"
           HYDRATION_REQUIRE: "1"
 
+      # Last, because it detaches the mount on the way out — that is one of the
+      # things it asserts. Everything above has to have run already.
       - name: end to end
-        run: sudo -E ./deploy/smoke.sh "$RUNNER_TEMP/mnt"
+        run: |
+          # An empty sync root. The steps above left theirs here.
+          sudo find "$RUNNER_TEMP/mnt" -mindepth 1 -delete
+          sudo -E ./deploy/smoke.sh "$RUNNER_TEMP/mnt"
 
       - name: what the mount looked like when it failed
         if: failure()

@@ -263,12 +263,17 @@ mod tests {
         // Deliberately not /tmp: this needs a filesystem with both O_TMPFILE
         // and user xattrs, and the target directory is on the same one the
         // framework is developed against.
-        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/place-tests")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        // Not /tmp: this needs a filesystem with O_TMPFILE and user extended
+        // attributes. `HYDRATION_TEST_DIR` points it at whichever one is under
+        // test; unset, it lands beside the target directory as before.
+        //
+        // `CARGO_TARGET_TMPDIR` is not available to a unit test inside the
+        // library — cargo only sets it for integration tests — so the fallback
+        // is spelled out from the manifest directory.
+        test_scratch::scratch(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+            &format!("place-tests/{name}"),
+        )
     }
 
     /// Without a marked mount this exercises construction rather than the event

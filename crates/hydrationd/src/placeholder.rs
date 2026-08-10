@@ -377,12 +377,18 @@ pub fn holds_data_fd(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
     }
 }
 
-/// The raw block count, for the rare caller that genuinely means blocks.
-///
-/// Not a placeholder test — see [`holds_data`] for why.
-pub fn occupies_disk(path: &Path) -> io::Result<bool> {
-    Ok(fs::metadata(path)?.blocks() > 0)
-}
+// There was an `occupies_disk` here — `metadata.blocks() > 0`, public, with a
+// comment saying it was not a placeholder test. It had no callers, and it was
+// exactly the predicate that produced the bug this module's `holds_data` was
+// written to replace: on ext4 with a small inode the extended attributes spill
+// into a block of their own, so a placeholder holding nothing reports blocks,
+// and on any filesystem a file truncated to its object's size reports the same
+// count as an empty one (§8z).
+//
+// A documented trap in a public API is still a trap. The next person needs a
+// block count for something legitimate, finds a function that returns one,
+// and does not read the comment — so it is gone rather than annotated. Callers
+// who genuinely mean blocks can say `metadata.blocks()` and own the meaning.
 
 /// True when the file carries the placeholder mark, whatever its blocks say.
 pub fn has_mark(path: &Path) -> io::Result<bool> {

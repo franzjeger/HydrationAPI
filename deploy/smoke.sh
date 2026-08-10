@@ -46,7 +46,30 @@ setfattr -n user.hydration.id -v obj-1 "$MOUNT/notes.txt"
 setfattr -n user.hydration.dehydrated -v 1 "$MOUNT/notes.txt"
 chown -R "$SYNC_USER" "$CLOUD" "$MOUNT/notes.txt"
 
-[ "$(stat -c %b "$MOUNT/notes.txt")" = "0" ] || fail "the placeholder already occupies disk"
+# Does this file hold any content at all?
+#
+# Not `stat -c %b`, which counts blocks and cannot answer the question. On ext4
+# with a small inode a placeholder's extended attributes spill into a block of
+# their own, so an empty placeholder reports 8 and `= 0` fails on a file that is
+# perfectly correct; and on every filesystem a placeholder truncated to its
+# object's size reports the same count as an empty one, so the number cannot
+# separate the two states it is being asked about (§8z).
+#
+# SEEK_DATA asks the filesystem directly and answers the same way everywhere:
+# ENXIO when there is no data anywhere in the file.
+holds_data() {
+  python3 - "$1" <<'PY'
+import errno, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.lseek(fd, 0, os.SEEK_DATA)
+    sys.exit(0)          # holds data
+except OSError as e:
+    sys.exit(1 if e.errno == errno.ENXIO else 2)
+PY
+}
+
+holds_data "$MOUNT/notes.txt" && fail "the placeholder already holds content"
 echo "placeholder: $SIZE bytes, 0 blocks"
 
 setsid runuser -u "$SYNC_USER" -- "$BIN/hydration-sync" \
@@ -63,7 +86,7 @@ WORKER=$(grep -oP 'worker pid \K[0-9]+' /tmp/smoke-hydrationd.log) \
 # 1. A read hydrates.
 GOT=$(timeout 15 cat "$MOUNT/notes.txt") || fail "reading the placeholder failed"
 [ "$GOT" = "content that lives in the cloud" ] || fail "wrong content: $GOT"
-[ "$(stat -c %b "$MOUNT/notes.txt")" != "0" ] || fail "the file still occupies no disk"
+holds_data "$MOUNT/notes.txt" || fail "the file holds no content after hydration"
 echo "PASS: a placeholder hydrated on first read"
 
 # 2. The framework creates its own placeholder for a new cloud object.
@@ -81,10 +104,10 @@ for _ in $(seq 30); do
   sleep 1
 done
 [ -e "$MOUNT/arrived.txt" ] || fail "the delta pass never created a placeholder (see /tmp/smoke-sync.log)"
-[ "$(stat -c %b "$MOUNT/arrived.txt")" = "0" ] || fail "the new placeholder occupies disk"
+holds_data "$MOUNT/arrived.txt" && fail "the new placeholder holds content"
 getfattr -n user.hydration.building "$MOUNT/arrived.txt" >/dev/null 2>&1 \
   && fail "the construction mark reached the sync directory: this file would read as zeros"
-echo "delta: placeholder created live, $(stat -c %s "$MOUNT/arrived.txt") bytes, 0 blocks"
+echo "delta: placeholder created live, $(stat -c %s "$MOUNT/arrived.txt") bytes, no content"
 
 GOT2=$(timeout 15 cat "$MOUNT/arrived.txt") || fail "reading the created placeholder failed"
 [ "$GOT2" = "arrived from the cloud after we started" ] || fail "wrong content: $GOT2"
@@ -150,7 +173,7 @@ case "$OUT" in
   reclaimed*) echo "evict: $OUT" ;;
   *) fail "eviction refused unexpectedly: $OUT" ;;
 esac
-[ "$(stat -c %b "$MOUNT/notes.txt")" = "0" ] || fail "the disk was not returned"
+holds_data "$MOUNT/notes.txt" && fail "eviction left content behind"
 [ "$(stat -c %s "$MOUNT/notes.txt")" = "$SIZE" ] || fail "the size stopped describing the object"
 echo "PASS: a file was evicted and gave its disk back"
 

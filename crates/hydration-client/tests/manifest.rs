@@ -10,12 +10,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 fn scratch(name: &str) -> PathBuf {
-    let d = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("manifest")
-        .join(name);
-    let _ = fs::remove_dir_all(&d);
-    fs::create_dir_all(&d).expect("scratch");
-    d
+    // `HYDRATION_TEST_DIR` overrides this at run time, so the suite can be
+    // pointed at a btrfs, ext4 or xfs mount without rebuilding.
+    test_scratch::scratch(env!("CARGO_TARGET_TMPDIR"), &format!("manifest/{name}"))
 }
 
 /// A placeholder: right size, no content, known to the cloud, and *marked*.

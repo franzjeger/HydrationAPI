@@ -10,6 +10,7 @@ hydration-protocol = { path = "../hydration-protocol" }
 libc = "0.2"
 
 [dev-dependencies]
+test-scratch.workspace = true
 hydration-client = { path = "../hydration-client" }
 
 [[bin]]

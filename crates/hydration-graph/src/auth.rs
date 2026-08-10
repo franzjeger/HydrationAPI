@@ -238,7 +238,7 @@ impl RefreshToken {
 /// What a successful token response carries.
 ///
 /// `refresh_token` is optional because a reply that omits it is not a reply that
-/// revokes ours — see [`install`].
+/// revokes ours — see `install`.
 #[derive(Debug)]
 pub struct Tokens {
     access: AccessToken,
@@ -297,7 +297,7 @@ pub enum AuthError {
     /// so a health check reports the truth rather than `true` forever against a
     /// daemon whose every request 401s.
     CredentialRejected,
-    /// Some other OAuth error. `code` is sanitised: see [`sanitise_code`].
+    /// Some other OAuth error. `code` is sanitised: see `sanitise_code`.
     Oauth { code: String },
     /// A reply this layer could not read as a token response.
     ///
