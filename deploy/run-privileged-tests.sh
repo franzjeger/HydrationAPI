@@ -19,14 +19,27 @@ mountpoint -q "$MOUNT" || { echo "FAIL: $MOUNT is not a mount point" >&2; exit 1
 # root's environment and registry and finds nothing.
 as_user() {
   if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
-    runuser -u "$SUDO_USER" -- "$@"
+    # `runuser` resets the environment, and the PATH is what found cargo at all:
+    # rustup installs to ~/.cargo/bin, which is on the invoking user's PATH and
+    # on nobody else's. Without this the build fails with "cargo: not found",
+    # which the caller used to report as "could not build".
+    runuser -u "$SUDO_USER" -- env \
+      PATH="$PATH" \
+      ${CARGO_HOME:+CARGO_HOME="$CARGO_HOME"} \
+      ${RUSTUP_HOME:+RUSTUP_HOME="$RUSTUP_HOME"} \
+      ${CARGO_TERM_COLOR:+CARGO_TERM_COLOR="$CARGO_TERM_COLOR"} \
+      "$@"
   else
     "$@"
   fi
 }
 
 bin_for() { # package, test target
-  as_user cargo test -p "$1" --test "$2" --no-run --message-format=json 2>/dev/null \
+  # stderr goes to a file rather than /dev/null: when this returns nothing the
+  # caller reports "could not build", and without the compiler's own words that
+  # is a dead end. It cost a CI round trip to learn that it meant "cargo is not
+  # on the PATH".
+  as_user cargo test -p "$1" --test "$2" --no-run --message-format=json 2>"/tmp/build-$2.log" \
     | python3 -c '
 import sys, json
 for line in sys.stdin:
@@ -41,7 +54,11 @@ fails=0
 run() { # package, test target, env...
   local pkg="$1" tgt="$2"; shift 2
   local exe; exe="$(bin_for "$pkg" "$tgt")"
-  [ -n "$exe" ] || { echo "  $tgt: could not build"; fails=$((fails+1)); return; }
+  if [ -z "$exe" ]; then
+    echo "  $tgt: could not build"
+    sed 's/^/      /' "/tmp/build-$tgt.log" 2>/dev/null | tail -15
+    fails=$((fails+1)); return
+  fi
   rm -rf "${MOUNT:?}"/* 2>/dev/null
   printf '  %-18s ' "$tgt"
   if env "$@" HYDRATIOND_REQUIRE=1 HYDRATION_REQUIRE=1 \

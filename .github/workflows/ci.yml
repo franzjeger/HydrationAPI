@@ -216,10 +216,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Compiled, not linked. `ptprobe.c` needs libfuse3 and the rest need
-      # nothing, and what would actually break here is a kernel header changing
-      # under a probe — which the compile catches and the link would only
-      # obscure behind a missing library.
+
+      # ptprobe.c is the FUSE passthrough comparison and needs libfuse3's
+      # headers even to parse.
+      - name: install libfuse3-dev
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+
+      # Compiled, not linked: what would actually break here is a header
+      # changing under a probe, which the compile catches and a link failure
+      # would only obscure behind a missing library.
       - name: every probe still compiles
         run: |
           fail=0

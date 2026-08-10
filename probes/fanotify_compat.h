@@ -53,6 +53,12 @@
 #define FAN_MNT_DETACH 0x02000000
 #endif
 
+/* Marking a mount namespace rather than a mount — how the exposure guard hears
+ * about a mount it did not place itself. */
+#ifndef FAN_MARK_MNTNS
+#define FAN_MARK_MNTNS 0x00000110
+#endif
+
 /* An ignore mark that survives modification — how a hydrated file stops costing
  * anything. Linux 5.19. */
 #ifndef FAN_MARK_IGNORE
