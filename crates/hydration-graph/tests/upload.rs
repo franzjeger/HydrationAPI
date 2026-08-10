@@ -561,12 +561,7 @@ impl Transport for Wire {
                 .max_by_key(|(i, rule)| (rule.m.score(), usize::MAX - *i))
                 .map(|(i, _)| i);
             match best {
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("unscripted request: {rec:?}"),
-                    ))
-                }
+                None => return Err(io::Error::other(format!("unscripted request: {rec:?}"))),
                 Some(i) => {
                     let acts = &mut rules[i].acts;
                     if acts.len() > 1 {
@@ -1567,7 +1562,7 @@ fn a_202_on_a_fragment_is_progress_and_is_never_a_completed_upload() {
 fn a_file_that_changed_during_a_session_is_not_committed_as_a_splice() {
     let rig = Rig::with_cap("no_spliced_commit", 16);
     let mut bytes = vec![0xAAu8; 10_485_760];
-    bytes.extend(std::iter::repeat(0xBBu8).take(2_097_152));
+    bytes.extend(std::iter::repeat_n(0xBBu8, 2_097_152));
     let path = rig.file("big.bin", &bytes);
     let u = upload_url("S4");
 

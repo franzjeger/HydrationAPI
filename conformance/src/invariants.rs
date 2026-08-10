@@ -61,7 +61,7 @@ fn empty_file_floor(dir: &std::path::Path) -> u64 {
         "user.hydration.mode",
     ] {
         // Values sized like the real ones: a cloud id is not five bytes.
-        let _ = set_probe_xattr(&probe, name, &vec![b'a'; 80]);
+        let _ = set_probe_xattr(&probe, name, &[b'a'; 80]);
     }
     let blocks = fs::metadata(&probe).map(|m| m.blocks()).unwrap_or(u64::MAX);
     let _ = fs::remove_file(&probe);
@@ -451,9 +451,8 @@ pub fn placeholder_consumes_no_disk<H: Harness>(h: &mut H) -> Outcome {
 
     let md = fs::metadata(&path).expect("stat placeholder");
     assert_eq!(md.len(), 65536, "a placeholder must report the real size");
-    assert_eq!(
-        holds_content(&path),
-        false,
+    assert!(
+        !holds_content(&path),
         "a placeholder holds file content; du will claim disk that is not in use"
     );
     // And an upper bound as well as the predicate, because "holds no data" alone
@@ -493,11 +492,7 @@ pub fn worker_death_fails_closed<H: Harness>(h: &mut H) -> Outcome {
 
     h.seed_remote("big.bin", &vec![b'z'; 4096], "etag-1");
     let path = h.sync_dir().join("big.bin");
-    assert_eq!(
-        holds_content(&path),
-        false,
-        "seeded file is not a placeholder"
-    );
+    assert!(!holds_content(&path), "seeded file is not a placeholder");
 
     h.kill_hydration_worker();
 
@@ -516,9 +511,8 @@ pub fn worker_death_fails_closed<H: Harness>(h: &mut H) -> Outcome {
         }
     }
 
-    assert_eq!(
-        holds_content(&path),
-        false,
+    assert!(
+        !holds_content(&path),
         "the file gained content while the worker was dead"
     );
 

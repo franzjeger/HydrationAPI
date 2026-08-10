@@ -769,7 +769,7 @@ fn a_fetch_that_delivers_short_and_claims_success_is_refused() {
     let reader = unsafe { libc::fork() };
     if reader == 0 {
         let code = match std::fs::read(&path) {
-            Ok(b) if b.iter().any(|&x| x == 0) => 7,
+            Ok(b) if b.contains(&0) => 7,
             Ok(_) => 0,
             Err(_) => 1,
         };

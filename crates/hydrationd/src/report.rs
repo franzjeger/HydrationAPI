@@ -224,8 +224,10 @@ mod tests {
 
     #[test]
     fn an_overflow_is_reported_once_and_then_cleared() {
-        let mut d = Dirty::default();
-        d.lost = true;
+        let mut d = Dirty {
+            lost: true,
+            ..Dirty::default()
+        };
         assert!(d.take().1);
         assert!(!d.take().1, "the same overflow was reported twice");
     }

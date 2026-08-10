@@ -1,0 +1,186 @@
+name: CI
+
+# The filesystem matrix is the point of this file.
+#
+# This framework is a claim about filesystem semantics, and two filesystems have
+# already disagreed with each other in a way that cost real debugging: on ext4
+# with a 128-byte inode a placeholder's identity attributes do not fit in the
+# inode and spill into a block of their own, so `st_blocks` reports 2 for a file
+# that holds nothing — the same number it reports for a file with a byte in it.
+# Four tests and one production guard were written against `st_blocks == 0` and
+# were wrong everywhere except btrfs.
+#
+# Nobody found that by reading. A second machine found it on its first run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Cheap, fails fast, and says which of the three gates it was.
+  gate:
+    name: fmt, clippy, docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The `http` feature pulls in a TLS stack and is off by default, so it is
+      # the configuration least likely to be built by hand and most likely to
+      # rot.
+      - name: cargo clippy, all features
+        run: cargo clippy -p hydration-graph --all-features --all-targets -- -D warnings
+
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Everything that does not need root or a real filesystem.
+  unprivileged:
+    name: tests (no root)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --no-fail-fast
+      - name: with the http feature
+        run: cargo test -p hydration-graph --all-features --no-fail-fast
+
+  # The suites that need CAP_SYS_ADMIN and a real mount, on filesystems that
+  # disagree with each other.
+  #
+  # `HYDRATIOND_REQUIRE=1` and `HYDRATION_REQUIRE=1` turn a skip into a failure.
+  # Without them a runner without the capability reduces the whole suite to a
+  # no-op that reports success, which is worse than not running it: it is a
+  # green tick over nothing.
+  privileged:
+    name: privileged (${{ matrix.fs.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fs:
+          # btrfs keeps extended attributes in its metadata tree, so a
+          # placeholder reports zero blocks.
+          - name: btrfs
+            mkfs: mkfs.btrfs -q -f
+            pkg: btrfs-progs
+          # ext4 with a 128-byte inode cannot hold them there. This is the
+          # configuration that found the bug.
+          - name: ext4-128
+            mkfs: mkfs.ext4 -q -F -I 128
+            pkg: e2fsprogs
+          # And with room to spare, so the difference is attributable to the
+          # inode size rather than to ext4.
+          - name: ext4-512
+            mkfs: mkfs.ext4 -q -F -I 512
+            pkg: e2fsprogs
+          # xfs is the third filesystem §6.4 claims support for, and its block
+          # accounting is a third answer again.
+          - name: xfs
+            mkfs: mkfs.xfs -q -f
+            pkg: xfsprogs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install ${{ matrix.fs.pkg }}
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.fs.pkg }}
+
+      - name: check the kernel offers pre-content events
+        run: |
+          # FAN_CLASS_PRE_CONTENT landed in 5.19 and the framework is nothing
+          # without it. Failing here names the reason; failing later would look
+          # like a bug in the code.
+          uname -r
+          grep -q 'FAN_PRE_ACCESS' /usr/include/linux/fanotify.h || {
+            echo "::error::this runner's headers have no FAN_PRE_ACCESS; the suite cannot mean anything here"
+            exit 1
+          }
+
+      - name: make a ${{ matrix.fs.name }} filesystem
+        run: |
+          truncate -s 2G "$RUNNER_TEMP/fs.img"
+          ${{ matrix.fs.mkfs }} "$RUNNER_TEMP/fs.img"
+          mkdir -p "$RUNNER_TEMP/mnt"
+          sudo mount -o loop "$RUNNER_TEMP/fs.img" "$RUNNER_TEMP/mnt"
+          sudo chmod 777 "$RUNNER_TEMP/mnt"
+          # mkfs.ext4 leaves a root-owned lost+found that makes every directory
+          # walk fail with EACCES for the test user.
+          sudo rm -rf "$RUNNER_TEMP/mnt/lost+found"
+          mountpoint "$RUNNER_TEMP/mnt"
+          # Recorded so a failure can be read against the right numbers.
+          stat -f -c 'blocksize=%s' "$RUNNER_TEMP/mnt"
+
+      # The temporary directory `CARGO_TARGET_TMPDIR` points at decides which
+      # filesystem the unprivileged tests actually exercise. Left at its default
+      # they all run on whatever the runner's /tmp is, and the matrix means
+      # nothing.
+      - name: tests on ${{ matrix.fs.name }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/mnt/cargo-tmp"
+          CARGO_TARGET_TMPDIR="$RUNNER_TEMP/mnt/cargo-tmp" \
+            cargo test --workspace --no-fail-fast
+
+      - name: privileged suites on ${{ matrix.fs.name }}
+        run: sudo -E ./deploy/run-privileged-tests.sh "$RUNNER_TEMP/mnt" "$RUNNER_TEMP/fs.img"
+        env:
+          HYDRATIOND_REQUIRE: "1"
+          HYDRATION_REQUIRE: "1"
+
+      - name: end to end
+        run: sudo -E ./deploy/smoke.sh "$RUNNER_TEMP/mnt"
+
+      - name: what the mount looked like when it failed
+        if: failure()
+        run: |
+          mount | grep "$RUNNER_TEMP/mnt" || true
+          ls -la "$RUNNER_TEMP/mnt" || true
+          dmesg | tail -40 || true
+
+      - name: unmount
+        if: always()
+        run: sudo umount -l "$RUNNER_TEMP/mnt" || true
+
+  # The probes are measurements the design document quotes. If one stops
+  # reproducing, a claim in DESIGN.md has become false and somebody should hear
+  # about it.
+  probes:
+    name: probes still compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Compiled, not linked. `ptprobe.c` needs libfuse3 and the rest need
+      # nothing, and what would actually break here is a kernel header changing
+      # under a probe — which the compile catches and the link would only
+      # obscure behind a missing library.
+      - name: every probe still compiles
+        run: |
+          fail=0
+          for c in probes/*.c; do
+            if gcc -fsyntax-only -Wall -Wextra "$c"; then
+              echo "ok   $c"
+            else
+              echo "::error file=$c::probe no longer compiles against current headers"
+              fail=1
+            fi
+          done
+          exit $fail

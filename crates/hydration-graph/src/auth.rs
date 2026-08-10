@@ -1783,10 +1783,7 @@ mod tests {
                 Some(r) => r,
                 None => match self.repeating.lock().expect("script").clone() {
                     Some(body) => Ok(TokenReply::new(400, body.into_bytes())),
-                    None => Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "the script ran out of replies",
-                    )),
+                    None => Err(io::Error::other("the script ran out of replies")),
                 },
             }
         }

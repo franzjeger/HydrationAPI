@@ -455,10 +455,7 @@ impl Pages {
         );
         let mut script = self.script.lock().unwrap();
         let Some(queue) = script.get_mut(&req) else {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("unscripted request: {req:?}"),
-            ));
+            return Err(io::Error::other(format!("unscripted request: {req:?}")));
         };
         let reply = if queue.len() > 1 {
             queue.remove(0)

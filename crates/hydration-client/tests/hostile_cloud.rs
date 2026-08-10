@@ -445,7 +445,7 @@ fn no_amount_of_bad_cloud_behaviour_destroys_unsent_local_content() {
             cloud_id: "cloud-1".into(),
         },
     ] {
-        run(&dir, &[change.clone()]);
+        run(&dir, std::slice::from_ref(&change));
         assert_eq!(
             std::fs::read(&p).unwrap(),
             b"eight months of work, never uploaded",

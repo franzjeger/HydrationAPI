@@ -699,7 +699,8 @@ enum Shape {
     /// wrong, and guessing which one wins is how a folder becomes a file.
     Ambiguous,
     /// Neither, and not a tombstone.
-    NoShape,
+    /// Neither a file facet nor a folder one, and not a tombstone.
+    Neither,
 }
 
 fn shape_of(item: &DriveItem) -> Shape {
@@ -725,7 +726,7 @@ fn shape_of(item: &DriveItem) -> Shape {
         (_, _, _, _, _, true, true) => Shape::Ambiguous,
         (_, _, _, _, _, true, false) => Shape::Folder,
         (_, _, _, _, _, false, true) => Shape::File,
-        (_, _, _, _, _, false, false) => Shape::NoShape,
+        (_, _, _, _, _, false, false) => Shape::Neither,
     }
 }
 
@@ -896,7 +897,7 @@ pub fn map_item(
         Shape::Blocked => return Err(Unmappable::Blocked),
         Shape::Unsettled => return Err(Unmappable::Unsettled),
         Shape::Ambiguous => return Err(Unmappable::Ambiguous),
-        Shape::NoShape => return Err(Unmappable::NoShape),
+        Shape::Neither => return Err(Unmappable::NoShape),
         _ => {}
     }
 
@@ -1297,6 +1298,11 @@ impl Round {
         &self.namespace
     }
 
+    // The error side is large because a refused round carries its whole report,
+    // and that is the point of it — a caller that cannot see what was refused
+    // cannot act on it. Boxing would move the cost to every caller for a value
+    // constructed at most once per round.
+    #[allow(clippy::result_large_err)]
     pub fn finish(mut self) -> Result<CompletedRound, (Escalation, Report)> {
         self.report.unresolved_problems = self
             .namespace
@@ -1842,9 +1848,11 @@ enum Fault {
     /// A condition with a name, kept whole so `last_escalation` can report the
     /// variant rather than a flattened string.
     Escalated(Escalation),
-    /// 410. Not a failure — `PROVIDER.md` calls a full listing plus a fresh
-    /// cursor a supported outcome — so it is answered by re-running the round as
-    /// an enumeration rather than returned to the caller.
+    /// The token was too old and the service said so.
+    ///
+    /// Not a failure. `PROVIDER.md` calls a full listing plus a fresh cursor a
+    /// supported outcome, so it is answered by re-running the round as an
+    /// enumeration rather than by returning it to the caller.
     Resync,
 }
 
@@ -2065,12 +2073,9 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             Fault::Escalated(e) => {
                 let rendered = format!("{e:?}");
                 self.escalation = Some(e);
-                io::Error::new(io::ErrorKind::Other, rendered)
+                io::Error::other(rendered)
             }
-            Fault::Resync => io::Error::new(
-                io::ErrorKind::Other,
-                "the service asked for a resync twice in one round",
-            ),
+            Fault::Resync => io::Error::other("the service asked for a resync twice in one round"),
         }
     }
 
@@ -3128,10 +3133,7 @@ fn service_refused(what: &str, status: u16, body: &[u8]) -> io::Error {
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    io::Error::new(
-        io::ErrorKind::Other,
-        format!("{what}: the service answered {status} {code}"),
-    )
+    io::Error::other(format!("{what}: the service answered {status} {code}"))
 }
 
 /// The one answer an update with nothing to guard it may have.
@@ -3158,7 +3160,7 @@ fn no_precondition() -> io::Error {
 /// rendering or a source chain. That is why the underlying error is discarded
 /// here rather than wrapped: `source()` is walked when an error is rendered.
 fn session_failed(what: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, format!("the upload session {what}"))
+    io::Error::other(format!("the upload session {what}"))
 }
 
 /// How many times one Graph request may be re-issued before the call gives up.

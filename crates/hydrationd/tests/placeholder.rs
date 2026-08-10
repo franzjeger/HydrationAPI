@@ -33,9 +33,8 @@ fn the_scratch_filesystem_can_actually_punch_holes() {
          about allocation, and the rest of these tests would prove nothing"
     );
     dehydrate(&p).expect("dehydrate");
-    assert_eq!(
-        hydrationd::placeholder::holds_data(&p).expect("SEEK_DATA"),
-        false,
+    assert!(
+        !hydrationd::placeholder::holds_data(&p).expect("SEEK_DATA"),
         "punching a hole did not free the blocks — is CARGO_TARGET_TMPDIR on tmpfs?"
     );
 }
@@ -47,9 +46,8 @@ fn a_placeholder_has_size_and_holds_no_data() {
 
     let md = fs::metadata(&p).expect("stat");
     assert_eq!(md.len(), 65536, "a placeholder must report the real size");
-    assert_eq!(
-        hydrationd::placeholder::holds_data(&p).expect("SEEK_DATA"),
-        false,
+    assert!(
+        !hydrationd::placeholder::holds_data(&p).expect("SEEK_DATA"),
         "a placeholder reported {} blocks for content it does not hold; du would \
          claim disk that is not in use",
         md.blocks()
@@ -105,9 +103,8 @@ fn dehydrate_keeps_size_and_mode_and_drops_the_content() {
     let md = fs::metadata(&p).unwrap();
     assert_eq!(md.len(), 8192, "size lost across dehydration");
     assert_eq!(md.permissions().mode() & 0o777, 0o750, "mode lost");
-    assert_eq!(
-        hydrationd::placeholder::holds_data(&p).expect("SEEK_DATA"),
-        false,
+    assert!(
+        !hydrationd::placeholder::holds_data(&p).expect("SEEK_DATA"),
         "still occupying disk"
     );
 }
