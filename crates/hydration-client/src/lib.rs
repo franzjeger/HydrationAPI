@@ -49,7 +49,7 @@ pub trait Provider: Send {
     /// implementation is usually
     ///
     /// ```ignore
-    /// fn fetch(&mut self, id: &str, _size: u64, out: &mut Body<'_>) -> io::Result<()> {
+    /// fn fetch(&mut self, id: &str, _size: u64, _tag: Option<&str>, out: &mut Body<'_>) -> io::Result<()> {
     ///     let mut body = self.http.get(self.url(id)).send()?;
     ///     std::io::copy(&mut body, out)?;
     ///     Ok(())
@@ -59,7 +59,17 @@ pub trait Provider: Send {
     /// Returning `Err` abandons the transfer; the placeholder is put back
     /// exactly as it was and the reader gets an error rather than a short file
     /// (§5.7).
-    fn fetch(&mut self, cloud_id: &str, size: u64, out: &mut Body<'_>) -> io::Result<()>;
+    ///
+    /// `content_tag` is the exact version marker recorded when the placeholder
+    /// was installed. Providers whose tag format is a content hash must verify
+    /// it before returning success; opaque version tags may be ignored here.
+    fn fetch(
+        &mut self,
+        cloud_id: &str,
+        size: u64,
+        content_tag: Option<&str>,
+        out: &mut Body<'_>,
+    ) -> io::Result<()>;
 }
 
 /// Why a fetch could not be served, in the framework's own terms.
@@ -165,12 +175,17 @@ impl<P: Provider> Daemon<P> {
         while let Some(msg) = conn.recv()? {
             match msg {
                 FromHelper::Fetch(req) => match self.resolve_or_rescan(req.file) {
-                    Ok((cloud_id, size)) => {
+                    Ok((cloud_id, size, content_tag)) => {
                         // The length is declared from the placeholder, which we
                         // already know — never from something the provider has
                         // yet to deliver. `Body` then holds it to that.
                         let mut body = conn.begin(req.id, size)?;
-                        match self.provider.fetch(&cloud_id, size, &mut body) {
+                        match self.provider.fetch(
+                            &cloud_id,
+                            size,
+                            content_tag.as_deref(),
+                            &mut body,
+                        ) {
                             Ok(()) => {
                                 // A short delivery becomes an abort here rather
                                 // than a truncated file; `finish` sends it and
@@ -223,17 +238,20 @@ impl<P: Provider> Daemon<P> {
     /// depends on whether it existed when the scan happened. A rescan before
     /// refusing costs a walk on the miss path only, and the miss path is already
     /// about to fail.
-    fn resolve_or_rescan(&mut self, file: FileId) -> Result<(String, u64), Refusal> {
+    fn resolve_or_rescan(
+        &mut self,
+        file: FileId,
+    ) -> Result<(String, u64, Option<String>), Refusal> {
         if self.store.lookup(&file).is_none() {
             let _ = self.rescan();
         }
         self.resolve(file)
     }
 
-    fn resolve(&self, file: FileId) -> Result<(String, u64), Refusal> {
+    fn resolve(&self, file: FileId) -> Result<(String, u64, Option<String>), Refusal> {
         let entry = self.store.lookup(&file).ok_or(Refusal::Unknown)?;
         let cloud_id = entry.cloud_id.ok_or(Refusal::NeverUploaded)?;
-        Ok((cloud_id, entry.size))
+        Ok((cloud_id, entry.size, entry.etag))
     }
 
     /// Re-scan after a sync pass created or removed placeholders.

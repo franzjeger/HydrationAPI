@@ -50,6 +50,7 @@ impl Provider for Fake {
         &mut self,
         _cloud_id: &str,
         _size: u64,
+        _content_tag: Option<&str>,
         out: &mut hydration_protocol::transport::Body<'_>,
     ) -> io::Result<()> {
         use std::io::Write;

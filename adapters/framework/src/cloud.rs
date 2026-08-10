@@ -106,6 +106,7 @@ impl Provider for Cloud {
         &mut self,
         cloud_id: &str,
         size: u64,
+        _content_tag: Option<&str>,
         out: &mut hydration_protocol::transport::Body<'_>,
     ) -> io::Result<()> {
         use std::io::Write;
