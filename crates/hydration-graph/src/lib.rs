@@ -39,7 +39,7 @@ mod access;
 #[cfg(feature = "http")]
 pub use access::{
     FileCredentialStore, FileStateStore, GraphAccess, GraphProvider, MonotonicClock,
-    SharedTokenCache, SystemSleeper,
+    SharedCredentialStore, SharedTokenCache, SystemSleeper,
 };
 
 use hydration_client::delta::{Change, Cursor};
