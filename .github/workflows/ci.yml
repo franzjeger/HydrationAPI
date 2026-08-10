@@ -109,8 +109,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: install ${{ matrix.fs.pkg }}
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.fs.pkg }}
+      # `attr` for setfattr/getfattr, which smoke.sh uses to read and place the
+      # framework's own extended attributes. Not on a minimal runner image.
+      - name: install ${{ matrix.fs.pkg }} and attr
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.fs.pkg }} attr
 
       - name: build the capability probe
         run: gcc -O1 -Wall -Wextra -o /tmp/precontent probes/precontent.c

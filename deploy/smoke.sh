@@ -20,6 +20,19 @@ BIN="$(cd "$(dirname "$0")/.." && pwd)/target/debug"
 # root would put root-owned artefacts in the developer's target directory. Say
 # which one is missing rather than exiting 127 from a shell that could not find
 # it — that is what CI did, and "exit code 127" names nothing.
+# Likewise for the tools this script leans on. `setfattr` lives in the `attr`
+# package, which a minimal image does not have — and finding that out at line 57
+# costs a round trip and produces "exit code 127", which names nothing.
+missing=""
+for t in setfattr getfattr runuser setsid timeout python3 stat; do
+  command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+done
+[ -z "$missing" ] || {
+  echo "FAIL: missing tools:$missing" >&2
+  echo "        on Debian/Ubuntu: apt-get install -y attr util-linux coreutils" >&2
+  exit 1
+}
+
 for b in hydrationd hydration-sync hydration-ctl; do
   [ -x "$BIN/$b" ] || {
     echo "FAIL: $BIN/$b is missing. Build first, as yourself:" >&2
