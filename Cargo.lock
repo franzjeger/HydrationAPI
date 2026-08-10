@@ -739,6 +739,7 @@ dependencies = [
  "hydration-protocol",
  "serde",
  "serde_json",
+ "tempfile",
  "test-scratch",
  "ureq",
 ]

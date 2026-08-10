@@ -34,6 +34,14 @@
 /// everything else.
 pub mod auth;
 
+#[cfg(feature = "http")]
+mod access;
+#[cfg(feature = "http")]
+pub use access::{
+    FileCredentialStore, FileStateStore, GraphAccess, GraphProvider, MonotonicClock,
+    SharedTokenCache, SystemSleeper,
+};
+
 use hydration_client::delta::{Change, Cursor};
 use hydration_client::namespace::{Item, Kind, Namespace, Problem};
 use serde::{Deserialize, Serialize};
@@ -155,6 +163,15 @@ impl ObjectKey {
 }
 
 impl CloudId {
+    /// Parse the drive-qualified id previously produced by [`ObjectKey::to_cloud_id`].
+    pub fn parse(raw: &str) -> Result<ObjectKey, Unmappable> {
+        let (drive, item) = raw.split_once(CLOUD_ID_SEPARATOR).ok_or(Unmappable::NoId)?;
+        if item.contains(CLOUD_ID_SEPARATOR) {
+            return Err(Unmappable::NoId);
+        }
+        Ok(ObjectKey::new(DriveId::parse(drive)?, ItemId::parse(item)?))
+    }
+
     pub fn into_inner(self) -> String {
         self.0
     }
@@ -1734,6 +1751,9 @@ pub struct TokenBlob {
 impl TokenBlob {
     pub fn new() -> Self {
         Self::default()
+    }
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+        serde_json::from_slice(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
     pub fn one(drive: &DriveId, link: &str) -> Self {
         let mut t = Self::new();

@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Microsoft Graph delta feed to hydration-client namespace items"
 
+[[bin]]
+name = "hydration-onedrive"
+path = "src/bin/hydration-onedrive.rs"
+required-features = ["http"]
+
 [features]
 # Off by default. Everything above the transport seam — the wire model, the
 # mapper, the round driver, the sink — is testable with no socket, no
@@ -58,3 +63,4 @@ optional = true
 [dev-dependencies]
 test-scratch.workspace = true
 serde_json = "1"
+tempfile.workspace = true
