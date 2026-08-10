@@ -107,7 +107,9 @@ fn dehydrate_keeps_size_and_mode_and_drops_the_content() {
     assert_eq!(md.permissions().mode() & 0o777, 0o750, "mode lost");
     assert_eq!(
         hydrationd::placeholder::holds_data(&p).expect("SEEK_DATA"),
-        false, "still occupying disk");
+        false,
+        "still occupying disk"
+    );
 }
 
 /// The identity half of §5.1, at this layer: nothing about dehydrating or

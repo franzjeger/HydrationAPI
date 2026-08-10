@@ -103,11 +103,7 @@ pub fn reclaim(
 
     let md = match std::fs::metadata(&joined) {
         Ok(md) if md.is_file() => md,
-        Ok(_) => {
-            return Ok(Err(Refused::NotEligible(
-                "not a regular file".to_string(),
-            )))
-        }
+        Ok(_) => return Ok(Err(Refused::NotEligible("not a regular file".to_string()))),
         Err(e) => return Err(e),
     };
 
@@ -276,8 +272,14 @@ mod tests {
         );
         // And the same file being sent right now.
         assert_eq!(
-            reclaim(&dir, "doc.txt", &mut store, &HashSet::new(), &[id].into_iter().collect())
-                .unwrap(),
+            reclaim(
+                &dir,
+                "doc.txt",
+                &mut store,
+                &HashSet::new(),
+                &[id].into_iter().collect()
+            )
+            .unwrap(),
             Err(Refused::UploadPending)
         );
         assert_eq!(std::fs::read(&p).unwrap(), b"content");

@@ -35,7 +35,7 @@
 pub mod auth;
 
 use hydration_client::delta::{Change, Cursor};
-use hydration_client::namespace::{Item, Namespace, Problem, Kind};
+use hydration_client::namespace::{Item, Kind, Namespace, Problem};
 use serde::{Deserialize, Serialize};
 use std::io;
 
@@ -436,8 +436,8 @@ impl DeltaPage {
             return Err(EnvelopeError::ResyncRequired);
         }
 
-        let root: serde_json::Value = serde_json::from_slice(raw)
-            .map_err(|e| EnvelopeError::Malformed(e.to_string()))?;
+        let root: serde_json::Value =
+            serde_json::from_slice(raw).map_err(|e| EnvelopeError::Malformed(e.to_string()))?;
 
         // An `error` key outranks the status. Graph answers 200 with one.
         if let Some(err) = root.get("error") {
@@ -505,7 +505,9 @@ fn link(root: &serde_json::Value, key: &str) -> Result<Option<String>, EnvelopeE
         None => Ok(None),
         Some(v) => match v.as_str() {
             Some(s) if !s.is_empty() => Ok(Some(s.to_string())),
-            _ => Err(EnvelopeError::Malformed(format!("{key} is empty or not a string"))),
+            _ => Err(EnvelopeError::Malformed(format!(
+                "{key} is empty or not a string"
+            ))),
         },
     }
 }
@@ -544,15 +546,25 @@ pub enum Unmappable {
     IdTooLong,
     NoParent,
     SelfParent,
-    ForeignParent { parent_drive: DriveId },
+    ForeignParent {
+        parent_drive: DriveId,
+    },
     NoShape,
     Ambiguous,
     Blocked,
     Unsettled,
     NoSize,
-    NoContentTag { source: TagSource },
-    ShapeFlip { from: KindTag, to: KindTag, children: usize },
-    TooDeep { depth: usize },
+    NoContentTag {
+        source: TagSource,
+    },
+    ShapeFlip {
+        from: KindTag,
+        to: KindTag,
+        children: usize,
+    },
+    TooDeep {
+        depth: usize,
+    },
     RootDeleted,
 }
 
@@ -641,7 +653,10 @@ impl TreeIndex {
             }
         }
         if let Some(p) = parent {
-            self.children.entry(p.clone()).or_default().insert(key.clone());
+            self.children
+                .entry(p.clone())
+                .or_default()
+                .insert(key.clone());
             self.parents.insert(key.clone(), p);
         }
         self.shapes.insert(key, shape);
@@ -1751,12 +1766,7 @@ pub struct PersistedState {
 
 impl PersistedState {
     /// A pair a completed round would have written.
-    pub fn consistent(
-        drive: &DriveId,
-        tags: TagSource,
-        items: &[Item],
-        token: &TokenBlob,
-    ) -> Self {
+    pub fn consistent(drive: &DriveId, tags: TagSource, items: &[Item], token: &TokenBlob) -> Self {
         let mut token = token.clone();
         // Same generation on both halves is exactly what the two writes leave
         // behind when neither is interrupted.
@@ -2922,7 +2932,9 @@ fn check_relative_name(rel: &str) -> io::Result<()> {
             )));
         }
         if segment.starts_with("~$") {
-            return Err(refused(format!("{segment:?} is a name the service reserves")));
+            return Err(refused(format!(
+                "{segment:?} is a name the service reserves"
+            )));
         }
         let unholdable =
             |c: char| RESERVED_CHARS.contains(&c) || (c as u32) < 0x20 || c == '\u{7f}';
@@ -2933,10 +2945,14 @@ fn check_relative_name(rel: &str) -> io::Result<()> {
         }
         let folded = segment.to_ascii_lowercase();
         if folded.contains("_vti_") {
-            return Err(refused(format!("{segment:?} holds the reserved infix _vti_")));
+            return Err(refused(format!(
+                "{segment:?} holds the reserved infix _vti_"
+            )));
         }
         if RESERVED_NAMES.contains(&folded.as_str()) {
-            return Err(refused(format!("{segment:?} is a name the service reserves")));
+            return Err(refused(format!(
+                "{segment:?} is a name the service reserves"
+            )));
         }
     }
     Ok(())
@@ -3038,7 +3054,9 @@ fn unchanged(path: &std::path::Path, snap: &Snapshot) -> io::Result<()> {
     let file = std::fs::File::open(path)?;
     let md = file.metadata()?;
     if md.dev() != snap.dev || md.ino() != snap.ino {
-        return Err(refused("another inode took the path while the transfer ran"));
+        return Err(refused(
+            "another inode took the path while the transfer ran",
+        ));
     }
     if md.len() != snap.len {
         return Err(refused(format!(
@@ -3279,7 +3297,10 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
         let key = ObjectKey::new(
             drive.clone(),
             ItemId::parse(raw).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("the service named {e:?}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("the service named {e:?}"),
+                )
             })?,
         );
         // Graph's documented default property set carries no cTag and no
@@ -3464,9 +3485,8 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
                 // full of invisible partial copies and unrelated uploads start
                 // failing 507. "Delete the item I was writing to" would recycle
                 // the user's complete previous version instead.
-                let _ = self.call_session(
-                    &Request::new(Method::Delete, upload_url.clone()).unauthorized(),
-                );
+                let _ = self
+                    .call_session(&Request::new(Method::Delete, upload_url.clone()).unauthorized());
                 Err(e)
             }
         }
@@ -3682,11 +3702,7 @@ enum Transferred {
 }
 
 impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K> {
-    fn upload(
-        &mut self,
-        path: &std::path::Path,
-        existing: Option<&str>,
-    ) -> io::Result<Uploaded> {
+    fn upload(&mut self, path: &std::path::Path, existing: Option<&str>) -> io::Result<Uploaded> {
         // §5.5 states the absence rule about the moment an upload *finishes*.
         // The moment it starts is the same fact: `run_upload` folds `ENOENT`
         // into `None` and calls this anyway, so the path is routinely one that
@@ -3824,11 +3840,7 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
     /// can be saved over, truncated, or evicted into a placeholder. The content
     /// that goes up is the content at send time, and every guard that decided
     /// the first attempt has to decide this one too.
-    fn create(
-        &mut self,
-        path: &std::path::Path,
-        rel: &str,
-    ) -> io::Result<Uploaded> {
+    fn create(&mut self, path: &std::path::Path, rel: &str) -> io::Result<Uploaded> {
         let file = std::fs::File::open(path)?;
         if is_placeholder(path)? {
             return Err(refused(

@@ -14,7 +14,7 @@ pub mod exposure;
 pub mod fanotify;
 pub mod placeholder;
 pub mod policy;
-pub mod report;
 pub mod remote;
+pub mod report;
 pub mod supervisor;
 pub mod watch;

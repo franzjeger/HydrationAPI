@@ -344,9 +344,15 @@ fn a_prompt_fetch_is_unaffected() {
             break;
         }
     }
-    assert_eq!(libc::WEXITSTATUS(status), 0, "a prompt fetch did not deliver");
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        0,
+        "a prompt fetch did not deliver"
+    );
     assert!(
-        outcomes.iter().any(|h| matches!(h, Handled::Hydrated { .. })),
+        outcomes
+            .iter()
+            .any(|h| matches!(h, Handled::Hydrated { .. })),
         "expected a hydration: {outcomes:?}"
     );
     let _ = std::fs::remove_file(&path);
@@ -617,7 +623,10 @@ fn a_slow_but_steady_transfer_completes_past_the_first_byte_deadline() {
         "the transfer finished too fast to have exercised the deadline: {:?}",
         began.elapsed()
     );
-    assert!(!worker.fetcher_wedged(), "a slow transfer counted as unresponsive");
+    assert!(
+        !worker.fetcher_wedged(),
+        "a slow transfer counted as unresponsive"
+    );
     let _ = std::fs::remove_file(&path);
 }
 

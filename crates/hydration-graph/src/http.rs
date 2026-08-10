@@ -200,7 +200,9 @@ impl<T: TokenTransport, C: Clock, S: CredentialStore> TokenSource for Arc<TokenC
 /// force an `Arc` on a single-threaded tool.
 impl<T: TokenTransport, C: Clock, S: CredentialStore> TokenSource for TokenCache<T, C, S> {
     fn authorization(&mut self) -> io::Result<String> {
-        Ok(TokenCache::token(self).map_err(auth_failure)?.header_value())
+        Ok(TokenCache::token(self)
+            .map_err(auth_failure)?
+            .header_value())
     }
 }
 
@@ -562,10 +564,7 @@ impl TokenTransport for GraphTokens {
         let built = ureq::http::Request::builder()
             .method("POST")
             .uri(request.url())
-            .header(
-                ureq::http::header::CONTENT_TYPE,
-                TokenRequest::CONTENT_TYPE,
-            )
+            .header(ureq::http::header::CONTENT_TYPE, TokenRequest::CONTENT_TYPE)
             .header(ureq::http::header::ACCEPT, "application/json")
             .body(request.body().as_bytes())
             .map_err(|_| {
@@ -866,8 +865,7 @@ mod tests {
     /// finding, said earlier.
     #[test]
     fn a_token_cache_is_a_token_source_with_no_slicing_in_between() {
-        let cache =
-            cache(r#"{"access_token":"ACCESS-1","expires_in":3600,"refresh_token":"R2"}"#);
+        let cache = cache(r#"{"access_token":"ACCESS-1","expires_in":3600,"refresh_token":"R2"}"#);
         cache.sign_in_with(RefreshToken::new("R1"));
 
         let mut source = Arc::clone(&cache);
@@ -1030,7 +1028,6 @@ mod tests {
         let header = authorization_header(&mut StaticToken::new("ACCESS-1")).expect("a header");
         assert_eq!(header.to_str().expect("ascii"), "Bearer ACCESS-1");
     }
-
 
     #[test]
     fn the_token_goes_to_graph_when_the_caller_says_so() {

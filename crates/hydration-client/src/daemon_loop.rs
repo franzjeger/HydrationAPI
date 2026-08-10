@@ -263,7 +263,10 @@ fn control(
                         if seen.is_empty() {
                             "no other mount exposes these files".to_string()
                         } else {
-                            format!("WARNING: {} other mount(s) bypass hydration: {seen:?}", seen.len())
+                            format!(
+                                "WARNING: {} other mount(s) bypass hydration: {seen:?}",
+                                seen.len()
+                            )
                         }
                     )
                 }

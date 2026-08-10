@@ -68,8 +68,8 @@ use std::time::Duration;
 use hydration_client::delta::{Change, Cursor, Discover};
 use hydration_client::namespace::{Item, Kind};
 use hydration_graph::{
-    delta_url, DriveId, DriveScope, Escalation, GraphDiscover, ItemId, ObjectKey,
-    PageSource, PersistedState, RawPage, Sleeper, StateStore, TagSource, TokenBlob, TreeBlob,
+    delta_url, DriveId, DriveScope, Escalation, GraphDiscover, ItemId, ObjectKey, PageSource,
+    PersistedState, RawPage, Sleeper, StateStore, TagSource, TokenBlob, TreeBlob,
     MAX_PAGES_PER_ROUND,
 };
 
@@ -596,7 +596,10 @@ impl PageSource for GeneratedPages {
             .unwrap_or_else(|| panic!("the driver resumed something that is not a token: {tok}"))
             .parse()
             .unwrap();
-        assert!(r + 1 < self.rounds.len(), "no round after D{r} was scripted");
+        assert!(
+            r + 1 < self.rounds.len(),
+            "no round after D{r} was scripted"
+        );
         self.page(r + 1, 0)
     }
 
@@ -1057,7 +1060,9 @@ fn positive_control_an_empty_cursor_with_no_persisted_state_does_enumerate() {
     );
 
     let mut d = rig.provider();
-    let (changes, cursor) = d.changes(&Cursor::default()).expect("a first run must sync");
+    let (changes, cursor) = d
+        .changes(&Cursor::default())
+        .expect("a first run must sync");
 
     assert_eq!(
         rig.journal.calls(),
@@ -1141,7 +1146,11 @@ fn a_stored_token_with_no_stored_tree_is_discarded_rather_than_resumed() {
     );
     // The pair lands on the call that proves the batch was applied, not on the
     // round that derived it. Same two writes, same order, one call later.
-    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    assert!(
+        rig.journal.writes().is_empty(),
+        "{:?}",
+        rig.journal.writes()
+    );
     ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
@@ -1151,7 +1160,9 @@ fn a_stored_token_with_no_stored_tree_is_discarded_rather_than_resumed() {
         ]
     );
     assert_eq!(
-        rig.store.stored_token().and_then(|t| t.get(&drive_id(MINE)).map(str::to_string)),
+        rig.store
+            .stored_token()
+            .and_then(|t| t.get(&drive_id(MINE)).map(str::to_string)),
         Some(lnk("D10")),
         "the stale token is replaced, not kept"
     );
@@ -1246,11 +1257,7 @@ fn a_restart_reports_every_object_the_tree_knows_not_only_what_the_page_named() 
 
     assert_eq!(
         upserted(&changes),
-        set(&[
-            cloud(MINE, "01A"),
-            cloud(MINE, "01B"),
-            cloud(MINE, "01C")
-        ]),
+        set(&[cloud(MINE, "01A"), cloud(MINE, "01B"), cloud(MINE, "01C")]),
         "the batch is what the tree knows, not what the page named"
     );
     assert_eq!(
@@ -1306,7 +1313,11 @@ fn a_restart_never_reads_the_stored_tree_as_a_page_of_deletions() {
     assert_eq!(upsert_count(&changes), 500);
     // The pair lands on the call that proves the batch was applied. Same two
     // writes, same order, same contents, one call later.
-    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    assert!(
+        rig.journal.writes().is_empty(),
+        "{:?}",
+        rig.journal.writes()
+    );
     ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
@@ -1494,10 +1505,7 @@ fn a_resumed_round_still_follows_its_next_links() {
             &lnk("P1"),
         ))],
     );
-    rig.script(
-        next_req("P1"),
-        vec![Reply::ok(body_delta(&[], &lnk("D2")))],
-    );
+    rig.script(next_req("P1"), vec![Reply::ok(body_delta(&[], &lnk("D2")))]);
 
     let mut round_two = rig.provider();
     let (changes, cursor) = round_two.changes(&Cursor::default()).expect("resumable");
@@ -1685,7 +1693,11 @@ fn a_repeated_cursor_is_served_from_memory_with_no_request_and_no_backoff() {
     // A repeat is the framework saying it could not apply the batch, so the
     // round's pair is still held: nothing at all has been written yet. Moving
     // the position under an unapplied batch is what lost the removal.
-    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    assert!(
+        rig.journal.writes().is_empty(),
+        "{:?}",
+        rig.journal.writes()
+    );
     ack(&mut d, &c1);
     assert_eq!(rig.journal.token_writes().len(), 1);
     assert_eq!(
@@ -1840,7 +1852,11 @@ fn three_repeats_of_one_cursor_are_reported_as_a_stall() {
     // has been written at all — which is the whole of the fix: the position
     // stays where the wedged batch was read from, and the tombstone in it is
     // still reachable from the token on disk after a restart.
-    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    assert!(
+        rig.journal.writes().is_empty(),
+        "{:?}",
+        rig.journal.writes()
+    );
     let (b, c) = last.unwrap();
     assert_eq!(
         removed(&b),
@@ -1937,11 +1953,7 @@ fn a_quiet_steady_state_round_reports_the_tree_rather_than_an_empty_batch() {
     assert!(!b2.is_empty(), "a quiet round still reports the tree");
     assert_eq!(
         upserted(&b2),
-        set(&[
-            cloud(MINE, "01A"),
-            cloud(MINE, "01B"),
-            cloud(MINE, "01C")
-        ])
+        set(&[cloud(MINE, "01A"), cloud(MINE, "01B"), cloud(MINE, "01C")])
     );
     assert_eq!(
         paths(&b2),
@@ -1989,7 +2001,11 @@ fn the_tree_written_is_this_rounds_tree_and_it_is_written_before_the_token() {
     // Still this round's tree, still before the token — one call later. The
     // round derives the pair and writes neither; the call that proves the batch
     // was applied is the one that lands it.
-    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    assert!(
+        rig.journal.writes().is_empty(),
+        "{:?}",
+        rig.journal.writes()
+    );
     ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
@@ -2001,7 +2017,11 @@ fn the_tree_written_is_this_rounds_tree_and_it_is_written_before_the_token() {
     let tree = rig.store.trees_written().pop().expect("a tree was written");
     let ids = tree_ids(&tree);
     assert!(ids.contains(&cloud(MINE, "01A")) && ids.contains(&cloud(MINE, "01B")));
-    let token = rig.store.tokens_written().pop().expect("a token was written");
+    let token = rig
+        .store
+        .tokens_written()
+        .pop()
+        .expect("a token was written");
     assert_eq!(token.get(&drive_id(MINE)), Some(lnk("DELTA-1").as_str()));
     assert!(cursor_str(&cursor).contains("DELTA-1"));
 }
@@ -2450,7 +2470,10 @@ fn a_round_that_produced_no_changes_still_persists_its_tree() {
     rig.script(
         first_req(MINE),
         vec![Reply::ok(body_delta(
-            &[root_json(MINE, ROOT), folder_json(MINE, "01W", "Work", ROOT)],
+            &[
+                root_json(MINE, ROOT),
+                folder_json(MINE, "01W", "Work", ROOT),
+            ],
             &lnk("DELTA-1"),
         ))],
     );
@@ -2458,11 +2481,18 @@ fn a_round_that_produced_no_changes_still_persists_its_tree() {
     let mut d = rig.provider();
     let (changes, cursor) = d.changes(&Cursor::default()).expect("a clean round");
 
-    assert!(changes.is_empty(), "a root and an empty folder are no files");
+    assert!(
+        changes.is_empty(),
+        "a root and an empty folder are no files"
+    );
     // An empty batch is still acknowledged — `hydration-sync.rs` advances the
     // cursor on a quiet pass too — so the tree still reaches disk, one call
     // later and with the folder in it.
-    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    assert!(
+        rig.journal.writes().is_empty(),
+        "{:?}",
+        rig.journal.writes()
+    );
     ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
@@ -2526,7 +2556,10 @@ fn only_a_delta_link_is_ever_persisted_as_a_token() {
     assert_eq!(tokens.len(), 1, "one token per round, at the end of it");
     let bytes = String::from_utf8(tokens[0].as_bytes()).expect("utf-8");
     assert!(bytes.contains("DELTA-9"));
-    assert!(!bytes.contains("NEXT-1"), "a nextLink is not a resume point");
+    assert!(
+        !bytes.contains("NEXT-1"),
+        "a nextLink is not a resume point"
+    );
     assert!(!bytes.contains("NEXT-2"));
     let events = rig.journal.writes();
     let last_tree = events
@@ -2936,7 +2969,11 @@ fn a_delta_link_on_the_first_page_completes_the_round_and_nothing_further_is_fet
     assert!(cursor_str(&cursor).contains("DELTA-1"));
     // The pair lands on the call that proves the batch was applied. Same two
     // writes, same order, same contents, one call later.
-    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    assert!(
+        rig.journal.writes().is_empty(),
+        "{:?}",
+        rig.journal.writes()
+    );
     ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
@@ -3327,7 +3364,15 @@ const FAR_ROOT: &str = "01FAR";
 fn fan_out_primary_page(end_next: Option<&str>) -> String {
     let items = [
         root_json(MINE, ROOT),
-        share_json(MINE, SHARE, "Team Files", ROOT, THEIRS, FAR_ROOT, "01FARROOT"),
+        share_json(
+            MINE,
+            SHARE,
+            "Team Files",
+            ROOT,
+            THEIRS,
+            FAR_ROOT,
+            "01FARROOT",
+        ),
     ];
     match end_next {
         Some(n) => body_next(&items, n),
@@ -3381,7 +3426,10 @@ fn two_scopes_in_one_round_each_get_their_own_token() {
     let tokens = rig.store.tokens_written();
     assert_eq!(tokens.len(), 1, "one round, one token write");
     let blob = &tokens[0];
-    assert_eq!(blob.get(&drive_id(MINE)), Some(link_on(MINE, "DM").as_str()));
+    assert_eq!(
+        blob.get(&drive_id(MINE)),
+        Some(link_on(MINE, "DM").as_str())
+    );
     assert_eq!(
         blob.get(&drive_id(THEIRS)),
         Some(link_on(THEIRS, "DT").as_str())
@@ -3431,7 +3479,10 @@ fn a_delta_link_for_one_scope_does_not_end_another_scopes_paging() {
     // applied; it still carries both scopes' links.
     ack(&mut d, &cursor);
     let blob = rig.store.tokens_written().pop().expect("a token");
-    assert_eq!(blob.get(&drive_id(MINE)), Some(link_on(MINE, "DM").as_str()));
+    assert_eq!(
+        blob.get(&drive_id(MINE)),
+        Some(link_on(MINE, "DM").as_str())
+    );
     assert_eq!(
         blob.get(&drive_id(THEIRS)),
         Some(link_on(THEIRS, "DT").as_str())
@@ -3607,7 +3658,11 @@ fn an_expired_token_re_enumerates_and_returns_a_fresh_cursor_rather_than_errorin
     assert!(cursor.0.is_some() && cursor_str(&cursor).contains("D20"));
     // The recovered pair lands on the call that proves the batch was applied.
     // Same two writes, same order, same contents, one call later.
-    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    assert!(
+        rig.journal.writes().is_empty(),
+        "{:?}",
+        rig.journal.writes()
+    );
     ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
@@ -3685,7 +3740,11 @@ fn the_expired_token_diff_removes_a_file_deleted_while_the_token_was_dead() {
     assert!(cursor_str(&cursor).contains("DELTA-2"));
     // The recovered pair lands on the call that proves the batch was applied.
     // Same two writes, same order, same contents, one call later.
-    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    assert!(
+        rig.journal.writes().is_empty(),
+        "{:?}",
+        rig.journal.writes()
+    );
     ack(&mut two, &cursor);
     assert_eq!(
         rig.journal.writes(),
@@ -3751,7 +3810,11 @@ fn a_re_enumeration_that_did_not_finish_is_never_diffed_for_deletions() {
             removed(changes)
         );
     }
-    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    assert!(
+        rig.journal.writes().is_empty(),
+        "{:?}",
+        rig.journal.writes()
+    );
     assert_eq!(rig.store.tree_bytes(), Some(tree_before));
     assert_eq!(rig.store.token_bytes(), Some(token_before));
 }
@@ -3801,8 +3864,15 @@ fn a_round_the_blast_guard_refused_does_not_overwrite_the_tree_it_refused_to_tru
         d.changes(&Cursor::default()).is_err(),
         "500 removals in one batch is a bug, not an instruction"
     );
-    assert!(d.last_escalation().is_some(), "the refusal must be nameable");
-    assert!(rig.journal.writes().is_empty(), "{:?}", rig.journal.writes());
+    assert!(
+        d.last_escalation().is_some(),
+        "the refusal must be nameable"
+    );
+    assert!(
+        rig.journal.writes().is_empty(),
+        "{:?}",
+        rig.journal.writes()
+    );
     assert_eq!(rig.store.tree_bytes(), Some(tree_before));
     assert_eq!(rig.store.token_bytes(), Some(token_before));
 }

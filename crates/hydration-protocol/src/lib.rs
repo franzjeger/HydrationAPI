@@ -128,7 +128,6 @@ pub mod flags {
     }
 }
 
-
 /// Whether a file holds any content, asked of the filesystem.
 ///
 /// Here because both halves and their tests need the same answer, and because

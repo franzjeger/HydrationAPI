@@ -7,10 +7,10 @@
 use hydration_protocol::FileId;
 use hydrationd::daemon::{FetchWhole, Worker};
 use hydrationd::evict::{evict, Backup, Refused};
-use hydrationd::policy::Policy;
-use hydrationd::supervisor::InFlight;
 use hydrationd::fanotify::Group;
 use hydrationd::placeholder;
+use hydrationd::policy::Policy;
+use hydrationd::supervisor::InFlight;
 use std::path::PathBuf;
 
 fn mount() -> Option<PathBuf> {

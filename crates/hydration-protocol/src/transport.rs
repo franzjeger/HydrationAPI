@@ -114,7 +114,10 @@ impl HelperConn {
         if expected > crate::MAX_OBJECT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("placeholder claims {expected} bytes; the helper's limit is {}", crate::MAX_OBJECT),
+                format!(
+                    "placeholder claims {expected} bytes; the helper's limit is {}",
+                    crate::MAX_OBJECT
+                ),
             ));
         }
         let mut total = 0u64;
@@ -172,8 +175,8 @@ impl HelperConn {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
-                            "chunk of {len} is empty or would overrun a {expected}-byte object"
-                        ),
+                                "chunk of {len} is empty or would overrun a {expected}-byte object"
+                            ),
                         ));
                     }
                     let n = len as usize;
@@ -285,7 +288,10 @@ impl Body<'_> {
             )?;
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("short delivery: {} of {} bytes", self.written, self.promised),
+                format!(
+                    "short delivery: {} of {} bytes",
+                    self.written, self.promised
+                ),
             ));
         }
         let line = encode(&ToHelper::Done { id: self.id }).map_err(io::Error::other)?;
@@ -352,7 +358,11 @@ impl Write for Body<'_> {
         // From here the header is committed and the body is owed. A failure
         // leaves the stream in a state no reader can recover from, so it is
         // marked rather than retried.
-        if let Err(e) = self.writer.write_all(&buf[..n]).and_then(|()| self.writer.flush()) {
+        if let Err(e) = self
+            .writer
+            .write_all(&buf[..n])
+            .and_then(|()| self.writer.flush())
+        {
             self.poisoned = true;
             return Err(e);
         }
@@ -402,8 +412,8 @@ impl DaemonConn {
     /// out)` cannot get the contract wrong, which is the point of handing it a
     /// concrete type rather than a `dyn Write`.
     pub fn begin(&mut self, id: u64, len: u64) -> io::Result<Body<'_>> {
-        let line = encode(&ToHelper::Fetch(FetchResponse::Ready { id, len }))
-            .map_err(io::Error::other)?;
+        let line =
+            encode(&ToHelper::Fetch(FetchResponse::Ready { id, len })).map_err(io::Error::other)?;
         self.writer.write_all(line.as_bytes())?;
         Ok(Body {
             writer: &mut self.writer,

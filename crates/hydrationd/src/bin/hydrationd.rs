@@ -17,8 +17,8 @@ use hydrationd::daemon::{Worker, DEFAULT_STALL};
 use hydrationd::exposure::ExposureWatch;
 use hydrationd::fanotify::Group;
 use hydrationd::policy::Policy;
-use hydrationd::report;
 use hydrationd::remote::SocketFetch;
+use hydrationd::report;
 use hydrationd::supervisor::{deny, InFlight};
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -186,7 +186,10 @@ fn main() -> io::Result<()> {
             conn.notifier(),
             Duration::from_millis(250),
         ) {
-            Ok(_) => eprintln!("[worker] watching {} for local changes", args.mount.display()),
+            Ok(_) => eprintln!(
+                "[worker] watching {} for local changes",
+                args.mount.display()
+            ),
             // Not fatal. Hydration is the guarantee; change detection is the
             // feature, and the daemon walks the directory anyway.
             Err(e) => eprintln!("[worker] change detection unavailable: {e}"),

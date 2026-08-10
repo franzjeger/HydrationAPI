@@ -202,7 +202,10 @@ impl Materialise for TmpfilePlacer {
         etag: Option<&str>,
     ) -> io::Result<()> {
         let dir = path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "placeholder path has no parent")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "placeholder path has no parent",
+            )
         })?;
         std::fs::create_dir_all(dir)?;
 
@@ -350,7 +353,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.contains("hydration-"))
             .collect();
-        assert!(leftovers.is_empty(), "scratch names left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "scratch names left behind: {leftovers:?}"
+        );
     }
 
     /// A crash between `linkat` and `rename` leaves a complete placeholder under

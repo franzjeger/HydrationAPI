@@ -497,7 +497,10 @@ fn check_host(host: &str) -> Result<(), AuthError> {
         if label.starts_with('-') || label.ends_with('-') {
             return Err(AuthError::BadConfig("authority host label is malformed"));
         }
-        if !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
             return Err(AuthError::BadConfig("authority host is not a bare host"));
         }
     }
@@ -613,7 +616,10 @@ impl fmt::Debug for TokenReply {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TokenReply")
             .field("status", &self.status)
-            .field("body", &format_args!("<{} bytes redacted>", self.body.len()))
+            .field(
+                "body",
+                &format_args!("<{} bytes redacted>", self.body.len()),
+            )
             .finish()
     }
 }
@@ -832,8 +838,7 @@ fn oauth_error(v: &Value) -> Option<AuthError> {
 }
 
 fn body_json(reply: &TokenReply) -> Result<Value, AuthError> {
-    serde_json::from_slice(&reply.body)
-        .map_err(|_| AuthError::Malformed("the reply was not JSON"))
+    serde_json::from_slice(&reply.body).map_err(|_| AuthError::Malformed("the reply was not JSON"))
 }
 
 /// A token response, or the named reason it is not one.
@@ -925,8 +930,8 @@ fn read_device_code(reply: &TokenReply, now: Duration) -> Result<DeviceCode, Aut
     };
     // The two endpoints disagree in public about the spelling, so both are read
     // and the v2 one wins.
-    let uri = non_empty_str(&v, "verification_uri")
-        .or_else(|| non_empty_str(&v, "verification_url"));
+    let uri =
+        non_empty_str(&v, "verification_uri").or_else(|| non_empty_str(&v, "verification_url"));
     let Some(uri) = uri else {
         return Err(AuthError::Malformed("no verification_uri in the reply"));
     };
@@ -1407,7 +1412,9 @@ impl<T: TokenTransport, C: Clock, S: CredentialStore> TokenCache<T, C, S> {
                 }
                 Err(AuthError::AuthorizationPending) => continue,
                 Err(AuthError::SlowDown) => {
-                    interval = interval.saturating_add(SLOW_DOWN_STEP).min(MAX_POLL_INTERVAL);
+                    interval = interval
+                        .saturating_add(SLOW_DOWN_STEP)
+                        .min(MAX_POLL_INTERVAL);
                     continue;
                 }
                 Err(other) => return Err(other),
@@ -2318,7 +2325,10 @@ mod tests {
         cache.sign_in_with(RefreshToken::new("REFRESH-FRESH"));
         assert!(cache.is_signed_in(), "a new credential is a new chance");
         assert_eq!(
-            cache.token().expect("the new credential works").header_value(),
+            cache
+                .token()
+                .expect("the new credential works")
+                .header_value(),
             "Bearer ACCESS-9"
         );
         assert!(bodies_of(&rig.script, Grant::Refresh)[3].contains("refresh_token=REFRESH-FRESH"));
@@ -2362,13 +2372,20 @@ mod tests {
             2,
             "a failing refresh hot-looped against the token endpoint"
         );
-        assert_eq!(rig.script.remaining(), 1, "the good reply was consumed early");
+        assert_eq!(
+            rig.script.remaining(),
+            1,
+            "the good reply was consumed early"
+        );
 
         // POSITIVE CONTROL: the window ends, and it is the retry that fixes the
         // outage — a backoff that never expires is an outage that never ends.
         rig.clock.advance(REFRESH_BACKOFF_STEP);
         assert_eq!(
-            cache.token().expect("the attempt after the backoff").header_value(),
+            cache
+                .token()
+                .expect("the attempt after the backoff")
+                .header_value(),
             "Bearer ACCESS-2"
         );
         assert_eq!(rig.journal.posts(), 3);
@@ -2563,7 +2580,10 @@ mod tests {
         let cache = rig.signed_in("REFRESH-1");
 
         for _ in 0..5 {
-            assert_eq!(cache.token().expect("token").header_value(), "Bearer ACCESS-2");
+            assert_eq!(
+                cache.token().expect("token").header_value(),
+                "Bearer ACCESS-2"
+            );
         }
         assert_eq!(rig.journal.posts(), 1);
         assert_eq!(cache.refreshes(), 1);
@@ -2619,7 +2639,9 @@ mod tests {
 
         assert!(cache.resume().expect("resume"));
         cache.token().expect("token");
-        assert!(bodies_of(&rig.script, Grant::Refresh)[0].contains("refresh_token=REFRESH-FROM-DISK"));
+        assert!(
+            bodies_of(&rig.script, Grant::Refresh)[0].contains("refresh_token=REFRESH-FROM-DISK")
+        );
     }
 
     /// A store that cannot write must not fail the refresh. Catches `self
@@ -2636,10 +2658,16 @@ mod tests {
         let cache = rig.signed_in("REFRESH-1");
 
         assert_eq!(
-            cache.token().expect("the refresh itself succeeded").header_value(),
+            cache
+                .token()
+                .expect("the refresh itself succeeded")
+                .header_value(),
             "Bearer ACCESS-2"
         );
-        assert_eq!(cache.last_store_error(), Some(io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            cache.last_store_error(),
+            Some(io::ErrorKind::PermissionDenied)
+        );
         assert!(cache.is_signed_in());
     }
 
@@ -2746,7 +2774,11 @@ mod tests {
             Err(AuthError::DeviceCodeExpired)
         );
         assert!(!cache.is_signed_in());
-        assert_eq!(rig.script.remaining(), 1, "polling continued past the refusal");
+        assert_eq!(
+            rig.script.remaining(),
+            1,
+            "polling continued past the refusal"
+        );
     }
 
     /// The client's own deadline, for the service that never says `expired_token`
@@ -3281,7 +3313,9 @@ mod tests {
     fn a_tenant_that_is_not_a_bare_path_segment_is_refused() {
         for hostile in ["../../evil", "common/x", "", "..", "a?b", "a#b", "a%2f"] {
             assert!(
-                AuthConfig::public_client(CLIENT).with_tenant(hostile).is_err(),
+                AuthConfig::public_client(CLIENT)
+                    .with_tenant(hostile)
+                    .is_err(),
                 "accepted a hostile tenant: {hostile:?}"
             );
         }

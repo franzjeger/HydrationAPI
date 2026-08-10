@@ -15,7 +15,6 @@ use std::time::Duration;
 
 const UPLOAD_WINDOW: Duration = Duration::from_secs(10);
 
-
 /// Whether a file holds any content, asked of the filesystem rather than
 /// inferred from a block count.
 ///
@@ -55,8 +54,12 @@ fn empty_file_floor(dir: &std::path::Path) -> u64 {
     let Ok(_) = fs::File::create(&probe) else {
         return u64::MAX;
     };
-    for name in ["user.hydration.dehydrated", "user.hydration.id",
-                 "user.hydration.etag", "user.hydration.mode"] {
+    for name in [
+        "user.hydration.dehydrated",
+        "user.hydration.id",
+        "user.hydration.etag",
+        "user.hydration.mode",
+    ] {
         // Values sized like the real ones: a cloud id is not five bytes.
         let _ = set_probe_xattr(&probe, name, &vec![b'a'; 80]);
     }
@@ -70,9 +73,19 @@ fn set_probe_xattr(path: &std::path::Path, name: &str, value: &[u8]) -> std::io:
     let p = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     let n = std::ffi::CString::new(name)?;
     let rc = unsafe {
-        libc::setxattr(p.as_ptr(), n.as_ptr(), value.as_ptr() as *const libc::c_void, value.len(), 0)
+        libc::setxattr(
+            p.as_ptr(),
+            n.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+        )
     };
-    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// §5.1 — A locally created file keeps one identity for its whole life.

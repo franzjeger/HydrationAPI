@@ -338,14 +338,15 @@ impl Namespace {
                 // Held, not guessed at. A path invented for an item whose parent
                 // the service has not described is a file placed somewhere it
                 // never said.
-                self.waiting.entry(parent.clone()).or_default().push(
-                    Item::Upsert {
+                self.waiting
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(Item::Upsert {
                         id,
                         parent,
                         name,
                         kind,
-                    },
-                );
+                    });
                 return None;
             }
             // A package is a container, just one nothing is emitted from.
@@ -377,9 +378,9 @@ impl Namespace {
         // A file that became a folder, or the reverse. The old shape has to go,
         // or the tree holds one path as both — `listing()` would name it twice
         // and the directory that must exist there could never be created.
-        let reshaped = previous
-            .as_ref()
-            .is_some_and(|prev| std::mem::discriminant(&prev.kind) != std::mem::discriminant(&kind));
+        let reshaped = previous.as_ref().is_some_and(|prev| {
+            std::mem::discriminant(&prev.kind) != std::mem::discriminant(&kind)
+        });
         if reshaped {
             self.delete(&id, out);
         }
@@ -743,7 +744,10 @@ mod tests {
         let mut ns = Namespace::new();
         ns.apply(Item::Root { id: "R".into() });
         ns.apply(folder("F", "R", "Work"));
-        assert_eq!(paths(&ns.apply(file("a", "F", "a.txt", 10))), ["Work/a.txt"]);
+        assert_eq!(
+            paths(&ns.apply(file("a", "F", "a.txt", 10))),
+            ["Work/a.txt"]
+        );
     }
 
     #[test]
@@ -789,7 +793,10 @@ mod tests {
     #[test]
     fn deleting_a_folder_removes_every_file_beneath_it() {
         let mut ns = tree();
-        assert_eq!(removed(&ns.apply(Item::Delete { id: "F".into() })), ["a", "b"]);
+        assert_eq!(
+            removed(&ns.apply(Item::Delete { id: "F".into() })),
+            ["a", "b"]
+        );
     }
 
     #[test]
@@ -1025,7 +1032,10 @@ mod tests {
     #[test]
     fn renaming_a_file_reports_it_at_the_new_name() {
         let mut ns = tree();
-        assert_eq!(paths(&ns.apply(file("a", "F", "renamed.txt", 10))), ["Work/renamed.txt"]);
+        assert_eq!(
+            paths(&ns.apply(file("a", "F", "renamed.txt", 10))),
+            ["Work/renamed.txt"]
+        );
     }
 
     #[test]
@@ -1038,7 +1048,10 @@ mod tests {
     fn a_full_listing_names_every_file_at_its_current_path() {
         let mut ns = tree();
         ns.apply(folder("F", "R", "Archive"));
-        assert_eq!(paths(&ns.listing()), ["Archive/a.txt", "Archive/Notes/b.txt"]);
+        assert_eq!(
+            paths(&ns.listing()),
+            ["Archive/a.txt", "Archive/Notes/b.txt"]
+        );
     }
 
     #[test]
@@ -1059,7 +1072,10 @@ mod tests {
     #[test]
     fn deleting_the_root_empties_the_tree() {
         let mut ns = tree();
-        assert_eq!(removed(&ns.apply(Item::Delete { id: "R".into() })), ["a", "b"]);
+        assert_eq!(
+            removed(&ns.apply(Item::Delete { id: "R".into() })),
+            ["a", "b"]
+        );
         assert!(ns.is_empty());
         assert!(ns.listing().is_empty());
     }

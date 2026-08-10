@@ -192,7 +192,10 @@ fn items_stuck_forever_do_not_slow_down_everything_else() {
 fn a_folder_move_costs_time_proportional_to_what_it_moves() {
     let (mut small, small_files) = build(6, 20);
     let (mut large, large_files) = build(12, 40);
-    assert!(large_files > small_files * 7, "the sizes are too close to compare");
+    assert!(
+        large_files > small_files * 7,
+        "the sizes are too close to compare"
+    );
 
     // Warm, then measure. Both trees are already built, so this times the
     // expansion alone.
@@ -247,7 +250,10 @@ fn hundred_thousand_files() {
 
     let t = Instant::now();
     let moved = move_top(&mut ns, "Archive");
-    eprintln!("root-level folder move -> {moved} changes in {:?}", t.elapsed());
+    eprintln!(
+        "root-level folder move -> {moved} changes in {:?}",
+        t.elapsed()
+    );
 
     let t = Instant::now();
     let all = ns.listing().len();
@@ -255,7 +261,10 @@ fn hundred_thousand_files() {
 
     let t = Instant::now();
     let gone = ns.apply(Item::Delete { id: "TOP".into() }).len();
-    eprintln!("root-level folder delete -> {gone} changes in {:?}", t.elapsed());
+    eprintln!(
+        "root-level folder delete -> {gone} changes in {:?}",
+        t.elapsed()
+    );
 
     assert_eq!(moved, files);
     assert_eq!(gone, files);

@@ -55,11 +55,11 @@ use hydration_client::delta::Change;
 use hydration_client::namespace::Namespace;
 use hydration_client::store::{self, Store};
 use hydration_client::upload::{run_upload, Outcome as RunOutcome, Sink, Uploaded};
-use hydration_protocol::{stamp, xattr, FileId};
 use hydration_graph::{
     DeltaPage, DriveId, DriveScope, GraphSink, ItemId, Method, ObjectKey, Reply, Request, Round,
     Sleeper, TagSource, Transport, UploadPolicy, FRAGMENT_QUANTUM, MAX_FRAGMENT_BYTES,
 };
+use hydration_protocol::{stamp, xattr, FileId};
 
 // ===========================================================================
 // Ids, URLs and wire fixtures
@@ -1021,7 +1021,10 @@ fn a_409_on_a_create_is_an_error_and_never_adopts_the_other_objects_id() {
     let mut sink = rig.sink();
     let out = sink.upload(&path, None);
 
-    assert!(out.is_err(), "a name collision is a conflict, not a success");
+    assert!(
+        out.is_err(),
+        "a name collision is a conflict, not a success"
+    );
     let calls = rig.journal.calls();
     // Every other assertion here is a negative, and all of them hold of a sink
     // that never sent the create at all — in which case the 409 under test
@@ -1103,10 +1106,15 @@ fn a_delete_never_escalates_to_permanent_delete_or_a_lock_bypass() {
         vec![reply(423, graph_error("resourceLocked"))],
     );
     rig.script(
-        post(format!("{BASE}/drives/{MINE}/items/01LOCKED/permanentDelete")),
+        post(format!(
+            "{BASE}/drives/{MINE}/items/01LOCKED/permanentDelete"
+        )),
         vec![no_content()],
     );
-    rig.script(del(item_url(MINE, "01LOCKED")).with("prefer"), vec![no_content()]);
+    rig.script(
+        del(item_url(MINE, "01LOCKED")).with("prefer"),
+        vec![no_content()],
+    );
 
     let mut sink = rig.sink();
     let out = sink.remove(&cloud(MINE, "01LOCKED"));
@@ -1281,7 +1289,9 @@ fn a_renumbered_update_returns_the_new_composed_id_and_removes_nothing() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01OLD"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01OLD"))).expect("the write succeeded");
+    let out = sink
+        .upload(&path, Some(&cloud(MINE, "01OLD")))
+        .expect("the write succeeded");
 
     assert_eq!(
         out,
@@ -1333,7 +1343,8 @@ fn a_create_states_its_conflict_behaviour_in_the_url_and_it_is_never_replace() {
     // object no local file claims, stamped onto the inode that asked for
     // `notes.txt`.
     assert!(
-        call.query().contains("@microsoft.graph.conflictBehavior=fail"),
+        call.query()
+            .contains("@microsoft.graph.conflictBehavior=fail"),
         "a create declares that a collision is an error: {}",
         call.url
     );
@@ -1575,7 +1586,9 @@ fn a_file_that_changed_during_a_session_is_not_committed_as_a_splice() {
     // The commit is scripted to succeed, so only the assertion catches it.
     rig.script(
         put(u.clone()),
-        vec![created(drive_item("01BIG", "big.bin", 12_582_912, "c:{G},2"))],
+        vec![created(drive_item(
+            "01BIG", "big.bin", 12_582_912, "c:{G},2",
+        ))],
     );
     rig.script(del(u.clone()), vec![no_content()]);
 
@@ -1638,7 +1651,9 @@ fn a_session_does_not_commit_after_the_item_changed_under_it() {
     // The commit is scripted to succeed. Only the re-check stops it.
     rig.script(
         put(u.clone()).range("bytes 10485760-12582911/12582912"),
-        vec![created(drive_item("01BIG", "big.bin", 12_582_912, "c:{G},2"))],
+        vec![created(drive_item(
+            "01BIG", "big.bin", 12_582_912, "c:{G},2",
+        ))],
     );
     // Another device committed while the transfer ran.
     rig.script(
@@ -1712,7 +1727,12 @@ fn a_name_conflict_at_commit_is_never_resolved_by_replacing_the_other_object() {
     );
     rig.script(
         put(path_content(MINE, "Work/report.pdf")),
-        vec![created(drive_item("01OTHER", "report.pdf", 655_360, "c:{G},1"))],
+        vec![created(drive_item(
+            "01OTHER",
+            "report.pdf",
+            655_360,
+            "c:{G},1",
+        ))],
     );
     rig.script(del(item_url(MINE, "01OTHER")), vec![no_content()]);
     rig.script(del(u.clone()), vec![no_content()]);
@@ -1776,7 +1796,12 @@ fn the_cloud_id_comes_from_the_commit_response_not_from_the_existing_id() {
     );
     rig.script(
         put(u.clone()).range("bytes 655360-983039/983040"),
-        vec![created(drive_item("01NEW", "report.pdf", 983_040, "c:{G},9"))],
+        vec![created(drive_item(
+            "01NEW",
+            "report.pdf",
+            983_040,
+            "c:{G},9",
+        ))],
     );
 
     let mut sink = rig.sink_policy(session_policy());
@@ -2032,10 +2057,10 @@ fn a_416_is_resolved_by_asking_the_server_where_it_is() {
     let u = upload_url("S416");
     let u2 = upload_url("S416B");
 
-    rig.script(post(item_session(MINE, "01A")), vec![
-        ok(session(&u)),
-        ok(session(&u2)),
-    ]);
+    rig.script(
+        post(item_session(MINE, "01A")),
+        vec![ok(session(&u)), ok(session(&u2))],
+    );
     rig.script(
         get(item_url(MINE, "01A")),
         vec![ok(drive_item("01A", "report.pdf", 900, "c:{G},1"))],
@@ -2075,7 +2100,10 @@ fn a_416_is_resolved_by_asking_the_server_where_it_is() {
         .iter()
         .filter(|r| r.path() == item_session(MINE, "01A"))
         .count();
-    assert_eq!(sessions, 1, "the session was resumed, not restarted: {calls:#?}");
+    assert_eq!(
+        sessions, 1,
+        "the session was resumed, not restarted: {calls:#?}"
+    );
     // `any PUT at bytes 0-327679` is the *first* fragment, sent before the
     // reset and before the 416 — the flow guarantees it, so asserting it
     // asserts nothing. What the 416 has to produce is a probe, and then a
@@ -2286,7 +2314,10 @@ fn every_fragment_declares_the_total_size_fixed_when_the_session_was_created() {
             f.total, 983_040,
             "the total is the size observed once, before the first byte was read: {f:?}"
         );
-        assert!(f.end < 983_040, "nothing is sent past the declared end: {f:?}");
+        assert!(
+            f.end < 983_040,
+            "nothing is sent past the declared end: {f:?}"
+        );
     }
     let sessions = rig
         .journal
@@ -2353,7 +2384,10 @@ fn a_file_that_shrinks_mid_session_is_never_padded() {
         !frags.iter().any(|(f, _)| f.end + 1 == f.total),
         "nothing commits over a file that changed under the session: {frags:#?}"
     );
-    assert!(out.is_err(), "the transfer describes a file that no longer exists");
+    assert!(
+        out.is_err(),
+        "the transfer describes a file that no longer exists"
+    );
 }
 
 /// A non-multiple fragment size fails at the *commit*, after the whole file has
@@ -2391,7 +2425,10 @@ fn the_default_fragment_size_is_a_multiple_of_320_kib_and_under_60_mib() {
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
     let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
 
-    assert!(out.is_ok(), "the default policy must be able to commit: {out:?}");
+    assert!(
+        out.is_ok(),
+        "the default policy must be able to commit: {out:?}"
+    );
     let frags = fragments(&rig.journal, &u);
     let last = frags.len() - 1;
     for (i, (f, _)) in frags.iter().enumerate() {
@@ -2437,7 +2474,10 @@ fn a_404_on_the_final_fragment_is_not_evidence_that_the_commit_happened() {
         put(u.clone()).range("bytes 327680-655359/655360"),
         vec![reply(404, graph_error("itemNotFound"))],
     );
-    rig.script(get(u.clone()), vec![reply(404, graph_error("itemNotFound"))]);
+    rig.script(
+        get(u.clone()),
+        vec![reply(404, graph_error("itemNotFound"))],
+    );
     // The pre-upload state, so a probe that reads it as confirmation is caught.
     rig.script(
         get(item_url(MINE, "01A")),
@@ -2596,7 +2636,10 @@ fn a_second_upload_call_never_resumes_a_session_from_the_first() {
     rig.journal.clear();
 
     let two = sink.upload(&path, Some(&cloud(MINE, "01A")));
-    assert!(two.is_ok(), "the second call must be able to succeed: {two:?}");
+    assert!(
+        two.is_ok(),
+        "the second call must be able to succeed: {two:?}"
+    );
 
     let calls = rig.journal.calls();
     assert!(
@@ -2609,7 +2652,10 @@ fn a_second_upload_call_never_resumes_a_session_from_the_first() {
     );
     let frags = fragments(&rig.journal, &u2);
     for (f, _) in &frags {
-        assert_eq!(f.total, 655_360, "the total is the file as it is now: {f:?}");
+        assert_eq!(
+            f.total, 655_360,
+            "the total is the file as it is now: {f:?}"
+        );
     }
     let sent: Vec<u8> = frags.iter().flat_map(|(_, b)| b.clone()).collect();
     assert_eq!(sent, second, "the bytes sent are the file as it is now");
@@ -2664,7 +2710,10 @@ fn the_cloud_id_returned_by_upload_is_the_one_the_delta_half_produces() {
     let path = rig.file("notes.txt", b"abc");
     let item = drive_item("01NEW", "notes.txt", 3, "c:{G},1");
 
-    rig.script(put(path_content(MINE, "notes.txt")), vec![created(item.clone())]);
+    rig.script(
+        put(path_content(MINE, "notes.txt")),
+        vec![created(item.clone())],
+    );
 
     let mut sink = rig.sink();
     let uploaded = sink.upload(&path, None).expect("the create must succeed");
@@ -2681,7 +2730,10 @@ fn the_cloud_id_returned_by_upload_is_the_one_the_delta_half_produces() {
     let page = DeltaPage::parse(200, body.as_bytes()).expect("a well-formed page");
     let mut round = Round::new(TagSource::CTag, Namespace::new());
     round.feed(&primary(MINE), &page);
-    let done = round.finish().map_err(|(e, _)| e).expect("a complete round");
+    let done = round
+        .finish()
+        .map_err(|(e, _)| e)
+        .expect("a complete round");
 
     assert_eq!(
         uploaded.cloud_id,
@@ -2699,7 +2751,10 @@ fn the_etag_returned_by_upload_is_the_tag_the_delta_half_produces() {
     let path = rig.file("notes.txt", b"abc");
     let item = drive_item("01NEW", "notes.txt", 3, "c:{G},1");
 
-    rig.script(put(path_content(MINE, "notes.txt")), vec![created(item.clone())]);
+    rig.script(
+        put(path_content(MINE, "notes.txt")),
+        vec![created(item.clone())],
+    );
 
     let mut sink = rig.sink();
     let uploaded = sink.upload(&path, None).expect("the create must succeed");
@@ -2715,7 +2770,10 @@ fn the_etag_returned_by_upload_is_the_tag_the_delta_half_produces() {
     let page = DeltaPage::parse(200, body.as_bytes()).expect("a well-formed page");
     let mut round = Round::new(TagSource::CTag, Namespace::new());
     round.feed(&primary(MINE), &page);
-    let done = round.finish().map_err(|(e, _)| e).expect("a complete round");
+    let done = round
+        .finish()
+        .map_err(|(e, _)| e)
+        .expect("a complete round");
     let id = upserted_id(&done.changes, "notes.txt");
 
     assert_eq!(
@@ -2812,7 +2870,9 @@ fn two_local_names_differing_only_in_case_stay_two_objects() {
     );
 
     let mut sink = rig.sink();
-    let first = sink.upload(&upper, None).expect("the first create succeeds");
+    let first = sink
+        .upload(&upper, None)
+        .expect("the first create succeeds");
     assert_eq!(first.cloud_id, cloud(MINE, "01A"));
     rig.journal.clear();
 
@@ -3083,7 +3143,9 @@ fn positive_control_a_large_file_commits_through_a_session_with_conforming_fragm
     );
     rig.script(
         put(u.clone()).range("bytes 10485760-12582911/12582912"),
-        vec![created(drive_item("01BIG", "big.bin", 12_582_912, "c:{G},8"))],
+        vec![created(drive_item(
+            "01BIG", "big.bin", 12_582_912, "c:{G},8",
+        ))],
     );
 
     let mut sink = rig.sink();
@@ -3106,9 +3168,17 @@ fn positive_control_a_large_file_commits_through_a_session_with_conforming_fragm
     for (i, (f, body)) in frags.iter().enumerate() {
         assert_eq!(f.start, expect_at, "fragments are contiguous: {f:?}");
         assert_eq!(f.total, 12_582_912, "one declared total throughout: {f:?}");
-        assert_eq!(f.len as u64, f.end - f.start + 1, "the body fills the range");
+        assert_eq!(
+            f.len as u64,
+            f.end - f.start + 1,
+            "the body fills the range"
+        );
         if i != last {
-            assert_eq!(f.len % FRAGMENT_QUANTUM, 0, "a whole number of quanta: {f:?}");
+            assert_eq!(
+                f.len % FRAGMENT_QUANTUM,
+                0,
+                "a whole number of quanta: {f:?}"
+            );
             assert!(f.len < MAX_FRAGMENT_BYTES, "under the ceiling: {f:?}");
         }
         assert_eq!(
@@ -3154,7 +3224,12 @@ fn positive_control_a_three_fragment_session_completes_in_one_pass() {
     );
     rig.script(
         put(u.clone()).range("bytes 655360-983039/983040"),
-        vec![created(drive_item("01OLD", "report.pdf", 983_040, "c:{G},9"))],
+        vec![created(drive_item(
+            "01OLD",
+            "report.pdf",
+            983_040,
+            "c:{G},9",
+        ))],
     );
 
     let mut sink = rig.sink_policy(session_policy());
@@ -3173,7 +3248,10 @@ fn positive_control_a_three_fragment_session_completes_in_one_pass() {
 
     let frags = fragments(&rig.journal, &u);
     assert_eq!(
-        frags.iter().map(|(f, _)| (f.start, f.end)).collect::<Vec<_>>(),
+        frags
+            .iter()
+            .map(|(f, _)| (f.start, f.end))
+            .collect::<Vec<_>>(),
         vec![(0, 327_679), (327_680, 655_359), (655_360, 983_039)],
         "strictly ascending, contiguous, no gap and no overlap"
     );
@@ -3244,7 +3322,12 @@ fn a_dehydrated_placeholder_is_never_uploaded_as_content() {
     );
     rig.script(
         put(path_content(MINE, "Work/report.docx")),
-        vec![created(drive_item("01FRESH", "report.docx", 4096, "c:{G},1"))],
+        vec![created(drive_item(
+            "01FRESH",
+            "report.docx",
+            4096,
+            "c:{G},1",
+        ))],
     );
 
     let mut sink = rig.sink();
@@ -3286,7 +3369,11 @@ fn positive_control_a_file_of_real_zeros_with_no_eviction_mark_uploads() {
         cloud(MINE, "01IMG")
     );
     let call = only_call(&rig.journal);
-    assert_eq!(call.body, vec![0u8; 4096], "and its bytes went out unchanged");
+    assert_eq!(
+        call.body,
+        vec![0u8; 4096],
+        "and its bytes went out unchanged"
+    );
 }
 
 /// The race itself. The eviction lands between two fragments, so the session
@@ -3391,7 +3478,10 @@ fn a_file_that_is_gone_is_never_uploaded_as_an_empty_object_or_from_a_remembered
         Some(&cloud(MINE, "01REPORT")),
     );
 
-    assert!(out.is_err(), "a file that is not there has no content to send");
+    assert!(
+        out.is_err(),
+        "a file that is not there has no content to send"
+    );
     assert!(
         a.journal.calls().is_empty(),
         "the absence is local, and is discovered before a request rather than \
@@ -3761,7 +3851,10 @@ impl Sink for FakeCloud {
 
     fn remove(&mut self, cloud_id: &str) -> io::Result<()> {
         self.removed.lock().unwrap().push(cloud_id.to_string());
-        self.objects.lock().unwrap().retain(|(id, _)| id != cloud_id);
+        self.objects
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| id != cloud_id);
         Ok(())
     }
 }
@@ -3878,4 +3971,3 @@ fn the_stamp_written_after_a_rename_never_blesses_an_edit_that_was_not_sent() {
          pass replaces it with a placeholder for the version without it"
     );
 }
-

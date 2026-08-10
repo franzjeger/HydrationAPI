@@ -93,18 +93,14 @@ impl Fetch for SocketFetch {
         // the side §6b assumes may be compromised.
         match self.conn.recv_streamed(id, size, dest, progress)? {
             Streamed::Complete => Ok(()),
-            Streamed::Aborted { errno, reason } => {
-                Err(io::Error::new(
-                    io::Error::from_raw_os_error(errno).kind(),
-                    reason,
-                ))
-            }
-            Streamed::Refused(FetchResponse::Failed { errno, reason, .. }) => {
-                Err(io::Error::new(
-                    io::Error::from_raw_os_error(errno).kind(),
-                    reason,
-                ))
-            }
+            Streamed::Aborted { errno, reason } => Err(io::Error::new(
+                io::Error::from_raw_os_error(errno).kind(),
+                reason,
+            )),
+            Streamed::Refused(FetchResponse::Failed { errno, reason, .. }) => Err(io::Error::new(
+                io::Error::from_raw_os_error(errno).kind(),
+                reason,
+            )),
             Streamed::Refused(FetchResponse::Denied { reason, .. }) => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("policy refused this reader: {reason}"),

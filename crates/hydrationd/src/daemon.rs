@@ -97,7 +97,9 @@ pub enum Handled {
     /// Distinct from `Failed` for the same reason `Denied` is: "a 4 GB object
     /// was abandoned at 900 MB" is a capacity fact the user needs, and it is
     /// indistinguishable from a provider fault otherwise.
-    Abandoned { reason: String },
+    Abandoned {
+        reason: String,
+    },
     /// Already had content: nothing to do but let it through.
     AlreadyPresent,
     Denied {
@@ -457,7 +459,10 @@ impl std::fmt::Display for TransferError {
             Self::NoFirstByte => write!(f, "the provider sent nothing"),
             Self::Stalled { got, size } => write!(f, "stalled at {got} of {size} bytes"),
             Self::TooLong { got, size } => {
-                write!(f, "abandoned at {got} of {size} bytes: too long to hold a read")
+                write!(
+                    f,
+                    "abandoned at {got} of {size} bytes: too long to hold a read"
+                )
             }
             Self::Unresponsive => write!(f, "fetcher unresponsive"),
             Self::Gone => write!(f, "the fetch thread is gone"),
@@ -995,7 +1000,8 @@ impl SplitHandle {
             unsafe { libc::kill(self.worker, libc::SIGKILL) };
             let grace = std::time::Instant::now() + std::time::Duration::from_secs(1);
             while std::time::Instant::now() < grace {
-                if unsafe { libc::waitpid(self.worker, &mut status, libc::WNOHANG) } == self.worker {
+                if unsafe { libc::waitpid(self.worker, &mut status, libc::WNOHANG) } == self.worker
+                {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));

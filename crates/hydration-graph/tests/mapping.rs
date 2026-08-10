@@ -749,15 +749,15 @@ fn a_remote_item_files_content_tag_comes_from_inside_and_the_outer_etag_is_not_a
     let m = map_alone(&scope, REMOTE_FILE_TAGGED).expect("a shared file must map");
     assert_eq!(
         kind_of(&m),
-        &file(
-            9999,
-            "ct:\"c:{4F2A88C1-6D30-4E7B-9C52-1A0B3E6D8F47},3\""
-        ),
+        &file(9999, "ct:\"c:{4F2A88C1-6D30-4E7B-9C52-1A0B3E6D8F47},3\""),
         "the inner cTag verbatim behind the ct: prefix — not NoContentTag, not None"
     );
 
     let mut ns = ns_rooted(MINE, "01ROOT");
-    let changes = apply_all(&mut ns, &map_whole_page(&scope, &[REMOTE_FILE_TAGGED]).items);
+    let changes = apply_all(
+        &mut ns,
+        &map_whole_page(&scope, &[REMOTE_FILE_TAGGED]).items,
+    );
     assert_eq!(
         changes,
         vec![Change::Upserted {
@@ -1492,13 +1492,8 @@ fn the_tree_index_never_answers_about_a_different_drive() {
         second.refusals
     );
 
-    let m = map_item(
-        &scope,
-        &index,
-        TagSource::CTag,
-        &one(D1_FILE_SAME_ID),
-    )
-    .expect("an ordinary new file");
+    let m = map_item(&scope, &index, TagSource::CTag, &one(D1_FILE_SAME_ID))
+        .expect("an ordinary new file");
     let (id, _, _, kind) = as_upsert(&m);
     assert_eq!(id, cloud(D1, "01SHAREDIDQN3ZWBTUFOFD3GSPGOHDJD3K"));
     assert!(matches!(kind, Kind::File { size: 10, .. }), "got {kind:?}");
@@ -1507,7 +1502,10 @@ fn the_tree_index_never_answers_about_a_different_drive() {
     // complete primary tree, so `finish()` may legitimately withhold a token for
     // other reasons. The falsifiable claim is the escalation's identity.
     let mut round = Round::new(TagSource::CTag, Namespace::new());
-    round.feed(&mounted, &page(&[D2_FOLDER_SAME_ID, D2_CHILD_1, D2_CHILD_2]));
+    round.feed(
+        &mounted,
+        &page(&[D2_FOLDER_SAME_ID, D2_CHILD_1, D2_CHILD_2]),
+    );
     round.feed(&scope, &page(&[D1_FILE_SAME_ID, D1_ROOT]));
     if let Err((esc, _)) = round.finish() {
         assert!(
@@ -1939,7 +1937,12 @@ fn a_self_parent_on_a_folder_already_in_the_tree_does_not_poison_it() {
         "refused at the mapper, so Namespace never records Problem::Cycle"
     );
 
-    let second = map_page(&scope, &mut index, TagSource::CTag, &page(&[WORK_SELF_PARENT]));
+    let second = map_page(
+        &scope,
+        &mut index,
+        TagSource::CTag,
+        &page(&[WORK_SELF_PARENT]),
+    );
     let changes = apply_all(&mut ns, &second.items);
     assert!(changes.is_empty(), "round 2 emits nothing: {changes:?}");
     assert!(
@@ -2143,7 +2146,11 @@ fn a_whole_page_in_reverse_depth_order_maps_to_full_paths() {
         .finish()
         .unwrap_or_else(|(e, r)| panic!("deepest-first must still complete: {e:?} / {r:?}"));
 
-    assert!(done.report.refusals.is_empty(), "{:?}", done.report.refusals);
+    assert!(
+        done.report.refusals.is_empty(),
+        "{:?}",
+        done.report.refusals
+    );
     assert!(
         done.report.pending_after_round.is_empty(),
         "{:?}",
@@ -2531,7 +2538,12 @@ fn a_childless_file_that_becomes_a_folder_is_forwarded_and_the_stale_file_remove
         .expect("a childless flip is an ordinary upsert, not a refusal");
     assert_eq!(kind_of(&m), &Kind::Folder);
 
-    let second = map_page(&scope, &mut index, TagSource::CTag, &page(&[SWAP_AS_FOLDER]));
+    let second = map_page(
+        &scope,
+        &mut index,
+        TagSource::CTag,
+        &page(&[SWAP_AS_FOLDER]),
+    );
     assert!(second.refusals.is_empty(), "{:?}", second.refusals);
 
     let gone = cloud(MINE, "01SWAP");
@@ -2583,7 +2595,11 @@ fn every_deleted_state_graph_sends_is_a_delete() {
     let scope = primary(MINE);
     let doomed = cloud(MINE, "01TOMB");
 
-    for deleted in [r#"{}"#, r#"{"state":"deleted"}"#, r#"{"state":"softDeleted"}"#] {
+    for deleted in [
+        r#"{}"#,
+        r#"{"state":"deleted"}"#,
+        r#"{"state":"softDeleted"}"#,
+    ] {
         let json = tombstone_with(deleted);
         let m = map_alone(&scope, &json)
             .unwrap_or_else(|e| panic!("\"deleted\":{deleted} must map, got {e:?}"));

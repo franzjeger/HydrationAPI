@@ -232,7 +232,11 @@ fn service_supplied_paths_are_handled_or_refused_but_never_misinterpreted() {
             joined.is_some(),
             allowed,
             "{rel:?} was {} and should not have been",
-            if joined.is_some() { "accepted" } else { "refused" }
+            if joined.is_some() {
+                "accepted"
+            } else {
+                "refused"
+            }
         );
         if let Some(p) = joined {
             assert!(
@@ -289,7 +293,10 @@ fn an_object_that_moved_does_not_leave_two_files_claiming_it() {
 #[test]
 fn a_very_deep_path_fails_cleanly_rather_than_panicking() {
     let dir = scratch("deep");
-    let deep = (0..60).map(|i| format!("d{i}")).collect::<Vec<_>>().join("/");
+    let deep = (0..60)
+        .map(|i| format!("d{i}"))
+        .collect::<Vec<_>>()
+        .join("/");
     let rel = format!("{deep}/file.txt");
     let out = run(&dir, &[upserted(&rel, 16, "cloud-1", Some("e"))]);
     assert_eq!(
@@ -605,7 +612,10 @@ fn the_same_object_twice_in_one_batch_leaves_one_file() {
         "one object ended up claimed by {:?}",
         claimants(&dir, b"cloud-1")
     );
-    assert!(dir.join("c.txt").exists(), "the last occurrence did not win");
+    assert!(
+        dir.join("c.txt").exists(),
+        "the last occurrence did not win"
+    );
 }
 
 /// Two objects swapping paths in one batch. Both renames see an occupied
