@@ -23,11 +23,20 @@ as_user() {
     # rustup installs to ~/.cargo/bin, which is on the invoking user's PATH and
     # on nobody else's. Without this the build fails with "cargo: not found",
     # which the caller used to report as "could not build".
+    # `sudo -E` does not preserve PATH — `secure_path` in sudoers replaces it —
+    # so $PATH here is root's and has never heard of rustup. Locally that is
+    # invisible whenever cargo also happens to sit in /usr/bin; on a runner,
+    # where cargo exists only under the invoking user's home, every suite
+    # reports "could not build". Reconstruct it rather than inherit it.
+    local as_user_home as_user_cargo
+    as_user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    as_user_cargo="${CARGO_HOME:-$as_user_home/.cargo}/bin"
     runuser -u "$SUDO_USER" -- env \
-      PATH="$PATH" \
+      PATH="$as_user_cargo:$PATH" \
       ${CARGO_HOME:+CARGO_HOME="$CARGO_HOME"} \
       ${RUSTUP_HOME:+RUSTUP_HOME="$RUSTUP_HOME"} \
       ${CARGO_TERM_COLOR:+CARGO_TERM_COLOR="$CARGO_TERM_COLOR"} \
+      ${RUSTFLAGS:+RUSTFLAGS="$RUSTFLAGS"} \
       "$@"
   else
     "$@"
@@ -35,19 +44,21 @@ as_user() {
 }
 
 bin_for() { # package, test target
-  # stderr goes to a file rather than /dev/null: when this returns nothing the
-  # caller reports "could not build", and without the compiler's own words that
-  # is a dead end. It cost a CI round trip to learn that it meant "cargo is not
-  # on the PATH".
-  as_user cargo test -p "$1" --test "$2" --no-run --message-format=json 2>"/tmp/build-$2.log" \
-    | python3 -c '
+  # Both streams and the exit status go to files. When this returns nothing the
+  # caller says "could not build", and a guess is not a diagnostic: two CI runs
+  # went into learning that it meant "cargo is not on the PATH", because the
+  # only evidence was a message the script had invented itself.
+  as_user cargo test -p "$1" --test "$2" --no-run --message-format=json \
+    >"/tmp/build-$2.json" 2>"/tmp/build-$2.log"
+  echo "$?" >"/tmp/build-$2.rc"
+  python3 -c '
 import sys, json
 for line in sys.stdin:
     try: m = json.loads(line)
     except ValueError: continue
     if m.get("target", {}).get("name") == sys.argv[1] and m.get("executable"):
         print(m["executable"])
-' "$2" | tail -1
+' "$2" <"/tmp/build-$2.json" | tail -1
 }
 
 fails=0
@@ -55,8 +66,14 @@ run() { # package, test target, env...
   local pkg="$1" tgt="$2"; shift 2
   local exe; exe="$(bin_for "$pkg" "$tgt")"
   if [ -z "$exe" ]; then
-    echo "  $tgt: could not build"
-    sed 's/^/      /' "/tmp/build-$tgt.log" 2>/dev/null | tail -15
+    echo "  $tgt: could not build (cargo exited $(cat "/tmp/build-$tgt.rc" 2>/dev/null || echo '?'))"
+    if [ -s "/tmp/build-$tgt.log" ]; then
+      sed 's/^/      /' "/tmp/build-$tgt.log" | tail -15
+    else
+      echo "      (no output on stderr; cargo produced $(wc -c <"/tmp/build-$tgt.json" 2>/dev/null || echo 0) bytes of json)"
+      echo "      PATH was: $PATH"
+      echo "      SUDO_USER=${SUDO_USER:-unset} CARGO_HOME=${CARGO_HOME:-unset}"
+    fi
     fails=$((fails+1)); return
   fi
   rm -rf "${MOUNT:?}"/* 2>/dev/null
