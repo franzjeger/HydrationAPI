@@ -73,6 +73,12 @@ const MAX_REPLY_BYTES: u64 = 16 * 1024 * 1024;
 /// stall.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 
+/// A content request is bounded just like delta and upload requests. Four
+/// retries cover ordinary Wi-Fi transitions without turning a dead endpoint
+/// into a thread that never returns to the hydration deadline above it.
+const MAX_DOWNLOAD_RETRIES: u32 = 4;
+const DOWNLOAD_BACKOFF: Duration = Duration::from_secs(1);
+
 /// How long to wait for a connection, a name, and the first byte of a reply.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -706,33 +712,203 @@ impl<T: TokenSource> GraphHttp<T> {
         out: &mut dyn Write,
     ) -> io::Result<()> {
         let graph_url = crate::item_content_url(key);
-        let headers = [("accept".to_string(), "application/octet-stream".to_string())];
-        let mut response = self.send_response(Method::Get, &graph_url, &headers, &[], true)?;
+        resume_copy(
+            expected,
+            out,
+            |offset, sink| {
+                let mut headers =
+                    vec![("accept".to_string(), "application/octet-stream".to_string())];
+                if offset != 0 {
+                    headers.push(("range".to_string(), format!("bytes={offset}-")));
+                }
+                let mut response =
+                    self.send_response(Method::Get, &graph_url, &headers, &[], true)?;
 
-        if response.status().is_redirection() {
-            let location = response
-                .headers()
-                .get(ureq::http::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .filter(|url| safe_download_url(url))
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "Graph returned an unsafe content redirect; it was not followed",
-                    )
-                })?;
-            response = self.send_response(Method::Get, &location, &headers, &[], false)?;
-        }
+                if response.status().is_redirection() {
+                    let location = response
+                        .headers()
+                        .get(ureq::http::header::LOCATION)
+                        .and_then(|value| value.to_str().ok())
+                        .filter(|url| safe_download_url(url))
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "Graph returned an unsafe content redirect; it was not followed",
+                            )
+                        })?;
+                    response = self.send_response(Method::Get, &location, &headers, &[], false)?;
+                }
 
-        if !response.status().is_success() {
-            return Err(io::Error::other(format!(
-                "Graph content request returned HTTP {}",
-                response.status().as_u16()
-            )));
-        }
-        copy_exact(response.body_mut().as_reader(), out, expected)
+                let status = response.status().as_u16();
+                if status == 429 || status == 408 || (500..=599).contains(&status) {
+                    let retry_after = response
+                        .headers()
+                        .get(ureq::http::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| parse_retry_after(value, SystemTime::now()));
+                    return Ok(DownloadAttempt::Retry(retry_after));
+                }
+                if offset == 0 && status != 200 {
+                    return Err(content_status(status));
+                }
+                if offset != 0 {
+                    if status != 206 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Graph did not honor a resumed content range",
+                        ));
+                    }
+                    let range = response
+                        .headers()
+                        .get(ureq::http::header::CONTENT_RANGE)
+                        .and_then(|value| value.to_str().ok())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Graph omitted Content-Range from a resumed download",
+                            )
+                        })?;
+                    validate_content_range(range, offset, expected)?;
+                }
+                let mut reader = response.body_mut().as_reader();
+                io::copy(&mut reader, sink)?;
+                Ok(DownloadAttempt::Complete)
+            },
+            std::thread::sleep,
+        )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadAttempt {
+    Complete,
+    Retry(Option<Duration>),
+}
+
+fn resume_copy(
+    expected: u64,
+    out: &mut dyn Write,
+    mut attempt: impl FnMut(u64, &mut dyn Write) -> io::Result<DownloadAttempt>,
+    mut sleep: impl FnMut(Duration),
+) -> io::Result<()> {
+    let mut written = 0u64;
+    let mut retries = 0u32;
+    loop {
+        let offset = written;
+        let mut sink_failed = false;
+        let result = {
+            let mut counted = CountedWriter::new(out, &mut written, expected, &mut sink_failed);
+            attempt(offset, &mut counted)
+        };
+        if sink_failed {
+            return result.map(|_| ()).and_then(|()| {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "the hydration destination stopped accepting content",
+                ))
+            });
+        }
+        let retry_after = match result {
+            Ok(DownloadAttempt::Complete) if written == expected => return Ok(()),
+            Ok(DownloadAttempt::Complete) => None,
+            Ok(DownloadAttempt::Retry(delay)) => delay,
+            Err(error) if retryable_download_error(&error) => None,
+            Err(error) => return Err(error),
+        };
+        if retries >= MAX_DOWNLOAD_RETRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Graph content download exhausted its retry budget",
+            ));
+        }
+        retries += 1;
+        sleep(retry_after.unwrap_or(DOWNLOAD_BACKOFF));
+    }
+}
+
+struct CountedWriter<'a> {
+    inner: &'a mut dyn Write,
+    written: &'a mut u64,
+    expected: u64,
+    sink_failed: &'a mut bool,
+}
+
+impl<'a> CountedWriter<'a> {
+    fn new(
+        inner: &'a mut dyn Write,
+        written: &'a mut u64,
+        expected: u64,
+        sink_failed: &'a mut bool,
+    ) -> Self {
+        Self {
+            inner,
+            written,
+            expected,
+            sink_failed,
+        }
+    }
+}
+
+impl Write for CountedWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.written.saturating_add(bytes.len() as u64) > self.expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Graph returned more content than the placeholder size",
+            ));
+        }
+        let count = match self.inner.write(bytes) {
+            Ok(count) => count,
+            Err(error) => {
+                *self.sink_failed = true;
+                return Err(error);
+            }
+        };
+        *self.written += count as u64;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn retryable_download_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::WouldBlock
+    )
+}
+
+fn content_status(status: u16) -> io::Error {
+    io::Error::other(format!("Graph content request returned HTTP {status}"))
+}
+
+fn validate_content_range(raw: &str, expected_start: u64, expected_total: u64) -> io::Result<()> {
+    let value = raw.strip_prefix("bytes ").ok_or_else(bad_content_range)?;
+    let (span, total) = value.split_once('/').ok_or_else(bad_content_range)?;
+    let (start, end) = span.split_once('-').ok_or_else(bad_content_range)?;
+    let start = start.parse::<u64>().map_err(|_| bad_content_range())?;
+    let end = end.parse::<u64>().map_err(|_| bad_content_range())?;
+    let total = total.parse::<u64>().map_err(|_| bad_content_range())?;
+    if start != expected_start || total != expected_total || end < start || end >= total {
+        return Err(bad_content_range());
+    }
+    Ok(())
+}
+
+fn bad_content_range() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "Graph returned an inconsistent Content-Range",
+    )
 }
 
 fn safe_download_url(url: &str) -> bool {
@@ -894,6 +1070,97 @@ mod tests {
 
         let err = copy_exact(&b"short"[..], &mut Vec::new(), 6).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn a_broken_download_resumes_at_the_first_unwritten_byte() {
+        let mut offsets = Vec::new();
+        let mut sleeps = Vec::new();
+        let mut out = Vec::new();
+        let mut calls = 0;
+        resume_copy(
+            8,
+            &mut out,
+            |offset, sink| {
+                offsets.push(offset);
+                calls += 1;
+                if calls == 1 {
+                    sink.write_all(b"abcd")?;
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "injected disconnect",
+                    ))
+                } else {
+                    sink.write_all(b"efgh")?;
+                    Ok(DownloadAttempt::Complete)
+                }
+            },
+            |delay| sleeps.push(delay),
+        )
+        .unwrap();
+        assert_eq!(out, b"abcdefgh");
+        assert_eq!(offsets, [0, 4]);
+        assert_eq!(sleeps, [DOWNLOAD_BACKOFF]);
+    }
+
+    #[test]
+    fn throttling_retries_the_same_range_after_the_advertised_delay() {
+        let mut offsets = Vec::new();
+        let mut sleeps = Vec::new();
+        let mut out = Vec::new();
+        let mut calls = 0;
+        resume_copy(
+            4,
+            &mut out,
+            |offset, sink| {
+                offsets.push(offset);
+                calls += 1;
+                if calls == 1 {
+                    Ok(DownloadAttempt::Retry(Some(Duration::from_secs(7))))
+                } else {
+                    sink.write_all(b"data")?;
+                    Ok(DownloadAttempt::Complete)
+                }
+            },
+            |delay| sleeps.push(delay),
+        )
+        .unwrap();
+        assert_eq!(offsets, [0, 0]);
+        assert_eq!(sleeps, [Duration::from_secs(7)]);
+        assert_eq!(out, b"data");
+    }
+
+    #[test]
+    fn retry_budget_is_finite_and_preserves_partial_content() {
+        let mut out = Vec::new();
+        let mut attempts = 0;
+        let error = resume_copy(
+            2,
+            &mut out,
+            |_offset, sink| {
+                attempts += 1;
+                if attempts == 1 {
+                    sink.write_all(b"a")?;
+                }
+                Err(io::Error::new(io::ErrorKind::TimedOut, "injected timeout"))
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(attempts, MAX_DOWNLOAD_RETRIES + 1);
+        assert_eq!(out, b"a");
+    }
+
+    #[test]
+    fn resumed_ranges_are_bound_to_the_expected_object() {
+        validate_content_range("bytes 4-7/8", 4, 8).unwrap();
+        for bad in ["bytes 0-7/8", "bytes 4-8/8", "bytes 4-7/9", "items 4-7/8"] {
+            assert_eq!(
+                validate_content_range(bad, 4, 8).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 
     // --- doubles for the auth seams ----------------------------------------
