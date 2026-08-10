@@ -14,6 +14,9 @@
 // streaming can decompose an mmap at all.
 #define _GNU_SOURCE
 #include <sys/fanotify.h>
+
+// Numbers the running kernel knows that its headers may not — see the header.
+#include "fanotify_compat.h"
 #include <linux/fanotify.h>
 #include <sys/mman.h>
 #include <sys/stat.h>

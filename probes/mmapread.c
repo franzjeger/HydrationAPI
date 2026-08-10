@@ -13,6 +13,9 @@
 // The second matters more: a lazy mapping that faults later is the normal case.
 #define _GNU_SOURCE
 #include <sys/fanotify.h>
+
+// Numbers the running kernel knows that its headers may not — see the header.
+#include "fanotify_compat.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>

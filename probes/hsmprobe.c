@@ -7,6 +7,9 @@
 // FAN_ALLOW on every path including errors, so it can never wedge the mount.
 #define _GNU_SOURCE
 #include <sys/fanotify.h>
+
+// Numbers the running kernel knows that its headers may not — see the header.
+#include "fanotify_compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

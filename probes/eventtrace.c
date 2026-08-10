@@ -11,6 +11,9 @@
 // proves nothing.
 #define _GNU_SOURCE
 #include <sys/fanotify.h>
+
+// Numbers the running kernel knows that its headers may not — see the header.
+#include "fanotify_compat.h"
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <unistd.h>

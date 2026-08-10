@@ -11,6 +11,9 @@
 // hydration path), which decides whether clearing it needs its own step.
 #define _GNU_SOURCE
 #include <sys/fanotify.h>
+
+// Numbers the running kernel knows that its headers may not — see the header.
+#include "fanotify_compat.h"
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <linux/fs.h>

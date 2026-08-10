@@ -16,6 +16,9 @@
 // Safety: marks exactly what it is told, auto-exits, answers FAN_ALLOW always.
 #define _GNU_SOURCE
 #include <sys/fanotify.h>
+
+// Numbers the running kernel knows that its headers may not — see the header.
+#include "fanotify_compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

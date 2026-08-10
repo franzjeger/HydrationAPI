@@ -8,6 +8,9 @@
 // takes over the event loop and denies everything with EIO.
 #define _GNU_SOURCE
 #include <sys/fanotify.h>
+
+// Numbers the running kernel knows that its headers may not — see the header.
+#include "fanotify_compat.h"
 #include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>

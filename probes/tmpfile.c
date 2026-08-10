@@ -20,6 +20,9 @@
 //   2. Does linkat into the marked mount fire one?
 #define _GNU_SOURCE
 #include <sys/fanotify.h>
+
+// Numbers the running kernel knows that its headers may not — see the header.
+#include "fanotify_compat.h"
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <fcntl.h>

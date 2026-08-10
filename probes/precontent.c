@@ -30,6 +30,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/fanotify.h>
+
+// Numbers the running kernel knows that its headers may not — see the header.
+#include "fanotify_compat.h"
 #include <unistd.h>
 
 int main(int argc, char **argv) {
