@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-pub type SharedTokenCache = Arc<TokenCache<Arc<GraphTokens>, MonotonicClock, FileCredentialStore>>;
+pub type SharedCredentialStore = Arc<dyn CredentialStore>;
+pub type SharedTokenCache =
+    Arc<TokenCache<Arc<GraphTokens>, MonotonicClock, SharedCredentialStore>>;
 
 #[derive(Clone)]
 pub struct FileCredentialStore {
@@ -233,11 +235,12 @@ impl GraphAccess {
         config: AuthConfig,
         tags: TagSource,
     ) -> Self {
+        let store: SharedCredentialStore = Arc::new(FileCredentialStore::new(credential));
         let cache = Arc::new(TokenCache::new(
             config,
             Arc::new(GraphTokens::new()),
             MonotonicClock,
-            FileCredentialStore::new(credential),
+            store,
         ));
         Self::with_token_cache(scope, root, state_dir, tags, cache)
     }
@@ -308,6 +311,26 @@ impl CloudAccess for GraphAccess {
 mod tests {
     use super::*;
     use hydration_client::CloudAccess;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MemoryCredentialStore(Mutex<Option<String>>);
+
+    impl CredentialStore for MemoryCredentialStore {
+        fn load(&self) -> io::Result<Option<RefreshToken>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|value| RefreshToken::new(value.clone())))
+        }
+
+        fn save(&self, refresh: &RefreshToken) -> io::Result<()> {
+            *self.0.lock().unwrap() = Some(refresh.expose_for_storage().to_owned());
+            Ok(())
+        }
+    }
 
     fn access(dir: &Path) -> GraphAccess {
         GraphAccess::new(
@@ -349,6 +372,28 @@ mod tests {
         let _upload = access.sink().unwrap();
         let _discover = access.discover().unwrap();
         assert_eq!(Arc::strong_count(&cache), 5);
+    }
+
+    #[test]
+    fn injected_credential_backend_is_not_tied_to_files() {
+        let d = tempfile::tempdir().unwrap();
+        let store: SharedCredentialStore = Arc::new(MemoryCredentialStore::default());
+        store.save(&RefreshToken::new("refresh")).unwrap();
+        let cache: SharedTokenCache = Arc::new(TokenCache::new(
+            AuthConfig::public_client("client"),
+            Arc::new(GraphTokens::new()),
+            MonotonicClock,
+            store,
+        ));
+        let access = GraphAccess::with_token_cache(
+            DriveScope::primary(crate::DriveId::parse("drive").unwrap()),
+            d.path().join("mount"),
+            d.path().join("state"),
+            TagSource::CTag,
+            cache,
+        );
+        access.preflight().unwrap();
+        assert!(access.shared_token_cache().is_signed_in());
     }
 
     #[test]
