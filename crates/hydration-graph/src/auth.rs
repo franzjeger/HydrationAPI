@@ -688,16 +688,6 @@ pub trait CredentialStore: Send + Sync {
     fn save(&self, refresh: &RefreshToken) -> io::Result<()>;
 }
 
-impl<S: CredentialStore + ?Sized> CredentialStore for Arc<S> {
-    fn load(&self) -> io::Result<Option<RefreshToken>> {
-        (**self).load()
-    }
-
-    fn save(&self, refresh: &RefreshToken) -> io::Result<()> {
-        (**self).save(refresh)
-    }
-}
-
 // Shared ownership for all three seams, so `Arc<TokenCache<Arc<T>, …>>` — the
 // shape the provider instances actually need — does not require a wrapper type
 // at each use site.
