@@ -331,9 +331,55 @@ pub fn is_dehydrated(path: &Path) -> io::Result<bool> {
     has_mark(path)
 }
 
-/// Whether the file occupies disk. Distinct from [`is_dehydrated`] on purpose:
-/// this is the observation, that is the state, and §5.8 is about the two
-/// agreeing for files large enough that they can.
+/// Whether the file holds any content at all.
+///
+/// Asked of the file rather than inferred from its block count, because a block
+/// count answers a different question and answers it differently on every
+/// filesystem. Measured, an empty 1 MiB placeholder carrying the four identity
+/// attributes:
+///
+/// ```text
+///   btrfs                    blocks=0   SEEK_DATA=ENXIO
+///   ext4, 128-byte inode     blocks=2   SEEK_DATA=ENXIO
+///   ext4, one byte of data   blocks=2   SEEK_DATA=found data
+/// ```
+///
+/// The last two lines are the point: where the attributes do not fit in the
+/// inode they spill into a block of their own, and `st_blocks` charges for it —
+/// so on that filesystem *an empty placeholder* and *a file with content in it*
+/// report the same number. No threshold separates them, because there is
+/// nothing to separate.
+///
+/// `SEEK_DATA` asks the filesystem directly and gets `ENXIO` when the file holds
+/// no data anywhere. That is the question §5.8 is really about: not whether a
+/// placeholder costs an inode's worth of metadata, but whether the drive is
+/// quietly full of content the user thought was in the cloud.
+pub fn holds_data(path: &Path) -> io::Result<bool> {
+    let f = fs::File::open(path)?;
+    holds_data_fd(std::os::fd::AsFd::as_fd(&f))
+}
+
+/// As [`holds_data`], on a descriptor that is already open.
+pub fn holds_data_fd(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SEEK_DATA moves to the first byte at or after the offset that is not in a
+    // hole. On a file that is entirely a hole there is none, and the kernel says
+    // so with ENXIO — which is the answer, not an error.
+    let r = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_DATA) };
+    if r >= 0 {
+        return Ok(true);
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENXIO) => Ok(false),
+        // A filesystem without SEEK_DATA support cannot answer, and guessing
+        // would be worse than saying so.
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// The raw block count, for the rare caller that genuinely means blocks.
+///
+/// Not a placeholder test — see [`holds_data`] for why.
 pub fn occupies_disk(path: &Path) -> io::Result<bool> {
     Ok(fs::metadata(path)?.blocks() > 0)
 }

@@ -28,28 +28,28 @@ fn the_scratch_filesystem_can_actually_punch_holes() {
     create(&p, 65536, 0o644).expect("create");
     hydrate(&p, &vec![b'a'; 65536], 65536).expect("hydrate");
     assert!(
-        fs::metadata(&p).unwrap().blocks() > 0,
+        hydrationd::placeholder::holds_data(&p).expect("SEEK_DATA"),
         "a filled file reports no blocks — this filesystem is not telling the truth \
          about allocation, and the rest of these tests would prove nothing"
     );
     dehydrate(&p).expect("dehydrate");
     assert_eq!(
-        fs::metadata(&p).unwrap().blocks(),
-        0,
+        hydrationd::placeholder::holds_data(&p).expect("SEEK_DATA"),
+        false,
         "punching a hole did not free the blocks — is CARGO_TARGET_TMPDIR on tmpfs?"
     );
 }
 
 #[test]
-fn a_placeholder_has_size_and_no_blocks() {
+fn a_placeholder_has_size_and_holds_no_data() {
     let p = scratch("basic.bin");
     create(&p, 65536, 0o644).expect("create");
 
     let md = fs::metadata(&p).expect("stat");
     assert_eq!(md.len(), 65536, "a placeholder must report the real size");
     assert_eq!(
-        md.blocks(),
-        0,
+        hydrationd::placeholder::holds_data(&p).expect("SEEK_DATA"),
+        false,
         "a placeholder reported {} blocks for content it does not hold; du would \
          claim disk that is not in use",
         md.blocks()
@@ -95,7 +95,7 @@ fn a_matching_fetch_fills_it() {
 }
 
 #[test]
-fn dehydrate_keeps_size_and_mode_and_drops_the_blocks() {
+fn dehydrate_keeps_size_and_mode_and_drops_the_content() {
     let p = scratch("round.bin");
     create(&p, 8192, 0o750).expect("create");
     hydrate(&p, &vec![b'z'; 8192], 8192).expect("hydrate");
@@ -105,7 +105,9 @@ fn dehydrate_keeps_size_and_mode_and_drops_the_blocks() {
     let md = fs::metadata(&p).unwrap();
     assert_eq!(md.len(), 8192, "size lost across dehydration");
     assert_eq!(md.permissions().mode() & 0o777, 0o750, "mode lost");
-    assert_eq!(md.blocks(), 0, "still occupying disk");
+    assert_eq!(
+        hydrationd::placeholder::holds_data(&p).expect("SEEK_DATA"),
+        false, "still occupying disk");
 }
 
 /// The identity half of §5.1, at this layer: nothing about dehydrating or

@@ -178,6 +178,8 @@ pub fn reclaim(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hydration_protocol::holds_data;
+    use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
@@ -207,7 +209,6 @@ mod tests {
 
     #[test]
     fn a_synced_file_gives_its_disk_back_and_keeps_its_identity() {
-        use std::os::unix::fs::MetadataExt;
         let dir = scratch("basic");
         let p = synced(&dir, "report.pdf", &vec![b'x'; 8192]);
 
@@ -215,7 +216,7 @@ mod tests {
 
         let md = std::fs::metadata(&p).unwrap();
         assert_eq!(md.len(), 8192, "the size no longer describes the object");
-        assert_eq!(md.blocks(), 0, "the disk was not returned");
+        assert!(!holds_data(&p).unwrap(), "the content was not returned");
         assert_eq!(
             store::get_xattr(&p, store::XATTR_ID).unwrap().unwrap(),
             b"cloud-1"
@@ -258,7 +259,6 @@ mod tests {
 
     #[test]
     fn a_file_with_an_edit_waiting_is_never_evicted() {
-        use std::os::unix::fs::MetadataExt;
         let dir = scratch("waiting");
         let p = synced(&dir, "doc.txt", b"content");
         let md = std::fs::metadata(&p).unwrap();

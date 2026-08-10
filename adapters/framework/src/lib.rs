@@ -421,8 +421,21 @@ impl Harness for Framework {
             .flatten()
             .flatten()
             .filter(|e| {
+                // The mark, not the block count. Counting zero-block files
+                // reported *no* dehydrated files on a filesystem where the
+                // identity attributes spill out of the inode — a conformance
+                // check that passed by measuring the wrong thing.
                 e.metadata()
-                    .map(|m| m.is_file() && m.blocks() == 0)
+                    .map(|m| {
+                        m.is_file()
+                            && matches!(
+                                hydration_client::store::get_xattr(
+                                    &e.path(),
+                                    hydration_protocol::xattr::DEHYDRATED
+                                ),
+                                Ok(Some(_))
+                            )
+                    })
                     .unwrap_or(false)
             })
             .count()

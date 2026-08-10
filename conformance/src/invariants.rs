@@ -15,9 +15,64 @@ use std::time::Duration;
 
 const UPLOAD_WINDOW: Duration = Duration::from_secs(10);
 
-/// Blocks allocated to a file. Zero means "metadata only, no content here".
-fn blocks(path: &std::path::Path) -> u64 {
-    fs::metadata(path).expect("stat placeholder").blocks()
+
+/// Whether a file holds any content, asked of the filesystem rather than
+/// inferred from a block count.
+///
+/// `st_blocks` counts the block an inode spills its extended attributes into, so
+/// on ext4 with a 128-byte inode an empty placeholder and a file with one byte
+/// in it both report 2. There is no threshold between them; `SEEK_DATA` returns
+/// `ENXIO` when the file is entirely a hole, which is the question.
+fn holds_content(path: &std::path::Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(f) = fs::File::open(path) else {
+        return false;
+    };
+    let r = unsafe { libc::lseek(f.as_raw_fd(), 0, libc::SEEK_DATA) };
+    if r >= 0 {
+        return true;
+    }
+    // Anything other than "no data anywhere" is a filesystem that cannot answer,
+    // and a conformance suite must not read that as a pass.
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENXIO) => false,
+        _ => panic!("this filesystem cannot answer SEEK_DATA; the invariant is unmeasurable here"),
+    }
+}
+
+/// What an empty file carrying a placeholder's attributes costs on the
+/// filesystem under test. The upper bound, not the predicate.
+fn empty_file_floor(dir: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    // Named per process and per call so two tests in the same directory cannot
+    // race each other's probe.
+    let probe = dir.join(format!(
+        ".hydration-floor-{}-{:p}",
+        std::process::id(),
+        &dir as *const _
+    ));
+    let _ = fs::remove_file(&probe);
+    let Ok(_) = fs::File::create(&probe) else {
+        return u64::MAX;
+    };
+    for name in ["user.hydration.dehydrated", "user.hydration.id",
+                 "user.hydration.etag", "user.hydration.mode"] {
+        // Values sized like the real ones: a cloud id is not five bytes.
+        let _ = set_probe_xattr(&probe, name, &vec![b'a'; 80]);
+    }
+    let blocks = fs::metadata(&probe).map(|m| m.blocks()).unwrap_or(u64::MAX);
+    let _ = fs::remove_file(&probe);
+    blocks
+}
+
+fn set_probe_xattr(path: &std::path::Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let p = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let n = std::ffi::CString::new(name)?;
+    let rc = unsafe {
+        libc::setxattr(p.as_ptr(), n.as_ptr(), value.as_ptr() as *const libc::c_void, value.len(), 0)
+    };
+    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
 /// §5.1 — A locally created file keeps one identity for its whole life.
@@ -384,10 +439,21 @@ pub fn placeholder_consumes_no_disk<H: Harness>(h: &mut H) -> Outcome {
     let md = fs::metadata(&path).expect("stat placeholder");
     assert_eq!(md.len(), 65536, "a placeholder must report the real size");
     assert_eq!(
-        md.blocks(),
-        0,
-        "a placeholder reports {} allocated blocks for content it does not hold; \
-         du will claim disk that is not in use",
+        holds_content(&path),
+        false,
+        "a placeholder holds file content; du will claim disk that is not in use"
+    );
+    // And an upper bound as well as the predicate, because "holds no data" alone
+    // would accept a file whose allocation ballooned for some other reason. The
+    // bound is the filesystem's own floor for an empty file carrying the same
+    // attributes — measured here rather than assumed, because it is 0 on btrfs
+    // and 2 on ext4 with a 128-byte inode, where the identity attributes do not
+    // fit in the inode and spill into a block of their own.
+    let floor = empty_file_floor(path.parent().expect("placeholder has a parent"));
+    assert!(
+        md.blocks() <= floor,
+        "a placeholder allocates {} blocks where an empty file with the same \
+         attributes costs {floor}",
         md.blocks()
     );
 
@@ -414,7 +480,11 @@ pub fn worker_death_fails_closed<H: Harness>(h: &mut H) -> Outcome {
 
     h.seed_remote("big.bin", &vec![b'z'; 4096], "etag-1");
     let path = h.sync_dir().join("big.bin");
-    assert_eq!(blocks(&path), 0, "seeded file is not a placeholder");
+    assert_eq!(
+        holds_content(&path),
+        false,
+        "seeded file is not a placeholder"
+    );
 
     h.kill_hydration_worker();
 
@@ -434,8 +504,8 @@ pub fn worker_death_fails_closed<H: Harness>(h: &mut H) -> Outcome {
     }
 
     assert_eq!(
-        blocks(&path),
-        0,
+        holds_content(&path),
+        false,
         "the file gained content while the worker was dead"
     );
 

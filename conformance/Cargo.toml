@@ -6,6 +6,7 @@ license.workspace = true
 description = "Executable specification for a Linux cloud-file hydration framework"
 
 [dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

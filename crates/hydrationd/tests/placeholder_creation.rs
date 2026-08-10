@@ -130,8 +130,10 @@ fn a_placeholder_can_be_created_inside_the_watched_mount() {
 
     let md = std::fs::metadata(&target).expect("the placeholder does not exist");
     assert_eq!(md.len(), 64, "the placeholder has the wrong size");
-    use std::os::unix::fs::MetadataExt;
-    assert_eq!(md.blocks(), 0, "the placeholder occupies disk");
+    assert!(
+        !hydrationd::placeholder::holds_data(&target).expect("SEEK_DATA"),
+        "the placeholder holds content"
+    );
     assert!(
         hydrationd::placeholder::has_mark(&target).unwrap_or(false),
         "the placeholder is not marked dehydrated — it would never be intercepted"

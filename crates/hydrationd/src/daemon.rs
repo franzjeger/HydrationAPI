@@ -778,7 +778,19 @@ impl<F: Fetch + 'static> Worker<F> {
         if unsafe { libc::fstat(fd, &mut st) } < 0 {
             return false;
         }
-        st.st_size > 0 && st.st_blocks == 0
+        if st.st_size == 0 {
+            return false;
+        }
+        // Asked of the filesystem, not inferred from the block count.
+        //
+        // `st_blocks == 0` was the first version and it silently did nothing on
+        // ext4 with a 128-byte inode: the identity attributes do not fit there
+        // and spill into a block of their own, so a stripped placeholder reports
+        // 2 and the guard never fired. The one protection against a mark someone
+        // removed was therefore absent on exactly the filesystems where it is
+        // hardest to notice.
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        !placeholder::holds_data_fd(borrowed).unwrap_or(true)
     }
 
     /// `Some(Empty)` when there is provably nothing to serve.

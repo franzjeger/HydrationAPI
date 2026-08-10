@@ -58,10 +58,13 @@ fn evicting_returns_the_disk_and_keeps_the_metadata() {
     assert_eq!(outcome, Ok(()));
 
     let md = std::fs::metadata(&path).unwrap();
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     assert_eq!(md.len(), 8192, "size lost");
     assert_eq!(md.permissions().mode() & 0o777, 0o750, "mode lost");
-    assert_eq!(md.blocks(), 0, "the disk was not actually returned");
+    assert!(
+        !placeholder::holds_data(&path).expect("SEEK_DATA"),
+        "the content was not actually returned"
+    );
     let _ = std::fs::remove_file(&path);
 }
 

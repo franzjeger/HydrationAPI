@@ -254,6 +254,7 @@ impl Materialise for TmpfilePlacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hydration_protocol::holds_data;
 
     fn scratch(name: &str) -> PathBuf {
         // Deliberately not /tmp: this needs a filesystem with both O_TMPFILE
@@ -280,8 +281,13 @@ mod tests {
 
         let md = std::fs::metadata(&target).unwrap();
         assert_eq!(md.len(), 8192);
-        use std::os::unix::fs::MetadataExt;
-        assert_eq!(md.blocks(), 0, "the placeholder occupies disk");
+        assert!(
+            !holds_data(&target).unwrap(),
+            "the placeholder holds content — asked with SEEK_DATA rather than \
+             st_blocks, which on a filesystem whose inodes cannot hold the \
+             identity attributes charges a block for them and reports the same \
+             number for an empty placeholder and a file with a byte in it"
+        );
         assert_eq!(
             store::get_xattr(&target, store::XATTR_ID).unwrap().unwrap(),
             b"cloud-1"

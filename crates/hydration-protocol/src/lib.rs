@@ -129,6 +129,29 @@ pub mod flags {
 }
 
 
+/// Whether a file holds any content, asked of the filesystem.
+///
+/// Here because both halves and their tests need the same answer, and because
+/// the obvious alternative is wrong in a way that only shows up on someone
+/// else's machine: `st_blocks` counts the block an inode spills its extended
+/// attributes into, so on ext4 with a 128-byte inode an empty placeholder and a
+/// file with one byte in it both report 2. There is no threshold between them.
+///
+/// `SEEK_DATA` returns `ENXIO` when the file is entirely a hole, which is the
+/// question §5.8 is actually about.
+pub fn holds_data(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::File::open(path)?;
+    let r = unsafe { libc::lseek(f.as_raw_fd(), 0, libc::SEEK_DATA) };
+    if r >= 0 {
+        return Ok(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENXIO) => Ok(false),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
 /// Extended attributes both halves agree on.
 ///
 /// Here rather than in either half because they are the shared vocabulary: the
