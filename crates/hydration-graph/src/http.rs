@@ -797,9 +797,10 @@ fn resume_copy(
     loop {
         let offset = written;
         let mut sink_failed = false;
-        let mut counted = CountedWriter::new(out, &mut written, expected, &mut sink_failed);
-        let result = attempt(offset, &mut counted);
-        drop(counted);
+        let result = {
+            let mut counted = CountedWriter::new(out, &mut written, expected, &mut sink_failed);
+            attempt(offset, &mut counted)
+        };
         if sink_failed {
             return result.map(|_| ()).and_then(|()| {
                 Err(io::Error::new(
