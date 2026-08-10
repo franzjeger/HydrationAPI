@@ -5,7 +5,7 @@ Provider and Windows' Cloud Files API. Files appear as ordinary local files with
 their real size and metadata; their content is fetched on first access.
 
 **Status: the framework is built and hardened. A Microsoft Graph provider is
-half written.** 294 tests, eight privileged suites against a real kernel, and an
+half written.** 395 tests, eight privileged suites against a real kernel, and an
 end-to-end smoke run with both real binaries. What is *not* done is the part that
 needs a real OneDrive account, and nothing here has met live Graph — see
 [Where this actually stands](#where-this-actually-stands).
@@ -127,6 +127,53 @@ can run, and the two binaries the systemd units point at.
 sudo ./deploy/smoke.sh /mnt/scratch    # both real binaries, end to end
 ```
 
+### Which filesystem the tests run on
+
+This framework is a claim about filesystem semantics, so the filesystem a test
+runs on is part of the test. `HYDRATION_TEST_DIR` chooses it at run time:
+
+```bash
+sudo mount -o loop ext4-128.img /mnt/scratch
+HYDRATION_TEST_DIR=/mnt/scratch cargo test --workspace
+```
+
+Do **not** reach for `CARGO_TARGET_TMPDIR` for this. It is a compile-time macro
+and cargo sets it itself, so exporting it is silently ignored — measured:
+
+```text
+CARGO_TARGET_TMPDIR=/mnt/scratch cargo test  ->  ./target/tmp     (ignored)
+CARGO_TARGET_DIR=/mnt/scratch cargo test     ->  /mnt/scratch/tmp (works, moves the build too)
+```
+
+A filesystem matrix written the obvious way runs every leg on the same disk and
+reports green. See `crates/test-scratch`.
+
+### CI
+
+`.github/workflows/ci.yml` runs on every push: `cargo fmt --check`, clippy under
+`-D warnings` across all targets and again with `--all-features`, `cargo doc`
+under `-D warnings`, the full suite unprivileged, and then **the whole suite plus
+all eight privileged suites and the smoke run on four filesystems** — btrfs,
+ext4 with a 128-byte inode, ext4 with a 512-byte one, and xfs.
+
+Those four are not a preference. The kernel gates pre-content events on a
+per-filesystem opt-in (`SB_I_ALLOW_HSM`) and exactly ext4, btrfs and xfs set it.
+
+Two things the matrix does that are easy to leave out:
+
+- `HYDRATIOND_REQUIRE=1` and `HYDRATION_REQUIRE=1` turn a skipped privileged test
+  into a failure. Without them a runner lacking `CAP_SYS_ADMIN` reduces the suite
+  to a no-op that reports success.
+- A step asserts the suite **fails** when `HYDRATION_TEST_DIR` points somewhere
+  unwritable. If it passed, the tests never read the variable and all four legs
+  were the same filesystem wearing different names.
+
+**Minimum kernel: 6.14**, where `FAN_PRE_ACCESS` shipped. `FAN_CLASS_PRE_CONTENT`
+has been in the header since 2.6.37 with nothing behind it, so the constant's
+presence proves nothing — `probes/precontent.c` asks the kernel with a syscall
+and says which of "too old", "not permitted" and "this filesystem cannot carry
+the mark" it hit.
+
 Nine checks: a placeholder hydrates on first read; the framework creates its own
 placeholder live inside the marked mount and that one hydrates too; a local edit
 reaches the cloud; a rename-edit reaches the cloud; the framework's own writes do
@@ -171,7 +218,7 @@ that have each bitten somebody.
 Honest, because the interesting number is not the test count.
 
 **Done and hardened.** The framework: seven adversarial review rounds, every
-finding fixed, 294 tests, 8/8 privileged suites against a real kernel. Two of the
+finding fixed, 395 tests, 8/8 privileged suites against a real kernel. Two of the
 five Graph pieces.
 
 **Not done.** The upload half — no Graph `Sink` exists. Authentication. The seam
