@@ -1518,7 +1518,36 @@ In the interest of honesty, since this is meant to be the basis for a decision:
   with database lookups is substantially slower, and on NVMe the ratio looks different.
   The numbers show the structure — passthrough removes the userspace round trip — not absolute
   values you can plan capacity from.
-- The kernel source I read was `torvalds/linux` master, not exactly 7.1.6-cachyos.
+- ~~The kernel source I read was `torvalds/linux` master, not exactly 7.1.6-cachyos.~~ —
+  **narrowed.** The uapi header and `fs/notify/fanotify/fanotify_user.c` have now been read at
+  the release tags rather than at master, and the parts this design rests on are unchanged
+  from v6.14 through v7.1 and master:
+  - **`FAN_PRE_ACCESS` first shipped in 6.14** (merged 2025-01-23, released 2025-03-24).
+    `FAN_CLASS_PRE_CONTENT` has been in the header since 2.6.37 with nothing behind it,
+    so the constant is not the feature — which is why `probes/precontent.c` asks the kernel
+    instead of grepping the headers, and why CI pins its runner rather than taking
+    whatever `-latest` becomes.
+  - **`FAN_PRE_MODIFY` never shipped.** It was in early revisions of the series and was
+    dropped before merge; `FANOTIFY_PRE_CONTENT_EVENTS` is exactly `FAN_PRE_ACCESS` in every
+    released kernel. §5's line about there being no separate pre-modify event is right, and
+    it is not a property of this kernel — it is a property of all of them.
+  - **Three filesystems set `SB_I_ALLOW_HSM`: ext4, btrfs, xfs.** Not fuse, bcachefs, f2fs,
+    shmem, overlayfs. §8's "filesystems other than ext4/btrfs/xfs" is not a scoping decision
+    we made; there is nothing else to support, and the conformance matrix is complete by
+    construction rather than by choice.
+  - **The page-fault pre-content hooks were reverted in 6.14-rc7**, before 6.14 shipped:
+    syzbot found they could fire while holding freeze protection and deadlock the HSM client.
+    What ships generates **one event for the whole range at `mmap()` time**. This is what
+    `probes/mmapread.c` measured, so §8d's "a mapped read demands the whole object in one
+    event" is the shipped behaviour and not an accident of this kernel — but it also means
+    lazy per-page filling is not available to build on later.
+  - **`FAN_REPORT_FID` with a permission class returns `EINVAL`** in every released kernel:
+    `fanotify_init` still rejects any fid mode outside `FAN_CLASS_NOTIF`. Pre-content events
+    carry an fd and a `FAN_EVENT_INFO_TYPE_RANGE` record instead.
+
+  What remains unverified is narrower than it was: the cachyos tree's own patches have not
+  been diffed against upstream, so a local divergence would not have been seen. Nothing in
+  the above is cachyos-specific, and all of it reproduces on this machine.
   The headline findings (`CAP_SYS_ADMIN` in `backing.c`, `SB_I_ALLOW_HSM` in the three
   filesystems, `FOPEN_PASSTHROUGH_MASK`) match the local uapi header and the
   measurements, so I consider them reliable.
