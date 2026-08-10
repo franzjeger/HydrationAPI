@@ -201,6 +201,7 @@ impl Provider for FolderCloud {
         &mut self,
         cloud_id: &str,
         _size: u64,
+        _content_tag: Option<&str>,
         out: &mut hydration_protocol::transport::Body<'_>,
     ) -> io::Result<()> {
         // What a real provider's implementation looks like too: open the
