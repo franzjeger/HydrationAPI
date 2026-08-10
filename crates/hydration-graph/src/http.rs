@@ -33,7 +33,7 @@
 //! whole suite runs on a machine with no TLS stack, no certificate store and no
 //! network.
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -256,6 +256,44 @@ pub struct GraphHttp<T: TokenSource> {
 }
 
 impl<T: TokenSource> GraphHttp<T> {
+    fn send_response(
+        &mut self,
+        method: Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        authorize: bool,
+    ) -> io::Result<ureq::http::Response<ureq::Body>> {
+        let headers = caller_headers(headers)?;
+        let authorized = may_authorize(url, authorize)?;
+
+        let mut builder = ureq::http::Request::builder()
+            .method(method.as_str())
+            .uri(url);
+        for (name, value) in headers {
+            builder = builder.header(name, value);
+        }
+        if authorized {
+            builder = builder.header(
+                ureq::http::header::AUTHORIZATION,
+                authorization_header(&mut self.token)?,
+            );
+        }
+
+        let bodiless = body.is_empty() && matches!(method, Method::Get | Method::Delete);
+        if bodiless {
+            builder
+                .body(())
+                .map_err(bad_request)
+                .and_then(|request| self.agent.run(request).map_err(|e| wire_error(url, e)))
+        } else {
+            builder
+                .body(body)
+                .map_err(bad_request)
+                .and_then(|request| self.agent.run(request).map_err(|e| wire_error(url, e)))
+        }
+    }
+
     pub fn new(token: T) -> Self {
         Self {
             agent: agent(),
@@ -629,40 +667,11 @@ impl<T: TokenSource> GraphHttp<T> {
         body: &[u8],
         authorize: bool,
     ) -> io::Result<Answer> {
-        let headers = caller_headers(headers)?;
-        let authorized = may_authorize(url, authorize)?;
-
-        let mut builder = ureq::http::Request::builder()
-            .method(method.as_str())
-            .uri(url);
-        for (name, value) in headers {
-            builder = builder.header(name, value);
-        }
-        if authorized {
-            builder = builder.header(
-                ureq::http::header::AUTHORIZATION,
-                authorization_header(&mut self.token)?,
-            );
-        }
-
         // A GET or DELETE with nothing to send carries no `content-length` at
         // all; anything else carries one, *including a zero* — a PUT of an
         // empty file is a real request, and a PUT with no length is not the
         // same thing as a PUT of nothing.
-        let bodiless = body.is_empty() && matches!(method, Method::Get | Method::Delete);
-        let sent = if bodiless {
-            builder
-                .body(())
-                .map_err(bad_request)
-                .map(|r| self.agent.run(r))
-        } else {
-            builder
-                .body(body)
-                .map_err(bad_request)
-                .map(|r| self.agent.run(r))
-        }?;
-
-        let mut response = sent.map_err(|e| wire_error(url, e))?;
+        let mut response = self.send_response(method, url, headers, body, authorize)?;
 
         let status = response.status().as_u16();
         let retry_after = response
@@ -683,6 +692,69 @@ impl<T: TokenSource> GraphHttp<T> {
             body,
         })
     }
+
+    /// Stream one drive item's content without buffering it in the daemon.
+    ///
+    /// Graph normally answers `/content` with a pre-authorized HTTPS URL. The
+    /// first request carries the account token; the second emphatically does
+    /// not. Redirect following stays disabled in the agent so this boundary is
+    /// visible here rather than delegated to a client default.
+    pub fn download_content(
+        &mut self,
+        key: &crate::ObjectKey,
+        expected: u64,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        let graph_url = crate::item_content_url(key);
+        let headers = [("accept".to_string(), "application/octet-stream".to_string())];
+        let mut response = self.send_response(Method::Get, &graph_url, &headers, &[], true)?;
+
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(ureq::http::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .filter(|url| safe_download_url(url))
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Graph returned an unsafe content redirect; it was not followed",
+                    )
+                })?;
+            response = self.send_response(Method::Get, &location, &headers, &[], false)?;
+        }
+
+        if !response.status().is_success() {
+            return Err(io::Error::other(format!(
+                "Graph content request returned HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        copy_exact(response.body_mut().as_reader(), out, expected)
+    }
+}
+
+fn safe_download_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !authority.is_empty() && !authority.contains('@')
+}
+
+fn copy_exact(mut source: impl Read, out: &mut dyn Write, expected: u64) -> io::Result<()> {
+    let copied = io::copy(&mut source, out)?;
+    if copied != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("Graph returned {copied} content bytes; expected {expected}"),
+        ));
+    }
+    Ok(())
 }
 
 fn bad_request(_: ureq::http::Error) -> io::Error {
@@ -801,6 +873,28 @@ mod tests {
     // Where a real upload session lives: a host this crate never composed.
     const SESSION: &str = "https://up.1drv.com/upload.aspx?token=abc";
     const CLIENT: &str = "11111111-2222-3333-4444-555555555555";
+
+    #[test]
+    fn content_redirect_must_be_https_without_userinfo() {
+        assert!(safe_download_url(
+            "https://public.dm.files.1drv.com/content?q=token"
+        ));
+        assert!(!safe_download_url(
+            "http://public.dm.files.1drv.com/content"
+        ));
+        assert!(!safe_download_url("https://token@evil.example/content"));
+        assert!(!safe_download_url("not a url"));
+    }
+
+    #[test]
+    fn streamed_content_must_match_the_promised_size() {
+        let mut out = Vec::new();
+        copy_exact(&b"content"[..], &mut out, 7).unwrap();
+        assert_eq!(out, b"content");
+
+        let err = copy_exact(&b"short"[..], &mut Vec::new(), 6).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
 
     // --- doubles for the auth seams ----------------------------------------
     //

@@ -2,8 +2,8 @@
 
 use crate::auth::{AuthConfig, Clock, CredentialStore, RefreshToken, TokenCache};
 use crate::{
-    CloudId, DriveScope, GraphDiscover, GraphHttp, GraphSink, GraphTokens, Method, PersistedState,
-    Request, Sleeper, StateStore, TagSource, TokenBlob, Transport, TreeBlob,
+    CloudId, DriveScope, GraphDiscover, GraphHttp, GraphSink, GraphTokens, PersistedState, Sleeper,
+    StateStore, TagSource, TokenBlob, TreeBlob,
 };
 use hydration_client::{CloudAccess, Provider};
 use hydration_protocol::transport::Body;
@@ -123,22 +123,10 @@ pub struct GraphProvider {
     http: GraphHttp<SharedTokenCache>,
 }
 impl Provider for GraphProvider {
-    fn fetch(&mut self, cloud_id: &str, _size: u64, out: &mut Body<'_>) -> io::Result<()> {
+    fn fetch(&mut self, cloud_id: &str, size: u64, out: &mut Body<'_>) -> io::Result<()> {
         let key = CloudId::parse(cloud_id)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid Graph cloud id"))?;
-        let url = format!(
-            "https://graph.microsoft.com/v1.0/drives/{}/items/{}/content",
-            key.drive().as_str(),
-            key.item().as_str()
-        );
-        let reply = self.http.send(&Request::new(Method::Get, url))?;
-        if !(200..300).contains(&reply.status) {
-            return Err(io::Error::other(format!(
-                "Graph content request returned HTTP {}",
-                reply.status
-            )));
-        }
-        out.write_all(&reply.body)
+        self.http.download_content(&key, size, out)
     }
 }
 
