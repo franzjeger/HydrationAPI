@@ -7,6 +7,7 @@ use crate::{
 };
 use hydration_client::{CloudAccess, Provider};
 use hydration_protocol::transport::Body;
+use hydration_protocol::Span;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -130,17 +131,31 @@ impl Provider for GraphProvider {
         cloud_id: &str,
         size: u64,
         content_tag: Option<&str>,
+        span: Span,
         out: &mut Body<'_>,
     ) -> io::Result<()> {
         let key = CloudId::parse(cloud_id)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid Graph cloud id"))?;
+        // QuickXorHash is a hash of the *object*. A range cannot be checked
+        // against it — there is no per-range digest in Graph to check against
+        // either — so the verification runs when the reader demanded the whole
+        // object and is skipped, visibly, when it did not.
+        //
+        // Not a loophole someone could ride: nothing chooses the span except the
+        // kernel reporting what a reader asked for, and a partially filled file
+        // keeps its placeholder mark, so no range is ever promoted to "this file
+        // is hydrated" without every other range having arrived. What is
+        // genuinely lost is that a service corrupting one range of a large file
+        // is no longer caught by the tag, only by whatever the reader makes of
+        // the bytes. That is the price of not fetching 2.77 GiB to answer a
+        // 4 KiB read, and it is recorded here rather than left to be discovered.
         match content_tag.and_then(|tag| tag.strip_prefix("qx:")) {
-            Some(expected) => {
+            Some(expected) if span.is_whole(size) => {
                 let mut verified = QuickXorWriter::new(out);
-                self.http.download_content(&key, size, &mut verified)?;
+                self.http.download_span(&key, span, size, &mut verified)?;
                 verified.verify(expected)
             }
-            None => self.http.download_content(&key, size, out),
+            _ => self.http.download_span(&key, span, size, out),
         }
     }
 }

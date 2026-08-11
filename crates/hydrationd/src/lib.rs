@@ -12,6 +12,7 @@ pub mod daemon;
 pub mod evict;
 pub mod exposure;
 pub mod fanotify;
+pub mod partial;
 pub mod placeholder;
 pub mod policy;
 pub mod remote;

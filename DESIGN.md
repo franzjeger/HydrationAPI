@@ -1469,7 +1469,111 @@ gone. §8 and PROVIDER.md are to state that number, not claim the ceiling has be
 Range-based hydration is the real solution for reads, and it is deliberately not
 bundled with this change: it introduces a third file state — partially present —
 which the store, the manifest, the delta pass, eviction and §5.8 are all two-state
-about today.
+about today. **It is now built; see §8d-bis, including what happened to that
+objection.**
+
+---
+
+## 8d-bis. The same questions on an object big enough for the answers to differ
+
+§8d was measured on a 4 MiB file, and one of its two conclusions was an artefact of
+that. On a 4 MiB file "the whole object" and "the mapped length" are the same
+number, so the mmap case could not tell them apart — and the conclusion drawn was
+the pessimistic one.
+
+A live account made the difference matter. Opening
+`Backups/FranzJeger_Arch/2026-02-22_18-41.tar.gz` (2.77 GiB) in a file manager froze
+it for a long stretch and then succeeded, having fetched the entire file: `SEEK_DATA`
+afterwards reported data at 0 and the first hole at 2.77 GiB, and the mount went from
+37 MB to 3.2 GB. A deliberate **4096-byte** read of the sibling file failed with `EIO`
+after **61.7 seconds** — the `stall` limit — having moved nothing to disk. Four
+kilobytes were asked for; 2.77 GiB were attempted.
+
+`probes/bigdemand.c`, 7.1.6, btrfs, on a 2.77 GiB sparse placeholder. The worker fills
+exactly what each event asks for and answers `FAN_ALLOW`:
+
+```
+case                                   events   first off   first count   reader
+read() 4 KiB at 1 GiB                       1  1073741824          4096   real content
+read() 8 MiB at 1 GiB                       1  1073741824       8388608   real content
+read() 8 x 128 KiB sequential               8  1073741824        131072   real content
+read() 4 KiB at 1 GiB, at 2 GiB, at 1 GiB   3  1073741824          4096   real content
+mmap() whole object, touch 1 page           1           0    2972712960   (not filled)
+mmap() 4 KiB window at 1 GiB                1  1073741824          4096   real content
+mmap() 64 MiB segment at 1 GiB              1  1073741824      67108864   real content
+```
+
+Four things follow, and the third and fourth are new.
+
+- **`count` does not grow with the object.** A 4 KiB read of a 2.77 GiB file demands
+  4096 bytes, at a page-aligned offset a gigabyte in. There is no readahead inflation
+  and no whole-file demand hiding behind a large file. §8d's first conclusion holds at
+  any size.
+- **Sequential reads tile exactly.** Eight 128 KiB reads produced eight demands,
+  abutting, no overlap, no growth. A file read straight through is therefore its own
+  size in traffic and not a byte more — which is what makes it safe to serve ranges
+  rather than objects without turning one read into many.
+- **A demand is per access, including a repeat.** Reading at 1 GiB, then at 2 GiB,
+  then at 1 GiB again fired *three* events. Filling a range and answering does not
+  stop the file generating events, because the file is still marked and the ignore
+  mark only goes on when it is complete. So ranges can accumulate across events —
+  and a re-read of a range already present costs a round trip unless the worker
+  recognises what it put there, which is what `partial::Ranges` is for.
+- **`mmap()` demands the *mapping*, not the object.** This is the correction.
+  A 4 KiB window mapped a gigabyte into a 2.77 GiB file demanded 4096 bytes; a 64 MiB
+  segment demanded 64 MiB; only mapping the whole object demanded the whole object.
+  §8d's "no streaming can decompose that" is true of a whole-object mapping and false
+  of mapping generally — and segment-mapping is what an ELF loader actually does.
+
+The ceiling is therefore **the largest single demand**, not the object. It still
+exists: `mmap(NULL, size, ...)` over a whole large file is one event held through the
+entire transfer, and that is a real thing that real programs do. What has gone is the
+much larger class where the ceiling applied for no reason at all — every ordinary
+`read()`, at any size, of any object.
+
+### What became of the third file state
+
+§8d deferred this because "partially present" is a state the store, the manifest, the
+delta pass, eviction and §5.8 are all two-state about. The objection is answered by
+**not persisting the third state**. The set of filled ranges lives in the worker's
+memory (`crates/hydrationd/src/partial.rs`) and nowhere else. Nothing on disk says a
+file is partly filled; every other component still sees a file that is either marked
+or not, and a marked file is still one nobody may be served from without asking.
+
+Two consequences, both deliberate:
+
+- **A restart forgets.** The next event punches the file and starts over. Partial
+  content is a cache, and this is the price of not having to be correct across a crash
+  *mid-write* — where a range recorded present but only half written would be served
+  as content, which is the silent corruption the framework exists to prevent.
+- **Memory is not enough on its own**, because something else may write into the
+  placeholder between two events. A record is therefore believed only while the file
+  still looks the way we left it — the same `(mtime, mtime_nsec, size)` triple the
+  stamp records. Anything else and the record is dropped and the file punched, which
+  is what the code did unconditionally before ranges existed.
+
+`crates/hydrationd/tests/ranges.rs` runs all of this against the kernel on a real
+mount. Writing that suite turned up a ninth disguise of §6a-ter, from an unexpected
+direction: **a partial-page write into a placeholder blocks on a pre-content event.**
+The page has to be brought in before part of it can be modified, that read fires
+`FAN_PRE_ACCESS`, and a process that writes into the sync root and would have to answer
+its own event deadlocks. The framework's own writes go through the event fd and are
+exempt (§8c) — this is about anything *else* that edits a placeholder in place. It also
+means the worker does see a read of the page an editor is about to overwrite; what it
+does not see is the modification, because no released kernel has a pre-modify event.
+
+### What ranges cost
+
+- **A whole-object content hash cannot verify a range.** Graph publishes QuickXorHash
+  for the object and nothing per range, so `GraphProvider` runs the check when the
+  reader demanded the whole object and skips it otherwise. A service corrupting one
+  range of a large file is no longer caught by the tag. That is stated in the code at
+  the point where the check is skipped rather than left to be discovered.
+- **A partly filled file occupies disk while marked.** §5.8 asks that `st_blocks` be
+  honest, and it still is — the file really does hold those bytes. What is no longer
+  true is the stronger reading, that a *marked* file holds nothing.
+- **Re-reading is free only up to the cap.** 512 files are remembered at once;
+  past that the oldest is forgotten and its ranges are refetched on next use.
 
 ---
 
@@ -1538,9 +1642,12 @@ In the interest of honesty, since this is meant to be the basis for a decision:
   - **The page-fault pre-content hooks were reverted in 6.14-rc7**, before 6.14 shipped:
     syzbot found they could fire while holding freeze protection and deadlock the HSM client.
     What ships generates **one event for the whole range at `mmap()` time**. This is what
-    `probes/mmapread.c` measured, so §8d's "a mapped read demands the whole object in one
-    event" is the shipped behaviour and not an accident of this kernel — but it also means
-    lazy per-page filling is not available to build on later.
+    `probes/mmapread.c` measured — but "the whole range" is the *mapping's* range and not
+    the object's, which that probe could not show because it mapped a small file whole.
+    `probes/bigdemand.c` separates them: a 4 KiB window mapped into a 2.77 GiB file demands
+    4096 bytes (§8d-bis). One event per mapping at `mmap()` time is the shipped behaviour and
+    not an accident of this kernel; it also means lazy per-page filling is not available to
+    build on later.
   - **`FAN_REPORT_FID` with a permission class returns `EINVAL`** in every released kernel:
     `fanotify_init` still rejects any fid mode outside `FAN_CLASS_NOTIF`. Pre-content events
     carry an fd and a `FAN_EVENT_INFO_TYPE_RANGE` record instead.

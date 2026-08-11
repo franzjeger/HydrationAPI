@@ -202,12 +202,17 @@ impl Provider for FolderCloud {
         cloud_id: &str,
         _size: u64,
         _content_tag: Option<&str>,
+        span: hydration_protocol::Span,
         out: &mut hydration_protocol::transport::Body<'_>,
     ) -> io::Result<()> {
-        // What a real provider's implementation looks like too: open the
-        // object, copy it into the sink, let the sink hold the contract.
+        // What a real provider's implementation looks like too: seek to what was
+        // asked for, copy that much into the sink, let the sink hold the
+        // contract. The seek is the whole of what serving ranges costs a
+        // provider whose objects are addressable — which is every one of them,
+        // since HTTP has had `Range` since 1997.
         let mut src = std::fs::File::open(self.object(cloud_id))?;
-        io::copy(&mut src, out)?;
+        std::io::Seek::seek(&mut src, std::io::SeekFrom::Start(span.offset))?;
+        io::copy(&mut std::io::Read::take(&mut src, span.len), out)?;
         Ok(())
     }
 }

@@ -107,6 +107,7 @@ impl Provider for Cloud {
         cloud_id: &str,
         size: u64,
         _content_tag: Option<&str>,
+        span: hydration_protocol::Span,
         out: &mut hydration_protocol::transport::Body<'_>,
     ) -> io::Result<()> {
         use std::io::Write;
@@ -120,12 +121,24 @@ impl Provider for Cloud {
         let bytes = match st.fetch.get(&obj.name) {
             // Short on purpose: the suite's 5.7 case. `Body` refuses to call it
             // finished, so this becomes an abort rather than a truncated file.
+            //
+            // Shortened against the *span*, because that is what this transfer
+            // promised. Truncating the object instead would deliver the whole
+            // span for any range that ends before the cut, and the case would
+            // stop testing anything.
             Some(FetchBehaviour::Short { bytes }) => {
-                obj.content[..(*bytes).min(obj.content.len())].to_vec()
+                let want = (*bytes as u64).min(span.len) as usize;
+                vec![b'x'; want]
             }
-            Some(FetchBehaviour::Stale { .. }) => vec![b'!'; size as usize],
-            _ => obj.content,
+            Some(FetchBehaviour::Stale { .. }) => vec![b'!'; span.len as usize],
+            // The ordinary path: the slice of the object that was asked for.
+            _ => {
+                let end = (span.end() as usize).min(obj.content.len());
+                let start = (span.offset as usize).min(end);
+                obj.content[start..end].to_vec()
+            }
         };
+        let _ = size;
         drop(st);
         out.write_all(&bytes)?;
         Ok(())

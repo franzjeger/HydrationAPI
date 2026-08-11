@@ -33,6 +33,7 @@
 //! whole suite runs on a machine with no TLS stack, no certificate store and no
 //! network.
 
+use hydration_protocol::Span;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -711,15 +712,61 @@ impl<T: TokenSource> GraphHttp<T> {
         expected: u64,
         out: &mut dyn Write,
     ) -> io::Result<()> {
+        self.download_span(key, Span::whole(expected), expected, out)
+    }
+
+    /// Stream one slice of a drive item's content.
+    ///
+    /// The same machinery, asked for less. A reader that opened a 2.77 GiB
+    /// archive to look at its header demanded 4096 bytes (§8d-bis), and this is
+    /// where that stops being 2.77 GiB of traffic held inside one `read()`.
+    ///
+    /// Ranged requests were already here — `resume_copy` has always restarted a
+    /// broken download with `Range: bytes=<offset>-` — so what is new is only
+    /// that the *end* is named too, and checked. Naming it is what turns a
+    /// resumed whole-object download into a bounded one.
+    pub fn download_span(
+        &mut self,
+        key: &crate::ObjectKey,
+        span: Span,
+        total: u64,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        if span.end() > total {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "asked for {}..{} of an item Graph reports as {total} bytes",
+                    span.offset,
+                    span.end()
+                ),
+            ));
+        }
+        // Nothing to ask for. Graph answers `bytes=0-` on an empty item with a
+        // 200 and no body, and an empty *range* request with a 416 — so the one
+        // case where the two disagree is handled here rather than by hoping.
+        if span.is_empty() {
+            return Ok(());
+        }
         let graph_url = crate::item_content_url(key);
+        let whole = span.is_whole(total);
         resume_copy(
-            expected,
+            span.len,
             out,
-            |offset, sink| {
+            |done, sink| {
+                // `done` counts bytes of *this span* already delivered; the
+                // service is asked about absolute positions in the object.
+                let from = span.offset + done;
+                let last = span.end() - 1;
                 let mut headers =
                     vec![("accept".to_string(), "application/octet-stream".to_string())];
-                if offset != 0 {
-                    headers.push(("range".to_string(), format!("bytes={offset}-")));
+                // A whole-object download from the start stays a plain GET, so
+                // the ordinary path is the one that has been exercised against
+                // the live service and the 200/redirect handling below is not
+                // reached by a new road.
+                let ranged = !whole || done != 0;
+                if ranged {
+                    headers.push(("range".to_string(), format!("bytes={from}-{last}")));
                 }
                 let mut response =
                     self.send_response(Method::Get, &graph_url, &headers, &[], true)?;
@@ -749,14 +796,19 @@ impl<T: TokenSource> GraphHttp<T> {
                         .and_then(|value| parse_retry_after(value, SystemTime::now()));
                     return Ok(DownloadAttempt::Retry(retry_after));
                 }
-                if offset == 0 && status != 200 {
+                if !ranged && status != 200 {
                     return Err(content_status(status));
                 }
-                if offset != 0 {
+                // A range that comes back as a 200 is the whole object, and
+                // copying it into a sink that promised `span.len` would overrun.
+                // Refused rather than truncated: a service that ignores `Range`
+                // cannot serve part of a large object at all, and finding that
+                // out here is better than finding it out as a stall.
+                if ranged {
                     if status != 206 {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "Graph did not honor a resumed content range",
+                            format!("Graph did not honor a content range; answered {status}"),
                         ));
                     }
                     let range = response
@@ -766,10 +818,17 @@ impl<T: TokenSource> GraphHttp<T> {
                         .ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                "Graph omitted Content-Range from a resumed download",
+                                "Graph omitted Content-Range from a ranged download",
                             )
                         })?;
-                    validate_content_range(range, offset, expected)?;
+                    // The end is checked as well as the start, which the resumed
+                    // whole-object download could not do because it asked
+                    // open-endedly. It is the check that makes a bounded request
+                    // bounded: a service answering `bytes=0-4095` with
+                    // `bytes 0-2972712959/2972712960` is offering the whole
+                    // object, and believing it would put 2.77 GiB behind a 4 KiB
+                    // read again by another route.
+                    validate_content_range(range, from, last, total)?;
                 }
                 let mut reader = response.body_mut().as_reader();
                 io::copy(&mut reader, sink)?;
@@ -891,14 +950,24 @@ fn content_status(status: u16) -> io::Error {
     io::Error::other(format!("Graph content request returned HTTP {status}"))
 }
 
-fn validate_content_range(raw: &str, expected_start: u64, expected_total: u64) -> io::Result<()> {
+fn validate_content_range(
+    raw: &str,
+    expected_start: u64,
+    expected_end: u64,
+    expected_total: u64,
+) -> io::Result<()> {
     let value = raw.strip_prefix("bytes ").ok_or_else(bad_content_range)?;
     let (span, total) = value.split_once('/').ok_or_else(bad_content_range)?;
     let (start, end) = span.split_once('-').ok_or_else(bad_content_range)?;
     let start = start.parse::<u64>().map_err(|_| bad_content_range())?;
     let end = end.parse::<u64>().map_err(|_| bad_content_range())?;
     let total = total.parse::<u64>().map_err(|_| bad_content_range())?;
-    if start != expected_start || total != expected_total || end < start || end >= total {
+    if start != expected_start
+        || end != expected_end
+        || total != expected_total
+        || end < start
+        || end >= total
+    {
         return Err(bad_content_range());
     }
     Ok(())
@@ -1154,13 +1223,31 @@ mod tests {
 
     #[test]
     fn resumed_ranges_are_bound_to_the_expected_object() {
-        validate_content_range("bytes 4-7/8", 4, 8).unwrap();
+        validate_content_range("bytes 4-7/8", 4, 7, 8).unwrap();
         for bad in ["bytes 0-7/8", "bytes 4-8/8", "bytes 4-7/9", "items 4-7/8"] {
             assert_eq!(
-                validate_content_range(bad, 4, 8).unwrap_err().kind(),
+                validate_content_range(bad, 4, 7, 8).unwrap_err().kind(),
                 io::ErrorKind::InvalidData
             );
         }
+    }
+
+    /// The check a bounded request needs and an open-ended one could not make.
+    ///
+    /// `Range: bytes=0-4095` answered with `bytes 0-2972712959/2972712960` is a
+    /// service offering the whole object instead of the four kilobytes that were
+    /// asked for. The start matches, the total matches, and only the *end* says
+    /// what is wrong — so without this the sink would be handed 2.77 GiB behind a
+    /// 4 KiB read, which is the failure §8d-bis exists to remove.
+    #[test]
+    fn a_range_answered_with_the_whole_object_is_refused() {
+        assert_eq!(
+            validate_content_range("bytes 0-2972712959/2972712960", 0, 4095, 2972712960)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        validate_content_range("bytes 0-4095/2972712960", 0, 4095, 2972712960).unwrap();
     }
 
     // --- doubles for the auth seams ----------------------------------------

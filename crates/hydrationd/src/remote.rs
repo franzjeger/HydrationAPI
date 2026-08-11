@@ -20,7 +20,7 @@
 
 use crate::daemon::Fetch;
 use hydration_protocol::transport::{HelperConn, Streamed};
-use hydration_protocol::{FetchRequest, FetchResponse, FileId, FromHelper};
+use hydration_protocol::{FetchRequest, FetchResponse, FileId, FromHelper, Span};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -58,6 +58,7 @@ impl Fetch for SocketFetch {
         &mut self,
         file: FileId,
         size: u64,
+        span: Span,
         dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
         progress: &mut dyn FnMut(u64),
     ) -> io::Result<()> {
@@ -72,26 +73,50 @@ impl Fetch for SocketFetch {
             ));
         }
 
+        // A span outside the object cannot be honoured and must not be asked
+        // for: the daemon would be told to seek past the end of its own object
+        // and would answer with whatever its provider made of that. The worker
+        // clamps before it gets here; this is the check on the side that has to
+        // live with being wrong, in the same spirit as the length check below.
+        if span.end() > size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "asked for {}..{} of a placeholder that is {size} bytes",
+                    span.offset,
+                    span.end()
+                ),
+            ));
+        }
+
         let id = self.next_id;
         self.next_id += 1;
 
         self.conn.send(&FromHelper::Fetch(FetchRequest {
             id,
             file,
-            offset: 0,
-            // v1 fetches whole objects. The event's range is a *demand* rather
-            // than a hint (§8d) — answering with less than it asks for hands the
-            // reader zeros — so serving ranges is a real feature and not a
-            // shortcut, and it is deliberately not in this change.
-            len: size,
+            // Exactly what the reader demanded. Sending `0..size` regardless was
+            // v1's behaviour and the reason a 4 KiB read of a multi-gigabyte
+            // object could not be served at all (§8d-bis).
+            offset: span.offset,
+            len: span.len,
             cgroup: None,
         }))?;
 
-        // `size` comes from the filesystem, not from the daemon: the length the
-        // body may be is decided here, before anything is read. The helper's own
+        // The length the body may be is decided here, from the span this helper
+        // asked for — never from something the daemon says. The helper's own
         // `MAX_OBJECT` bounds it besides, because the delta pass's limit runs on
         // the side §6b assumes may be compromised.
-        match self.conn.recv_streamed(id, size, dest, progress)? {
+        //
+        // `recv_streamed` reports offsets from the start of the body, and the
+        // worker writes them straight into the file, so the span's own offset has
+        // to be added here. Getting this wrong writes the right bytes to the
+        // wrong place, which is the quietest failure available.
+        let mut place = |buf: &[u8], at: u64| dest(buf, span.offset + at);
+        match self
+            .conn
+            .recv_streamed(id, span.len, &mut place, progress)?
+        {
             Streamed::Complete => Ok(()),
             Streamed::Aborted { errno, reason } => Err(io::Error::new(
                 io::Error::from_raw_os_error(errno).kind(),

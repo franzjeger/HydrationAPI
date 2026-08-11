@@ -503,8 +503,11 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                                 // changes the framework deliberately refused to
                                 // apply because local work would have been lost,
                                 // and they are what a conflict UI is for.
-                                for p in &a.kept_local {
-                                    eprintln!("hydration-sync:   kept local copy of {p}");
+                                for k in &a.kept_local {
+                                    eprintln!(
+                                        "hydration-sync:   kept local copy of {}: {}",
+                                        k.path, k.why
+                                    );
                                 }
                                 for p in &a.failed {
                                     eprintln!("hydration-sync:   could not apply {p}");

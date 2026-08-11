@@ -375,6 +375,69 @@ pub mod names {
     }
 }
 
+/// The slice of an object a transfer is responsible for.
+///
+/// Exists so that "the whole object" and "the range this reader demanded" are
+/// the same type rather than two conventions about what a bare `size` argument
+/// means. Every signature that used to take one `size` now takes the object's
+/// size *and* a span, because both are needed and for different things: the size
+/// is what the placeholder promised and what a whole-object content hash is
+/// computed over, the span is what must actually arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Span {
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl Span {
+    pub const fn new(offset: u64, len: u64) -> Self {
+        Self { offset, len }
+    }
+
+    /// The span covering an entire object.
+    pub const fn whole(size: u64) -> Self {
+        Self {
+            offset: 0,
+            len: size,
+        }
+    }
+
+    /// One past the last byte.
+    pub const fn end(&self) -> u64 {
+        self.offset.saturating_add(self.len)
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether this span is the whole of an object of `size` bytes.
+    ///
+    /// The distinction is not cosmetic. A provider can verify a whole-object
+    /// content hash and cannot verify a range against one, so this is the
+    /// predicate that decides whether the integrity check in a provider is
+    /// available at all.
+    pub const fn is_whole(&self, size: u64) -> bool {
+        self.offset == 0 && self.len == size
+    }
+
+    /// Cut the span down to what actually exists.
+    ///
+    /// The kernel's demand is page-aligned, so the last one in a file whose size
+    /// is not a multiple of the page size asks for bytes past the end. Serving
+    /// them is impossible and refusing them would fail every read of the tail of
+    /// almost every file, so the span is clamped and the reader gets the part
+    /// that exists — which is exactly what a read of a fully present file
+    /// returns.
+    pub fn clamped_to(self, size: u64) -> Self {
+        let offset = self.offset.min(size);
+        Self {
+            offset,
+            len: self.end().min(size).saturating_sub(offset),
+        }
+    }
+}
+
 /// Identifies a file without naming it.
 ///
 /// A path would be a destination, and destinations are the privileged side's
@@ -392,11 +455,25 @@ pub struct FetchRequest {
     /// Correlates the response. Monotonic per connection.
     pub id: u64,
     pub file: FileId,
-    /// The byte range the kernel asked about.
+    /// The byte range that must be delivered — a contract, not advice.
     ///
-    /// Treated as advice, not a contract: the measured range is the readahead
-    /// window, not what the application asked for, and overlapping repeats are
-    /// normal. v1 fetches whole files and ignores this beyond logging.
+    /// This field carried the opposite comment until `probes/bigdemand.c` was
+    /// run: it said the range was the readahead window rather than what the
+    /// application asked for, so v1 ignored it and fetched whole objects. Both
+    /// halves of that were wrong. `count` is what the reader demanded (§8d), and
+    /// on an object big enough for the two to differ it is *only* what the
+    /// reader demanded — a 4 KiB `read()` of a 2.77 GiB file asks for 4096
+    /// bytes, not for 2.77 GiB (§8d-bis).
+    ///
+    /// Fetching the whole object for such a read is what made a multi-gigabyte
+    /// file unreadable: the transfer could not finish inside the deadlines, so
+    /// the reader got `EIO` after a minute of waiting for bytes it had not asked
+    /// for.
+    ///
+    /// The daemon must deliver exactly `len` bytes starting at `offset`.
+    /// Delivering fewer is an abort, not a short success — answering the event
+    /// after filling less than it demanded hands the reader zeros with no error
+    /// (§8d).
     pub offset: u64,
     pub len: u64,
     /// Who is reading, for the hydration policy in §6c. A cgroup path rather

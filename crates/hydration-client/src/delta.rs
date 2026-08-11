@@ -71,6 +71,60 @@ pub trait Materialise: Send {
     fn remove(&mut self, path: &Path) -> io::Result<()>;
 }
 
+/// A change that was refused, and which of the four rules refused it.
+///
+/// The reason used to be dropped on the floor, and a live account showed why that
+/// was not good enough: a 2.77 GiB file logged `kept local copy of …` on every
+/// pass, indefinitely, and the line said nothing that could be acted on. Every
+/// condition below evaluates cleanly against a file from outside — the stamp
+/// matched, the cloud id was present, the queue was empty — so from the log alone
+/// there was no way to tell which rule was firing, or whether the refusal was
+/// protecting anything at all.
+///
+/// "Never invent a diagnostic" cuts both ways: a diagnostic that names no cause
+/// is one the reader has to invent for themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    /// As the change named it, so it can be matched against the service's view.
+    pub path: String,
+    pub why: Why,
+}
+
+/// Why a change was not applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// An edit is queued for upload. It is newer than anything the cloud can say
+    /// and exists nowhere else.
+    EditWaiting,
+    /// Local content with no cloud id: never uploaded, so there is no remote copy
+    /// to fall back on.
+    NeverUploaded,
+    /// The file no longer looks the way the framework left it, so somebody wrote
+    /// to it and we were not told.
+    ChangedUnderneath,
+}
+
+impl std::fmt::Display for Why {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EditWaiting => write!(f, "an edit is waiting to be uploaded"),
+            Self::NeverUploaded => write!(f, "it has never been uploaded"),
+            Self::ChangedUnderneath => {
+                write!(f, "it has changed since the framework last wrote it")
+            }
+        }
+    }
+}
+
+impl Kept {
+    pub fn new(path: &str, why: Why) -> Self {
+        Self {
+            path: path.to_string(),
+            why,
+        }
+    }
+}
+
 /// What a delta pass did, for the status a user is shown.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Applied {
@@ -82,7 +136,7 @@ pub struct Applied {
     pub moved: usize,
     /// Changes deliberately not applied because local content would have been
     /// lost. Not an error, and not silent: these are what a conflict UI is for.
-    pub kept_local: Vec<String>,
+    pub kept_local: Vec<Kept>,
     pub failed: Vec<String>,
     /// At least one failure could succeed on a later pass — a rename blocked by
     /// a destination that another change will free, most often.
@@ -217,7 +271,7 @@ pub fn apply<M: Materialise>(
                         // would throw away work that exists nowhere else — the
                         // one outcome this framework must never produce.
                         if waiting.contains(&id) {
-                            out.kept_local.push(path.clone());
+                            out.kept_local.push(Kept::new(path, Why::EditWaiting));
                             continue;
                         }
                         // Local content that has never been uploaded is in the
@@ -238,7 +292,7 @@ pub fn apply<M: Materialise>(
                             .flatten()
                             .filter(|v| !v.is_empty());
                         if known.is_none() && md.len() > 0 {
-                            out.kept_local.push(path.clone());
+                            out.kept_local.push(Kept::new(path, Why::NeverUploaded));
                             continue;
                         }
                         // And the queue is not enough on its own.
@@ -259,7 +313,7 @@ pub fn apply<M: Materialise>(
                             hydration_protocol::stamp::state(&abs),
                             Ok(hydration_protocol::stamp::State::Dirty)
                         ) {
-                            out.kept_local.push(path.clone());
+                            out.kept_local.push(Kept::new(path, Why::ChangedUnderneath));
                             continue;
                         }
                         // Nothing to do is the common case, and doing something
@@ -299,7 +353,10 @@ pub fn apply<M: Materialise>(
                 // delete, because the edit is the newer intention *here* and
                 // nothing else has a copy of it.
                 if waiting.contains(&id) {
-                    out.kept_local.push(entry.path.display().to_string());
+                    out.kept_local.push(Kept::new(
+                        &entry.path.display().to_string(),
+                        Why::EditWaiting,
+                    ));
                     continue;
                 }
                 // Same check as the upsert side, for the same reason: a delete
@@ -309,7 +366,10 @@ pub fn apply<M: Materialise>(
                     hydration_protocol::stamp::state(&entry.path),
                     Ok(hydration_protocol::stamp::State::Dirty)
                 ) {
-                    out.kept_local.push(entry.path.display().to_string());
+                    out.kept_local.push(Kept::new(
+                        &entry.path.display().to_string(),
+                        Why::ChangedUnderneath,
+                    ));
                     continue;
                 }
                 match mat.remove(&entry.path) {

@@ -51,12 +51,18 @@ impl Provider for Fake {
         _cloud_id: &str,
         _size: u64,
         _content_tag: Option<&str>,
+        span: hydration_protocol::Span,
         out: &mut hydration_protocol::transport::Body<'_>,
     ) -> io::Result<()> {
         use std::io::Write;
+        let slice = {
+            let end = (span.end() as usize).min(self.body.len());
+            let start = (span.offset as usize).min(end);
+            self.body[start..end].to_vec()
+        };
         let body = match self.truncate_to {
-            Some(n) => self.body[..n.min(self.body.len())].to_vec(),
-            None => self.body.clone(),
+            Some(n) => slice[..n.min(slice.len())].to_vec(),
+            None => slice,
         };
         // A short body is written and then simply not finished; `Body` turns
         // that into an abort rather than a truncated file, which is §5.7 moved

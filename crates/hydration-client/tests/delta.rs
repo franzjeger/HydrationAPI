@@ -4,7 +4,7 @@
 //! local copy is the truth. A delta pass may create and may refresh, but it must
 //! never replace content that exists nowhere else.
 
-use hydration_client::delta::{apply, Applied, Change, Materialise};
+use hydration_client::delta::{apply, Applied, Change, Kept, Materialise, Why};
 use hydration_client::store::{self, Store};
 use hydration_client::upload::{Queue, TestClock};
 use hydration_protocol::FileId;
@@ -129,7 +129,11 @@ fn an_unsent_local_edit_is_never_replaced_by_the_cloud_version() {
     let mut m = Recorder::default();
     let out = run(&dir, &[upserted("notes.txt", 9, "cloud-1")], &q, &mut m);
 
-    assert_eq!(out.kept_local, vec!["notes.txt".to_string()], "{out:?}");
+    assert_eq!(
+        out.kept_local,
+        vec![Kept::new("notes.txt", Why::EditWaiting)],
+        "{out:?}"
+    );
     assert_eq!(out.updated, 0);
     assert!(m.placed.is_empty(), "the local edit was overwritten");
     assert_eq!(
@@ -151,7 +155,11 @@ fn local_content_that_was_never_uploaded_is_kept() {
     let mut m = Recorder::default();
     let out = run(&dir, &[upserted("draft.md", 5, "cloud-9")], &q, &mut m);
 
-    assert_eq!(out.kept_local, vec!["draft.md".to_string()], "{out:?}");
+    assert_eq!(
+        out.kept_local,
+        vec![Kept::new("draft.md", Why::NeverUploaded)],
+        "{out:?}"
+    );
     assert_eq!(std::fs::read(&p).unwrap(), b"written offline, never sent");
 }
 
@@ -302,7 +310,11 @@ fn an_edit_nobody_reported_is_still_not_overwritten() {
 
     assert_eq!(
         out.kept_local,
-        vec!["doc.txt".to_string()],
+        // The reason matters as much as the refusal: this file is protected by
+        // the stamp check and by nothing else, because no event was ever
+        // delivered for the edit. A pass that refused it for some other reason
+        // would leave that gap open and still pass an assertion on the path.
+        vec![Kept::new("doc.txt", Why::ChangedUnderneath)],
         "a delta pass overwrote an edit it had not been told about: {out:?}"
     );
     assert_eq!(

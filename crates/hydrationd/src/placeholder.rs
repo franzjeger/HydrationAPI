@@ -300,12 +300,27 @@ fn unmark_fd(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
 
 /// Punch a file's content away through an already-open fd.
 pub fn punch_fd(fd: std::os::fd::BorrowedFd<'_>, len: u64) -> io::Result<()> {
+    punch_range_fd(fd, 0, len)
+}
+
+/// Punch away one range, leaving the rest of the file alone.
+///
+/// What a failed *ranged* fill rolls back. Punching the whole file would also be
+/// correct — nothing is lost that cannot be fetched again — but it throws away
+/// every other range the worker has already paid for, so a transient error two
+/// gigabytes into a sequential read would restart the whole file. The narrower
+/// rollback is safe for the same reason the wide one is: the placeholder mark
+/// stays set either way, so nothing is served from this file without asking.
+pub fn punch_range_fd(fd: std::os::fd::BorrowedFd<'_>, offset: u64, len: u64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
+    if len == 0 {
+        return Ok(());
+    }
     let rc = unsafe {
         libc::fallocate(
             fd.as_raw_fd(),
             PUNCH_HOLE | KEEP_SIZE,
-            0,
+            offset as libc::off_t,
             len as libc::off_t,
         )
     };
@@ -450,6 +465,34 @@ pub fn finish_hydration(fd: std::os::fd::BorrowedFd<'_>, expected: u64) -> io::R
         Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
         Err(e) => return Err(e),
     }
+    let _ = hydration_protocol::stamp::write_fd(fd);
+    Ok(())
+}
+
+/// Make a range that has just been filled durable, without finishing the file.
+///
+/// The counterpart of [`finish_hydration`] for a fill that covered only what a
+/// reader demanded (§8d-bis). It does the two things that must happen before the
+/// event is answered, and deliberately not the two that must not:
+///
+/// * **fsync**, because the reader is about to be allowed and the bytes have to
+///   be there.
+/// * **the stamp**, because we just moved the file's mtime. Left unstamped, a
+///   resync walk reads the fill as the user's own edit and queues the file for
+///   upload — where uploading it reads it, and reading it hydrates it. The loop
+///   is the one `hydrate_fd`'s rollback path already had to be taught about.
+///
+/// It does *not* clear the placeholder mark, and it does not clear `nodump`. The
+/// file still has holes in it; saying otherwise would let the next reader be
+/// served the parts that are not there.
+pub fn settle_range(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::fsync(fd.as_raw_fd()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Failing to stamp is not a failed fill: the content is in place and the
+    // reader is entitled to it. It costs an unnecessary upload later, which is
+    // the harmless direction — the same judgement `hydrate_fd` makes.
     let _ = hydration_protocol::stamp::write_fd(fd);
     Ok(())
 }

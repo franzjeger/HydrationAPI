@@ -20,7 +20,7 @@ pub mod store;
 pub mod upload;
 
 use hydration_protocol::transport::{Body, DaemonConn};
-use hydration_protocol::{FetchResponse, FileId, FromHelper};
+use hydration_protocol::{FetchResponse, FileId, FromHelper, Span};
 use std::io;
 use std::path::Path;
 
@@ -35,7 +35,7 @@ pub use store::{Entry, Store};
 /// get right on its own. What is left is the part only the client knows: how to
 /// talk to its service.
 pub trait Provider: Send {
-    /// Write the whole object into `out`.
+    /// Write `span` of the object into `out`.
     ///
     /// Streamed rather than returned, because the previous shape — hand back a
     /// `Vec` — made the object's size the memory cost *and* required the whole
@@ -43,31 +43,49 @@ pub trait Provider: Send {
     /// seconds of bandwidth was unservable, and its failure took the mount with
     /// it (§8d).
     ///
+    /// `span` is what a reader actually demanded, and it is usually far smaller
+    /// than the object: opening a 2.77 GiB archive to look at its header is a
+    /// 4096-byte demand (§8d-bis). Serving the whole object instead is not a
+    /// harmless over-delivery — [`Body`] refuses the extra bytes, and before it
+    /// did, the transfer could not finish inside the deadlines and the read
+    /// failed.
+    ///
     /// [`Body`] holds the promise made on the wire and will not let it be
-    /// broken: writing past the object's size fails at that byte, and finishing
+    /// broken: writing past the span's length fails at that byte, and finishing
     /// short is an abort rather than a truncation. So the whole of a correct
     /// implementation is usually
     ///
     /// ```ignore
-    /// fn fetch(&mut self, id: &str, _size: u64, _tag: Option<&str>, out: &mut Body<'_>) -> io::Result<()> {
-    ///     let mut body = self.http.get(self.url(id)).send()?;
+    /// fn fetch(&mut self, id: &str, _size: u64, _tag: Option<&str>, span: Span, out: &mut Body<'_>) -> io::Result<()> {
+    ///     let mut body = self.http.get(self.url(id))
+    ///         .header("range", format!("bytes={}-{}", span.offset, span.end() - 1))
+    ///         .send()?;
     ///     std::io::copy(&mut body, out)?;
     ///     Ok(())
     /// }
     /// ```
     ///
+    /// A service with no ranged reads can still implement this by fetching the
+    /// object and writing only the span out of it — correct, and no worse than
+    /// what every fetch did before ranges existed.
+    ///
     /// Returning `Err` abandons the transfer; the placeholder is put back
     /// exactly as it was and the reader gets an error rather than a short file
     /// (§5.7).
     ///
+    /// `size` is the whole object's size even when `span` is a slice of it, and
     /// `content_tag` is the exact version marker recorded when the placeholder
     /// was installed. Providers whose tag format is a content hash must verify
-    /// it before returning success; opaque version tags may be ignored here.
+    /// it before returning success **when the span is the whole object**
+    /// (`span.is_whole(size)`); a range cannot be checked against a whole-object
+    /// hash, and pretending otherwise would be a verification that never runs.
+    /// Opaque version tags may be ignored here.
     fn fetch(
         &mut self,
         cloud_id: &str,
         size: u64,
         content_tag: Option<&str>,
+        span: Span,
         out: &mut Body<'_>,
     ) -> io::Result<()>;
 }
@@ -176,14 +194,38 @@ impl<P: Provider> Daemon<P> {
             match msg {
                 FromHelper::Fetch(req) => match self.resolve_or_rescan(req.file) {
                     Ok((cloud_id, size, content_tag)) => {
-                        // The length is declared from the placeholder, which we
-                        // already know — never from something the provider has
-                        // yet to deliver. `Body` then holds it to that.
-                        let mut body = conn.begin(req.id, size)?;
+                        let span = Span::new(req.offset, req.len);
+                        // A request that runs off the end of what we believe the
+                        // object to be is refused rather than clamped.
+                        //
+                        // The two sides can genuinely disagree — the helper reads
+                        // the placeholder's current length, this index was built
+                        // by a walk that may predate a resize — and silently
+                        // serving a shorter range would answer the event with
+                        // less than it demanded, which hands the reader zeros
+                        // (§8d). An error puts the disagreement in front of
+                        // somebody instead.
+                        if span.end() > size {
+                            conn.send(FetchResponse::Failed {
+                                id: req.id,
+                                errno: libc::EIO,
+                                reason: format!(
+                                    "asked for {}..{} of an object this daemon has as {size} bytes",
+                                    span.offset,
+                                    span.end()
+                                ),
+                            })?;
+                            continue;
+                        }
+                        // The length is declared from the span the helper asked
+                        // for — never from something the provider has yet to
+                        // deliver. `Body` then holds it to that.
+                        let mut body = conn.begin(req.id, span.len)?;
                         match self.provider.fetch(
                             &cloud_id,
                             size,
                             content_tag.as_deref(),
+                            span,
                             &mut body,
                         ) {
                             Ok(()) => {

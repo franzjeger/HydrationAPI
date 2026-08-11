@@ -96,6 +96,7 @@ run hydrationd exposure
 run hydrationd selfcheck
 run hydrationd placeholder_creation
 run hydrationd deadlines
+run hydrationd ranges
 run adapter-framework conformance
 
 echo

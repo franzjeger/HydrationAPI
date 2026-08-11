@@ -18,7 +18,7 @@
 //!   1. the worker gives up on a fetch and answers `EIO` itself, and
 //!   2. the supervisor notices a worker that has stopped answering at all.
 
-use hydration_protocol::FileId;
+use hydration_protocol::{FileId, Span};
 use hydrationd::daemon::{spawn_split, Fetch, FetchWhole, Handled, Worker};
 use hydrationd::fanotify::Group;
 use hydrationd::placeholder;
@@ -555,17 +555,18 @@ fn a_slow_but_steady_transfer_completes_past_the_first_byte_deadline() {
         fn fetch_into(
             &mut self,
             _file: FileId,
-            size: u64,
+            _size: u64,
+            span: Span,
             dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
             progress: &mut dyn FnMut(u64),
         ) -> io::Result<()> {
             let chunk = vec![b'H'; 512 * 1024];
-            let mut off = 0u64;
-            while off < size {
-                let n = chunk.len().min((size - off) as usize);
-                dest(&chunk[..n], off)?;
-                off += n as u64;
-                progress(off);
+            let mut done = 0u64;
+            while done < span.len {
+                let n = chunk.len().min((span.len - done) as usize);
+                dest(&chunk[..n], span.offset + done)?;
+                done += n as u64;
+                progress(done);
                 std::thread::sleep(Duration::from_millis(400));
             }
             Ok(())
@@ -657,7 +658,8 @@ fn an_abandoned_transfer_cannot_write_into_the_next_file() {
         fn fetch_into(
             &mut self,
             _file: FileId,
-            size: u64,
+            _size: u64,
+            span: Span,
             dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
             progress: &mut dyn FnMut(u64),
         ) -> io::Result<()> {
@@ -666,9 +668,9 @@ fn an_abandoned_transfer_cannot_write_into_the_next_file() {
                 // Long enough that the worker gives up and answers the reader.
                 std::thread::sleep(Duration::from_secs(4));
             }
-            let buf = vec![if first { b'A' } else { b'B' }; size as usize];
-            dest(&buf, 0)?;
-            progress(size);
+            let buf = vec![if first { b'A' } else { b'B' }; span.len as usize];
+            dest(&buf, span.offset)?;
+            progress(span.len);
             Ok(())
         }
     }
@@ -745,12 +747,13 @@ fn a_fetch_that_delivers_short_and_claims_success_is_refused() {
         fn fetch_into(
             &mut self,
             _file: FileId,
-            size: u64,
+            _size: u64,
+            span: Span,
             dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
             progress: &mut dyn FnMut(u64),
         ) -> io::Result<()> {
-            let half = (size / 2) as usize;
-            dest(&vec![b'H'; half], 0)?;
+            let half = (span.len / 2) as usize;
+            dest(&vec![b'H'; half], span.offset)?;
             progress(half as u64);
             Ok(())
         }
