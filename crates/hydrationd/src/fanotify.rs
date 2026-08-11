@@ -240,13 +240,38 @@ impl Group {
 }
 
 /// One decoded event.
-#[derive(Debug, Clone)]
+///
+/// Deliberately not `Clone`: an event carries descriptors the kernel handed over
+/// exactly once, and a copy would mean two owners of the same fd number.
+#[derive(Debug)]
 pub struct Event {
     pub mask: u64,
     pub fd: i32,
     pub pid: i32,
     pub range: Option<(u64, u64)>,
-    pub pidfd: Option<i32>,
+    /// The reader's pidfd, when the group asked for one — and **owned**, so
+    /// dropping the event closes it.
+    ///
+    /// A raw number here was a descriptor leak, and a slow one, which is the
+    /// kind that survives review. The worker is a long-lived root process that
+    /// answers an event per read; the pidfd was closed at exactly one point,
+    /// inside the cgroup lookup, and every decision that returned before
+    /// reaching it — content already present, an unreadable mark, an empty
+    /// unnamed placeholder — dropped the number on the floor. The commonest
+    /// read on the system takes that first branch: every hydrated file's first
+    /// read after a restart, and *every* read of a file whose mark someone
+    /// stripped, because that case deliberately declines to install the ignore
+    /// mark that would suppress the next event. A reader in a loop over such a
+    /// file walks the worker into `EMFILE`, at which point it can no longer open
+    /// anything and the mount serves `EIO` — the fail-closed path, reached for
+    /// no reason at all.
+    ///
+    /// `OwnedFd` is what makes that unrepeatable rather than merely fixed: the
+    /// close is the drop, so a new early return in a decision function cannot
+    /// leak, and neither can an event a loop discards without handling — which
+    /// is what the supervisor's post-mortem deny loop does to every event that
+    /// arrives after the worker is gone.
+    pub pidfd: Option<OwnedFd>,
     pub mnt_id: Option<u64>,
 }
 
@@ -290,9 +315,19 @@ pub fn events(buf: &[u8], len: usize) -> Vec<Event> {
                     ev.range = Some((offset, count));
                 }
                 FAN_EVENT_INFO_TYPE_PIDFD if hlen >= 8 => {
-                    ev.pidfd = Some(i32::from_ne_bytes(
-                        buf[rec + 4..rec + 8].try_into().unwrap(),
-                    ));
+                    let raw = i32::from_ne_bytes(buf[rec + 4..rec + 8].try_into().unwrap());
+                    // The field is not always a descriptor. The kernel writes
+                    // `FAN_NOPIDFD` (-1) when the process behind the event is
+                    // already gone, and `FAN_EPIDFD` (-2) when creating the
+                    // pidfd failed; both are reports, not fds. Taking ownership
+                    // of one would be unsound as well as wrong — `OwnedFd` uses
+                    // -1 as the niche that makes `Option<OwnedFd>` free.
+                    if raw >= 0 {
+                        // SAFETY: the kernel created this descriptor for this
+                        // event and nothing else in this process refers to it,
+                        // so ownership transfers here exactly once.
+                        ev.pidfd = Some(unsafe { OwnedFd::from_raw_fd(raw) });
+                    }
                 }
                 FAN_EVENT_INFO_TYPE_MNT if hlen >= 16 => {
                     ev.mnt_id = Some(u64::from_ne_bytes(
@@ -313,6 +348,84 @@ pub fn events(buf: &[u8], len: usize) -> Vec<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One synthetic pre-content event carrying a pidfd record and nothing else.
+    ///
+    /// Hand-built because the alternative — a real event — needs a marked mount
+    /// and `CAP_SYS_ADMIN`, and the thing under test here is the decoder's
+    /// ownership rule, which is the same whoever filled the buffer.
+    fn one_pidfd_event(pidfd: RawFd) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&32u32.to_ne_bytes()); // event_len: 24 + one 8-byte record
+        buf.push(3); // vers
+        buf.push(0); // reserved
+        buf.extend_from_slice(&24u16.to_ne_bytes()); // metadata_len
+        buf.extend_from_slice(&FAN_PRE_ACCESS.to_ne_bytes());
+        buf.extend_from_slice(&FAN_NOFD.to_ne_bytes()); // fd: not what this test is about
+        buf.extend_from_slice(&1i32.to_ne_bytes()); // pid
+        buf.push(FAN_EVENT_INFO_TYPE_PIDFD);
+        buf.push(0); // pad
+        buf.extend_from_slice(&8u16.to_ne_bytes()); // record len
+        buf.extend_from_slice(&pidfd.to_ne_bytes());
+        assert_eq!(buf.len(), 32);
+        buf
+    }
+
+    #[test]
+    fn dropping_an_event_closes_the_pidfd_the_kernel_handed_over() {
+        // The worker answers an event per read and lives for as long as the
+        // mount does, so a descriptor it forgets once per read is a descriptor
+        // it runs out of. This is the check that the decoder — not each of the
+        // decision function's exit paths — is what owns the pidfd.
+        let mut ends = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "pipe");
+        let (read_end, write_end) = (ends[0], ends[1]);
+
+        let evs = events(&one_pidfd_event(write_end), 32);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(
+            evs[0].pidfd.as_ref().map(|f| f.as_raw_fd()),
+            Some(write_end),
+            "the record was not decoded as a descriptor at all"
+        );
+
+        drop(evs);
+
+        // Asked of the pipe rather than of the fd number, and that is the whole
+        // reason a pipe is here: `fcntl(number)` after the drop would be
+        // answering about whichever thread in this binary opened something in
+        // between, and would report a leak as a pass. Whether the write end is
+        // closed is a fact about the pipe that no other thread can forge.
+        let mut pfd = libc::pollfd {
+            fd: read_end,
+            events: 0, // POLLHUP is reported regardless of what was requested
+            revents: 0,
+        };
+        let n = unsafe { libc::poll(&mut pfd, 1, 1000) };
+        unsafe { libc::close(read_end) };
+        assert!(
+            n == 1 && (pfd.revents & libc::POLLHUP) != 0,
+            "the pipe's write end outlived the event that owned it: poll returned \
+             {n}, revents {:#x} — the pidfd leaked",
+            pfd.revents
+        );
+    }
+
+    #[test]
+    fn a_pidfd_the_kernel_could_not_make_is_not_taken_as_one() {
+        // FAN_NOPIDFD (-1) means the reader was already gone; FAN_EPIDFD (-2)
+        // means creating it failed. Both arrive in the field a descriptor
+        // usually occupies, and owning either would be unsound: -1 is the niche
+        // `Option<OwnedFd>` is built on.
+        for sentinel in [FAN_NOFD, -2] {
+            let evs = events(&one_pidfd_event(sentinel), 32);
+            assert_eq!(evs.len(), 1);
+            assert!(
+                evs[0].pidfd.is_none(),
+                "{sentinel} was decoded as a descriptor"
+            );
+        }
+    }
 
     #[test]
     fn deny_with_encodes_the_errno_where_the_kernel_looks() {
