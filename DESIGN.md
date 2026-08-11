@@ -1577,6 +1577,83 @@ does not see is the modification, because no released kernel has a pre-modify ev
 
 ---
 
+## 8d-ter. What a fetch costs, and the amplification that was not there
+
+Ranged hydration made small reads of large files possible and made *sequential*
+reading of them unusable: Ark listing a 2.77 GiB `tar.gz` — which decompresses the
+whole stream, so it reads straight through — moved at 0.27 MB/s and needed about
+three hours. Alongside it, the sync daemon's `rchar` grew at 11.35 MB/s. The
+apparent conclusion was a 42x read amplification: bytes were being fetched and
+thrown away, presumably because `Range` did not survive Graph's `/content`
+redirect and every request was downloading from offset 0.
+
+**None of that was happening.** Measured with `probes/fetchrate.sh`, on the live
+account, 16 MiB read from a region of the object not yet present, one span size
+per row — wire from the kernel's per-socket TCP accounting for the daemon,
+landed from the file's extent map:
+
+```
+span       landed    secs    MiB/s   wire/landed
+128 KiB     23.88    29.3     0.82         1.023
+1 MiB       23.00     4.3     5.31         1.004
+2 MiB       22.00     3.0     7.36         1.003
+4 MiB       20.00     1.6    12.25         1.002
+8 MiB       16.00     0.8    19.79         1.002
+16 MiB      16.00     0.7    23.77         1.002
+32 MiB      16.00     0.6    26.37         1.002
+```
+
+Every byte that crossed the wire landed in the file, at every span size. The few
+per cent at 128 KiB is per-request overhead — TLS records, headers, the redirect
+response — spread over 191 requests; it varies with connection churn between runs
+and collapses to 0.2% once the requests are large, which is the shape overhead
+has and not the shape waste has.
+
+**Both figures behind the 42x were measurement errors, and each has bitten
+before.**
+
+- **`rchar` is not network traffic.** `tree.json` is 59,483,205 bytes and
+  `run_round` re-reads it once per round, on a 5-second round: 11.35 MiB/s, out
+  of the page cache. Sampled with nothing hydrating at all, the daemon's `rchar`
+  grew by 178,464,537 bytes in 20.00 s — exactly three times `tree.json`, to
+  within the token file. This is the second time this same number has been read
+  as a download: the first was during the initial live run, when it was reported
+  as "26 GB/hour against the tenant" and turned out to be the same file being
+  re-read. It is written down here because it was not written down then.
+- **The interface counter is not this process's traffic.** On the machine this
+  was measured on, a browser, Teams and Steam were between them pulling 674 kB/s
+  while the mount was idle — larger than the signal, and enough to produce an
+  amplification below 1.0, which is impossible and was the clue.
+
+So the fetch path was never wasteful. What it was, was **latency-bound**: about
+160 ms of fixed cost per fetch whatever its size, consistent with Graph answering
+`/content` with a redirect so that every span pays an API round trip before a
+byte of it moves — the daemon's sockets show one request to Graph and one to the
+storage host per span. At 128 KiB that fixed cost is 96% of the transfer, which
+is the whole of the 0.27 MB/s.
+
+The answer is therefore to ask for more per fetch, not to waste less, and that is
+what `daemon::READAHEAD` does. Two things follow that are worth keeping in view.
+
+- **Readahead may not decide whether a read succeeds.** Widening puts speculative
+  bytes into the same transfer as the demanded ones, so a failure in the window
+  would fail a read the service could have served — an optimisation paying for
+  itself in correctness. When a widened span fails, the demanded part is asked
+  for again on its own, and only that second answer decides the reader's outcome.
+  `ranges::a_readahead_that_fails_still_serves_what_the_reader_asked_for`.
+- **The window is also how long one `read()` blocks.** 8 MiB is the knee of the
+  table above — 24x of the 32x on offer — and the shortest span that gets most of
+  it. That reasoning is about a link delivering ~35 MB/s; on a much slower one the
+  fixed cost matters less and the blocking matters more, and the constant should
+  be revisited rather than inherited.
+
+Still open: a sequential read of content that is *already present* costs about
+61 ms per read, because the file keeps its mark until every byte is there and so
+every read fires an event. Past some fraction held, fetching the remainder and
+dropping the mark likely beats answering thousands more events.
+
+---
+
 ## 9. What I did not get verified
 
 There is no reconnection in the process. A client restart survives by the pair being

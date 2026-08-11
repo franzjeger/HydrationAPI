@@ -816,11 +816,18 @@ impl<F: Fetch + 'static> Worker<F> {
         // is what the kernel means by omitting it — a group that did not ask for
         // `FAN_REPORT_FD_ERROR` gets no range and the whole file is implied — and
         // it is also the safe direction to be wrong in.
-        let mut want = ev
+        //
+        // Kept for the whole of this function under its own name, because
+        // readahead widens `want` below and the two then mean different things:
+        // `want` is what will be fetched, `demanded` is what must arrive for the
+        // event to be answered. Only the second one may decide whether a reader
+        // gets `EIO`.
+        let demanded = ev
             .range
             .map(|(off, count)| Span::new(off, count))
             .unwrap_or_else(|| Span::whole(size))
             .clamped_to(size);
+        let mut want = demanded;
 
         // What is already there, and whether we are entitled to believe it.
         let witness = match partial::Witness::of(borrowed) {
@@ -899,51 +906,53 @@ impl<F: Fetch + 'static> Worker<F> {
         // their own, and no bystander can observe the half-filled file, because
         // their own event queues behind the one being served. That is what makes
         // filling incrementally safe rather than merely convenient.
-        let limits = self.limits;
         let named = path
             .as_deref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| format!("inode {}", id.ino));
         for span in missing {
-            let in_flight = self.in_flight.clone();
-            let mut alive = move || in_flight.working();
-            let mut say = |got: u64, owed: u64| {
-                let pct = got.saturating_mul(100).checked_div(owed).unwrap_or(100);
-                eprintln!(
-                    "[worker] hydrating {named}: {got} of {owed} bytes ({pct}%) \
-                     at offset {}",
-                    span.offset
-                );
+            let Err(e) = self.transfer(id, size, span, ev.fd, &named) else {
+                have.add(span);
+                continue;
             };
-            let outcome = self
-                .fetch
-                .run(id, size, span, ev.fd, limits, &mut alive, &mut say);
-            if let Err(e) = outcome {
-                // What arrived for *this* span is punched back out, so no reader
-                // can be served a part of a range as though it were the whole of
-                // one — answering `FAN_ALLOW` with less than the event demanded
-                // hands them zeros in silence (§8d). Ranges filled earlier are
-                // kept: they are complete, they are ours, and throwing them away
-                // would restart a sequential read from the beginning over one
-                // transient error.
-                let _ = placeholder::punch_range_fd(borrowed, span.offset, span.len);
-                let _ = hydration_protocol::stamp::write_fd(borrowed);
-                match partial::Witness::of(borrowed) {
-                    Ok(w) => self.partial.record(id, w, have),
-                    Err(_) => self.partial.forget(&id),
+            // What arrived for *this* span is punched back out, so no reader
+            // can be served a part of a range as though it were the whole of
+            // one — answering `FAN_ALLOW` with less than the event demanded
+            // hands them zeros in silence (§8d). Ranges filled earlier are
+            // kept: they are complete, they are ours, and throwing them away
+            // would restart a sequential read from the beginning over one
+            // transient error.
+            let _ = placeholder::punch_range_fd(borrowed, span.offset, span.len);
+
+            // Readahead must not be able to fail a read that would have
+            // succeeded. Widening `want` above put speculative bytes into the
+            // same transfer as the demanded ones, so a span that failed may have
+            // failed for a reason that lies entirely outside what the reader
+            // asked for — and the pre-readahead code would have served that
+            // reader without ever touching the byte that broke.
+            match span.intersect(demanded) {
+                // Speculation only. The reader already has everything it
+                // demanded, so this is a fetch not made rather than a failed
+                // read. No further spans are tried: they are speculative too,
+                // whatever is wrong will still be wrong one span further on, and
+                // a reader is blocked inside `read()` for every moment of it.
+                None => break,
+                // The demand was inside a span that also carried readahead. Ask
+                // again for just the demanded part, so the reader's outcome
+                // depends only on the bytes the reader asked for. It costs a
+                // second round trip, on a path that has already failed once.
+                Some(only) if only != span => {
+                    if let Err(again) = self.transfer(id, size, only, ev.fd, &named) {
+                        let _ = placeholder::punch_range_fd(borrowed, only.offset, only.len);
+                        return self.fill_failed(id, borrowed, have, again, path.as_deref());
+                    }
+                    have.add(only);
+                    break;
                 }
-                let abandoned = matches!(
-                    e,
-                    TransferError::TooLong { .. } | TransferError::Stalled { .. }
-                );
-                let reason = format!("{e}");
-                if abandoned {
-                    self.log.record("-", "transfer abandoned", path.as_deref());
-                    return Handled::Abandoned { reason };
-                }
-                return Handled::Failed { reason };
+                // Nothing speculative was in it. This is the path exactly as it
+                // was before readahead existed.
+                Some(_) => return self.fill_failed(id, borrowed, have, e, path.as_deref()),
             }
-            have.add(span);
         }
 
         // Complete, or not yet.
@@ -993,7 +1002,12 @@ impl<F: Fetch + 'static> Worker<F> {
                         Err(_) => self.partial.forget(&id),
                     }
                     Handled::Served {
-                        bytes: want.len,
+                        // What the *reader* demanded, which is what this field
+                        // is documented to mean. Reporting the widened window
+                        // here would say a 4 KiB read was served 8 MiB, and the
+                        // bytes readahead put on disk are already reported —
+                        // that is what `held` is.
+                        bytes: demanded.len,
                         held,
                         size,
                     }
@@ -1007,6 +1021,68 @@ impl<F: Fetch + 'static> Worker<F> {
                 }
             }
         }
+    }
+
+    /// One transfer of one span into the event fd.
+    ///
+    /// Split out because there are now two callers and they have to be the same
+    /// code: the second is the retry that re-asks for only what the reader
+    /// demanded after a span carrying readahead failed, and a retry that
+    /// differed in its limits or its heartbeat would be a second path pretending
+    /// to be the first.
+    fn transfer(
+        &mut self,
+        id: FileId,
+        size: u64,
+        span: Span,
+        fd: i32,
+        named: &str,
+    ) -> Result<(), TransferError> {
+        let limits = self.limits;
+        let in_flight = self.in_flight.clone();
+        let mut alive = move || in_flight.working();
+        let mut say = |got: u64, owed: u64| {
+            let pct = got.saturating_mul(100).checked_div(owed).unwrap_or(100);
+            eprintln!(
+                "[worker] hydrating {named}: {got} of {owed} bytes ({pct}%) \
+                 at offset {}",
+                span.offset
+            );
+        };
+        self.fetch
+            .run(id, size, span, fd, limits, &mut alive, &mut say)
+            .map(|_| ())
+    }
+
+    /// What a failed fill leaves behind.
+    ///
+    /// The caller has already punched whatever arrived for the span that failed.
+    /// This keeps the record of the ranges that are still ours — earlier spans
+    /// that completed in full — so one transient error costs one span rather
+    /// than a sequential read from the beginning.
+    fn fill_failed(
+        &mut self,
+        id: FileId,
+        borrowed: std::os::fd::BorrowedFd<'_>,
+        have: partial::Ranges,
+        error: TransferError,
+        path: Option<&Path>,
+    ) -> Handled {
+        let _ = hydration_protocol::stamp::write_fd(borrowed);
+        match partial::Witness::of(borrowed) {
+            Ok(w) => self.partial.record(id, w, have),
+            Err(_) => self.partial.forget(&id),
+        }
+        let abandoned = matches!(
+            error,
+            TransferError::TooLong { .. } | TransferError::Stalled { .. }
+        );
+        let reason = format!("{error}");
+        if abandoned {
+            self.log.record("-", "transfer abandoned", path);
+            return Handled::Abandoned { reason };
+        }
+        Handled::Failed { reason }
     }
 
     /// A file that claims a size but occupies no disk.

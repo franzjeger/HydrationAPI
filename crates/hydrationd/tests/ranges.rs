@@ -81,6 +81,12 @@ struct Ranged {
     asked: Asked,
     /// Bytes delivered in total, so a test can prove the *object* was not moved.
     delivered: Arc<AtomicU64>,
+    /// Refuse any span reaching past this offset.
+    ///
+    /// Stands in for the thing that makes readahead a risk rather than a free
+    /// win: the window is bytes nobody asked for, and a service that cannot
+    /// deliver them must not thereby fail the read that could have been served.
+    refuse_past: Option<u64>,
 }
 
 impl Fetch for Ranged {
@@ -93,6 +99,9 @@ impl Fetch for Ranged {
         progress: &mut dyn FnMut(u64),
     ) -> io::Result<()> {
         self.asked.0.lock().unwrap().push(span);
+        if self.refuse_past.is_some_and(|at| span.end() > at) {
+            return Err(io::Error::other("this range is not available"));
+        }
         let buf: Vec<u8> = (span.offset..span.end()).map(expected_byte).collect();
         dest(&buf, span.offset)?;
         progress(span.len);
@@ -149,6 +158,15 @@ fn read_at(path: &std::path::Path, off: u64, len: usize) -> libc::pid_t {
 }
 
 fn worker_for(mnt: &std::path::Path, asked: &Asked, delivered: &Arc<AtomicU64>) -> Worker<Ranged> {
+    worker_refusing_past(mnt, asked, delivered, None)
+}
+
+fn worker_refusing_past(
+    mnt: &std::path::Path,
+    asked: &Asked,
+    delivered: &Arc<AtomicU64>,
+    refuse_past: Option<u64>,
+) -> Worker<Ranged> {
     let group = Group::new_pre_content().expect("group");
     group.mark_mount(mnt).expect("mark");
     Worker::new(
@@ -156,6 +174,7 @@ fn worker_for(mnt: &std::path::Path, asked: &Asked, delivered: &Arc<AtomicU64>) 
         Ranged {
             asked: asked.clone(),
             delivered: Arc::clone(delivered),
+            refuse_past,
         },
         Policy::permissive(),
         InFlight::new(),
@@ -317,6 +336,70 @@ fn a_file_read_all_the_way_through_ends_up_hydrated() {
         asked.0.lock().unwrap().len(),
         before,
         "a hydrated file still costs a fetch"
+    );
+}
+
+/// Reading ahead must not be able to fail a read that would have succeeded.
+///
+/// Readahead widens the transfer past what the event demanded, which means the
+/// demanded bytes and bytes nobody asked for now travel together. If that one
+/// transfer decides the reader's outcome, then a speculative extension can turn
+/// a 4 KiB read that the service could serve into `EIO` — a fetch made for
+/// throughput costing correctness, which is the wrong way round for this
+/// framework.
+///
+/// So the fetcher here refuses everything past the first page. The widened span
+/// cannot succeed; the demand can. The reader must still get its content.
+#[test]
+fn a_readahead_that_fails_still_serves_what_the_reader_asked_for() {
+    let Some(mnt) = mount() else {
+        skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
+        return;
+    };
+    // Bigger than one window, so the widening is a genuine extension of the
+    // demand rather than the whole file.
+    const SIZE: u64 = hydrationd::daemon::READAHEAD * 2;
+    let path = placeholder_at(&mnt, "readahead-refused.bin", SIZE);
+
+    let asked = Asked::default();
+    let delivered = Arc::new(AtomicU64::new(0));
+    // Everything past the first page is unavailable — including every byte the
+    // readahead window would add, and none of the bytes the reader demands.
+    let mut worker = worker_refusing_past(&mnt, &asked, &delivered, Some(4096));
+
+    // At offset zero, so the reader is taken for a sequential one and the span
+    // is widened to `READAHEAD`. `read_at` checks every byte against its own
+    // offset, so a zero exit is real content and not a hole.
+    assert_eq!(
+        drive(&mut worker, read_at(&path, 0, 4096)),
+        0,
+        "a readahead that could not be delivered failed a read that could"
+    );
+
+    let asked = asked.0.lock().unwrap().clone();
+    assert_eq!(
+        asked.len(),
+        2,
+        "expected the widened span and then a retry of the demand, got {asked:?}"
+    );
+    assert_eq!(
+        asked[0],
+        Span::new(0, hydrationd::daemon::READAHEAD),
+        "the first fetch was not the widened one"
+    );
+    assert_eq!(
+        asked[1],
+        Span::new(0, 4096),
+        "the retry asked for something other than exactly what was demanded"
+    );
+
+    // Only what the reader demanded is on disk and recorded. The window was
+    // punched back out, so nothing can later be served from bytes that never
+    // arrived — the silent-zeros case (§8d) reached by way of an optimisation.
+    assert_eq!(delivered.load(Ordering::SeqCst), 4096);
+    assert!(
+        placeholder::has_mark(&path).expect("mark"),
+        "a file with one page of many lost its placeholder mark"
     );
 }
 

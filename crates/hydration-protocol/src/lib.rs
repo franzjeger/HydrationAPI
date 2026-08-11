@@ -436,6 +436,19 @@ impl Span {
             len: self.end().min(size).saturating_sub(offset),
         }
     }
+
+    /// The part of this span that is also in `other`, or `None` if they do not
+    /// overlap.
+    ///
+    /// Needed where a transfer covers more than the reader demanded: when such a
+    /// transfer fails, the demanded part has to be separable from the
+    /// speculative part, so that reading ahead can never turn a read that would
+    /// have succeeded into an error.
+    pub fn intersect(self, other: Span) -> Option<Span> {
+        let offset = self.offset.max(other.offset);
+        let end = self.end().min(other.end());
+        (offset < end).then(|| Span::new(offset, end - offset))
+    }
 }
 
 /// Identifies a file without naming it.
@@ -636,6 +649,37 @@ pub fn decode<T: for<'de> Deserialize<'de>>(line: &str) -> serde_json::Result<T>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What readahead needs from `intersect`: given a transfer that covered more
+    /// than the reader demanded, which part of it the reader was actually owed.
+    #[test]
+    fn intersect_separates_a_demand_from_the_speculation_around_it() {
+        let demanded = Span::new(0, 4096);
+        // The widened fetch: the demand is the front of it.
+        assert_eq!(
+            Span::new(0, 8 << 20).intersect(demanded),
+            Some(Span::new(0, 4096))
+        );
+        // A later span of the same widening owes the reader nothing, and that is
+        // the case that must be `None` rather than an empty span — an empty span
+        // is "covered", and would send a failed readahead down the path that
+        // fails the read.
+        assert_eq!(Span::new(8 << 20, 8 << 20).intersect(demanded), None);
+        // Touching but not overlapping is not an overlap.
+        assert_eq!(Span::new(4096, 4096).intersect(demanded), None);
+        // A demand in the middle of a fetch, and the symmetry that says the
+        // answer does not depend on which way round it is asked.
+        let inner = Span::new(100, 50);
+        assert_eq!(Span::new(0, 4096).intersect(inner), Some(inner));
+        assert_eq!(inner.intersect(Span::new(0, 4096)), Some(inner));
+        // Partial overlap at each end.
+        assert_eq!(
+            Span::new(50, 100).intersect(Span::new(100, 100)),
+            Some(Span::new(100, 50))
+        );
+        // Nothing intersects an empty span, including itself.
+        assert_eq!(Span::new(0, 4096).intersect(Span::new(100, 0)), None);
+    }
 
     #[test]
     fn a_request_names_an_inode_and_never_a_path() {
