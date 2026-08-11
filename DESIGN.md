@@ -1647,10 +1647,73 @@ what `daemon::READAHEAD` does. Two things follow that are worth keeping in view.
   fixed cost matters less and the blocking matters more, and the constant should
   be revisited rather than inherited.
 
-Still open: a sequential read of content that is *already present* costs about
-61 ms per read, because the file keeps its mark until every byte is there and so
-every read fires an event. Past some fraction held, fetching the remainder and
-dropping the mark likely beats answering thousands more events.
+---
+
+## 8d-quater. What an already-present read costs, and the fix that was not built
+
+The previous section left one number behind as a rumour: "a sequential read of
+content that is *already present* costs about 61 ms per read", with the implied
+fix that past some fraction held, the worker should fetch the remainder and drop
+the mark so later reads cost nothing. Measured before building anything
+(`crates/hydrationd/examples/presentcost.rs`, release build, quiet machine, own
+loop mounts, 4 KiB reads of a region `SEEK_HOLE` proves is held, every event in
+the timed phase asserted `AlreadyPresent` and the fetch count asserted
+unchanged — any fetch inside a rep is exactly the pollution the 61 ms figure
+turned out to be made of):
+
+```
+                                    btrfs        ext4
+still marked, event per read      9.2 µs/read  7.1 µs/read
+hydrated, ignore mark, no event   0.2 µs/read  0.2 µs/read
+```
+
+**The per-event cost is 7–9 µs, not 61 ms — three and a half orders of
+magnitude below the rumour.** The reader that walks a 2.77 GiB archive in
+128 KiB reads fires ~22,700 events and pays about 0.2 s for all of them
+together. The complete-early-and-unmark fix would trade the one invariant this
+whole design leans on — a marked file is never served holes, and only a file
+with every byte present may lose its mark (§8d-bis) — plus a background write
+path into the marked mount from the answering process (a candidate tenth
+disguise for §6a-ter) and a second-reader-during-completion race, to save a
+fifth of a second per archive. It is not built, on purpose. This section exists
+so the next person reaching for it starts from the number rather than from the
+rumour.
+
+**Where the 61 ms actually lived.** The same instrument walks a cold 64 MiB file
+sequentially in 128 KiB reads and records what each event was answered with:
+
+```
+                              fetches   of them stride-sized   already-present
+window anchored at demand       449       448 × 128 KiB              0
+window anchored at frontier       8         0                      441
+```
+
+The readahead window used to be anchored at the demand's offset, and the
+already-present check asked about the *widened* span. A continuous walker's
+window therefore always poked one stride past what the previous event had
+filled: never "already present", and the missing part was exactly one
+reader-stride at the frontier. After the first window, **every read of a walk
+carried its own 128 KiB fetch**, and each fetch pays the ~160 ms fixed price of
+§8d-ter — 0.8 MB/s however fast the link, ~22,700 round trips for the archive,
+and a number that averaged out to tens of milliseconds "per already-present
+read" when measured without separating the two. That is the polluted
+measurement, identified.
+
+The fix is anchoring: decide "already present" on the demand alone, and when the
+demand does need bytes, widen the fetch to reach `READAHEAD` past the *first
+missing byte* rather than past the demand's own start. A walk then costs one
+fetch per window — ~355 round trips for that archive instead of ~22,700 — and
+the reads in between are the 7–9 µs answers measured above. The over-fetch bound
+is unchanged: the window still ends at most `READAHEAD` beyond a byte the
+reader demanded, so a reader that stops walking strands at most one window.
+`ranges::a_walker_pays_one_fetch_per_window_not_per_read` pins the shape, and
+fails against the demand-anchored code.
+
+One observation recorded rather than explained: in the cold walk, 512 reads
+produced 449 events — the 63 reads that landed wholly inside the first fetched
+window produced none, on 7.1.6, while the stride-cycling timed phase produced
+exactly one event per read. One event per read is therefore the worst case, not
+the invariant. Nothing here depends on which of the two the kernel chooses.
 
 ---
 

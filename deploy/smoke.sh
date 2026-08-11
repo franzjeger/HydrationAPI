@@ -72,6 +72,15 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 mountpoint -q "$MOUNT" || fail "$MOUNT is not a mount point (a directory mark delivers no events)"
+# The sync daemon runs as $SYNC_USER and materialises into the mount root
+# itself — O_TMPFILE for a new placeholder, a scratch link beside the target,
+# the manifest. On a freshly made scratch filesystem that root is owned by
+# root, so every one of those is EACCES: each delta round reports "could not
+# apply" for every file, part 2 times out, and nothing anywhere names the
+# permission underneath. Owned rather than merely checked, for the same reason
+# the fixtures below are chowned: a scratch mount handed to a smoke test has no
+# other tenant to disturb.
+chown "$SYNC_USER" "$MOUNT"
 rm -f "$MOUNT"/*.txt "$MOUNT"/.hydration-manifest 2>/dev/null || true
 
 # An object in the cloud, and a placeholder for it. The placeholder is made

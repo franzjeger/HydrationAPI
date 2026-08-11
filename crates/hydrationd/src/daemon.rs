@@ -7,6 +7,7 @@ use crate::policy::{cgroup_of, Decision, DenialLog, Policy};
 use crate::supervisor::{allow, deny, take_over, InFlight};
 use hydration_protocol::{FileId, Span};
 use std::io;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
 /// Where content comes from.
@@ -736,10 +737,11 @@ impl<F: Fetch + 'static> Worker<F> {
                 // creation back across the privilege boundary.
                 if let Some(p) = &path {
                     if self.looks_stripped(ev.fd) {
-                        // The reader's cgroup is deliberately not looked up: the
-                        // pidfd is consumed by the policy check further down,
-                        // and who read it is not the point. What is worth
-                        // recording is that a file in this state was served.
+                        // The reader's cgroup is deliberately not looked up:
+                        // policy does not apply to a file that already holds its
+                        // content, and who read it is not the point. What is
+                        // worth recording is that a file in this state was
+                        // served.
                         self.log.record(
                             "-",
                             "sized file occupying no disk; not suppressing future events",
@@ -782,11 +784,14 @@ impl<F: Fetch + 'static> Worker<F> {
             return outcome;
         }
 
-        let cgroup = ev.pidfd.and_then(|pfd| {
-            let c = cgroup_of(pfd).ok();
-            unsafe { libc::close(pfd) };
-            c
-        });
+        // Borrowed, not consumed: the event owns the pidfd and closes it when it
+        // is dropped, whichever way this function returned. Closing it here was
+        // the leak — the branches above return before reaching this line, and
+        // the two commonest reads on the system take one of them.
+        let cgroup = ev
+            .pidfd
+            .as_ref()
+            .and_then(|pfd| cgroup_of(pfd.as_fd()).ok());
 
         if let Decision::Deny { rule } = self.policy.decide(cgroup.as_deref()) {
             self.log
@@ -861,6 +866,30 @@ impl<F: Fetch + 'static> Worker<F> {
             }
         };
 
+        // Already served this demand once. No round trip, and no rewrite of
+        // bytes that are already correct.
+        //
+        // This case is not rare and is not an optimisation: re-reading a range
+        // that has been filled fires a fresh event every time, because the file
+        // is still marked and the ignore mark only goes on when it is complete
+        // (measured — `probes/bigdemand.c`, third event of the two-range case).
+        // Answering it costs 7–9 µs against a 0.2 µs unmarked read (measured,
+        // `examples/presentcost.rs`), which is why staying marked until every
+        // byte is present is affordable and nothing here tries to shed the mark
+        // early.
+        //
+        // Decided on the *demand*, before any widening, and the order is
+        // load-bearing. This check used to sit after the widening and ask about
+        // the widened span, which meant a covered read near the trailing edge of
+        // a walk was never "already present" — its window always poked past the
+        // frontier — so every read of a sequential walk carried its own fetch.
+        // See the frontier comment below for what that cost.
+        let missing_of_demand = have.missing(demanded);
+        let Some(first_missing) = missing_of_demand.first() else {
+            return Handled::AlreadyPresent;
+        };
+        let frontier = first_missing.offset;
+
         // Read ahead, but only for a reader that is walking forward.
         //
         // Serving exactly what was asked made small reads of huge files cheap
@@ -879,23 +908,33 @@ impl<F: Fetch + 'static> Worker<F> {
         // taken from the record we already keep: either the bytes immediately
         // before this demand are already here, or the demand starts at the top
         // of the file, which is where a whole-file reader begins.
-        let sequential =
-            want.offset == 0 || (want.offset > 0 && have.covers(Span::new(want.offset - 1, 1)));
-        if sequential && want.len < READAHEAD {
-            want = Span::new(want.offset, READAHEAD).clamped_to(size);
+        //
+        // Anchored at the frontier — the first byte of the demand that is
+        // actually missing — and not at the demand's own offset. Anchoring at
+        // the demand looked the same in the stride tests and was not: a window
+        // re-anchored per event advances one reader-stride at a time, so after
+        // the first window every read of a continuous walk fetched exactly one
+        // stride at the frontier. Measured (`examples/presentcost.rs`): a 64 MiB
+        // walk in 128 KiB reads cost 449 fetches — one of 8 MiB, then 448 of
+        // 128 KiB — and each fetch pays the ~160 ms fixed price a Graph span
+        // costs (§8d-ter), which is 0.8 MB/s however fast the link. Reaching
+        // `READAHEAD` past the frontier instead makes it one fetch per window —
+        // 8 in that same walk — and every read in between is the cheap
+        // already-present answer above. The over-fetch bound does not move: the
+        // window still ends at most `READAHEAD` beyond a byte the reader
+        // demanded, and a reader that stops walking strands at most one window,
+        // exactly as before.
+        let sequential = demanded.offset == 0
+            || (demanded.offset > 0 && have.covers(Span::new(demanded.offset - 1, 1)));
+        if sequential {
+            let end = demanded
+                .end()
+                .max(frontier.saturating_add(READAHEAD))
+                .min(size);
+            want = Span::new(demanded.offset, end - demanded.offset);
         }
 
-        // Already served this range once. No round trip, and no rewrite of bytes
-        // that are already correct.
-        //
-        // This case is not rare and is not an optimisation: re-reading a range
-        // that has been filled fires a fresh event every time, because the file
-        // is still marked and the ignore mark only goes on when it is complete
-        // (measured — `probes/bigdemand.c`, third event of the two-range case).
         let missing = have.missing(want);
-        if missing.is_empty() {
-            return Handled::AlreadyPresent;
-        }
 
         // Written through the event fd as the bytes arrive, never by re-opening
         // the path. A write to a freshly opened file inside the marked mount
@@ -1346,6 +1385,12 @@ impl SplitHandle {
             }
             let len = self.group.read_events(&mut buf)?;
             for ev in fanotify::events(&buf, len) {
+                // The event fd is closed by hand and the pidfd is not, which
+                // looks inconsistent and is not: this loop discards the event
+                // whole, so its `Option<OwnedFd>` closes with it. The event fd
+                // cannot work that way — a response is matched by *number*, and
+                // the supervisor answers for fds it never opened, so it holds
+                // numbers rather than descriptors throughout.
                 if ev.fd >= 0 {
                     let _ = deny(&self.group, ev.fd);
                     unsafe { libc::close(ev.fd) };

@@ -403,6 +403,90 @@ fn a_readahead_that_fails_still_serves_what_the_reader_asked_for() {
     );
 }
 
+/// A reader walking forward pays one fetch per window, not one per read.
+///
+/// The regression this pins down was invisible to every stride test: a window
+/// anchored at the *demand* advances one reader-stride per event, so after the
+/// first window a continuous walk fetched exactly one stride at the frontier,
+/// per read. Measured (`examples/presentcost.rs`): 512 reads of a 64 MiB file
+/// cost 449 fetches, 448 of them 128 KiB — and on a live account every one of
+/// those pays the ~160 ms fixed price of a Graph span (§8d-ter), which caps a
+/// walk at under a megabyte per second whatever the link can do. Anchoring the
+/// window at the first missing byte makes the fetch count track windows, and
+/// the reads in between are answered from what is already here.
+#[test]
+fn a_walker_pays_one_fetch_per_window_not_per_read() {
+    let Some(mnt) = mount() else {
+        skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
+        return;
+    };
+    // Several windows, so "per window" and "per file" cannot be confused, and
+    // enough reads per window that "per read" would be an order of magnitude
+    // more fetches rather than a rounding difference.
+    const SIZE: u64 = hydrationd::daemon::READAHEAD * 3;
+    const STEP: u64 = 128 << 10;
+    let path = placeholder_at(&mnt, "walked-straight-through.bin", SIZE);
+
+    let asked = Asked::default();
+    let delivered = Arc::new(AtomicU64::new(0));
+    let mut worker = worker_for(&mnt, &asked, &delivered);
+
+    // A continuous walker: sequential fixed-size reads through one descriptor,
+    // every byte checked against its offset. `std::fs::read` is not used
+    // because its internal chunking is not a contract; the stride here *is* the
+    // experiment.
+    let reader = {
+        let path = path.clone();
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            use std::os::unix::fs::FileExt;
+            let code = (|| {
+                let f = std::fs::File::open(&path).map_err(|_| 1)?;
+                let mut buf = vec![0u8; STEP as usize];
+                let mut at = 0u64;
+                while at < SIZE {
+                    f.read_exact_at(&mut buf, at).map_err(|_| 1)?;
+                    if !buf
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &b)| b == expected_byte(at + i as u64))
+                    {
+                        return Err(7);
+                    }
+                    at += STEP;
+                }
+                Ok(0)
+            })()
+            .unwrap_or_else(|e| e);
+            unsafe { libc::_exit(code) };
+        }
+        pid
+    };
+    assert_eq!(drive(&mut worker, reader), 0, "the walk failed");
+
+    let asked = asked.0.lock().unwrap().clone();
+    let windows = SIZE / hydrationd::daemon::READAHEAD;
+    assert!(
+        asked.len() as u64 <= windows + 1,
+        "a walk of {} reads cost {} fetches; the window is advancing one \
+         stride per read instead of one window per window",
+        SIZE / STEP,
+        asked.len()
+    );
+    // And the window never sprints ahead of the reader: however the fetches
+    // were divided, reading the file once moved the file once.
+    assert_eq!(
+        delivered.load(Ordering::SeqCst),
+        SIZE,
+        "a single walk moved more bytes than the file holds"
+    );
+    // Read to the end is hydrated, same as ever.
+    assert!(
+        !placeholder::has_mark(&path).expect("mark"),
+        "a file walked to its last byte is still marked"
+    );
+}
+
 /// Somebody else wrote into the placeholder between two reads.
 ///
 /// No released kernel has a pre-modify event (§5), so this happens without the
