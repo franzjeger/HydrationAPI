@@ -71,6 +71,74 @@ pub enum Reach {
     Unknown(String),
 }
 
+/// Whether the mount at `path` is the one the rest of the machine traverses.
+///
+/// Asked of `/proc/self/mountinfo`, which needs no privilege — and that is the
+/// point. The namespace comparison in [`reach`] needs to read `/proc/1/ns/mnt`,
+/// which requires `CAP_SYS_PTRACE`, and the capability set this helper is
+/// supposed to run with does not include it. Measured: under a systemd unit with
+/// `CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE`, `reach()` degrades to
+/// [`Reach::Unknown`] — the guard goes quiet in exactly the deployment it exists
+/// to protect.
+///
+/// This asks the better question anyway. Not "which namespace am I in" but "is
+/// this mount a copy that receives propagation from somewhere else", which is
+/// what actually decides whether a mark on it covers anyone. Measured, the same
+/// mount seen two ways:
+///
+/// ```text
+/// host:              /home/frank/OneDrive rw,noatime shared:526
+/// inside a unit ns:  /home/frank/OneDrive rw,noatime shared:563 master:526
+/// ```
+///
+/// A `master:` field means this mount is downstream of peer group 526 — it is
+/// not that mount, it only hears about it. A mark here covers this copy and
+/// nothing else.
+pub fn mount_is_a_downstream_copy(path: &Path) -> io::Result<bool> {
+    let target = path.to_string_lossy();
+    let info = std::fs::read_to_string("/proc/self/mountinfo")?;
+    for line in info.lines() {
+        // `id parent major:minor root point opts [optional...] - fstype src super`
+        // The optional fields are variable in number, which is why the ` - `
+        // separator exists at all; splitting on it first is the only way to know
+        // where they end.
+        let Some((left, _)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fields: Vec<&str> = left.split_whitespace().collect();
+        if fields.len() < 6 || unescape(fields[4]) != target {
+            continue;
+        }
+        return Ok(fields[6..].iter().any(|f| f.starts_with("master:")));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("{target} is not a mount point in this namespace"),
+    ))
+}
+
+/// `/proc/self/mountinfo` escapes space, tab, newline and backslash as octal.
+fn unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() {
+            if let Some(c) = std::str::from_utf8(&b[i + 1..i + 4])
+                .ok()
+                .and_then(|o| u8::from_str_radix(o, 8).ok())
+            {
+                out.push(c as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// Whether a mount mark taken here reaches the rest of the machine.
 pub fn reach() -> Reach {
     // The namespace's identity is the inode behind the magic link, and the link

@@ -155,25 +155,43 @@ fn main() -> io::Result<()> {
     // process reports it is watching, and every read outside the namespace comes
     // back as zeros. See `selfcheck` for the measurement and the systemd
     // directives that cause it.
-    match selfcheck::reach() {
-        Reach::Everyone => {}
+    // Two questions, deliberately in this order.
+    //
+    // The mount's own propagation is the one that decides the outcome and the one
+    // that can always be asked: it comes from /proc/self/mountinfo and needs no
+    // privilege. The namespace comparison needs CAP_SYS_PTRACE to read
+    // /proc/1/ns/mnt, which the capability set this runs with does not include —
+    // measured, it degrades to Unknown under the very unit it protects. So it is
+    // used to enrich the message, never to decide.
+    let ns_note = match selfcheck::reach() {
         Reach::OurselvesOnly { ours, init } => {
+            format!(" (this process is in {ours}, init is in {init})")
+        }
+        Reach::Everyone | Reach::Unknown(_) => String::new(),
+    };
+    match selfcheck::mount_is_a_downstream_copy(&args.mount) {
+        Ok(false) => {}
+        Ok(true) => {
             eprintln!(
-                "hydrationd: refusing to start — this process is in its own mount \
-                 namespace ({ours}, init is in {init}), so a mount mark here would \
-                 protect nobody and every placeholder read outside it would return \
-                 zeros.\n\
+                "hydrationd: refusing to start — {} is a downstream copy of another \
+                 mount{ns_note}, so a mark here would cover this copy and nobody \
+                 else, and every placeholder read outside it would return zeros.\n\
                  hydrationd: under systemd, each of PrivateTmp=, PrivateNetwork=, \
                  ProtectKernelTunables=, ProtectControlGroups= and \
-                 ProtectKernelModules= causes this on its own. Use \
-                 RestrictAddressFamilies=AF_UNIX for network denial instead; it \
-                 needs no namespace."
+                 ProtectKernelModules= gives a unit its own mount namespace and \
+                 causes this on its own. Use RestrictAddressFamilies=AF_UNIX for \
+                 network denial instead; it needs no namespace.",
+                args.mount.display()
             );
             std::process::exit(1);
         }
-        Reach::Unknown(why) => eprintln!(
-            "hydrationd: WARNING — could not confirm this process shares init's \
-             mount namespace ({why}); if it does not, nothing here protects anything"
+        // The sync root not being a mount at all is caught by `mark_mount` a few
+        // lines below, which fails properly. Anything else is this check being
+        // unable to answer, and it says so rather than passing quietly.
+        Err(e) => eprintln!(
+            "hydrationd: WARNING — could not confirm {} is the mount others \
+             traverse ({e}); if it is not, nothing here protects anything",
+            args.mount.display()
         ),
     }
 
