@@ -266,6 +266,43 @@ pub fn apply<M: Materialise>(
                     },
                     Ok(md) => {
                         let id = file_id(&md);
+                        // Nothing to do is the common case, and it is decided
+                        // *before* the protections below, not after.
+                        //
+                        // Both feeds re-present unchanged objects on every
+                        // round: `Discover` promises a full listing behaves
+                        // like an incremental one, and the Graph provider
+                        // returns its whole tree each pass for exactly that
+                        // reason. So most upserts describe a file that is
+                        // already right, and applying one is a no-op — there
+                        // is no `place()` to refuse, and therefore nothing for
+                        // `kept_local` to be about. (Before this check existed
+                        // at all, every echo was re-placed: a file the user
+                        // had just written and successfully uploaded became a
+                        // placeholder seconds later, which on a laptop that is
+                        // offline by morning is their content gone.)
+                        //
+                        // When this check ran after the stamp check, a stale
+                        // stamp turned that no-op into a permanent conflict. A
+                        // live account showed the shape: a worker killed
+                        // between writing a range into a placeholder and
+                        // `settle_range`'s re-stamp left the file dirty, and
+                        // nothing re-stamps a file nobody touches — so the
+                        // echo of the unchanged object was refused as
+                        // `ChangedUnderneath` every five seconds, indefinitely,
+                        // for a file whose id, version and size all matched.
+                        // Not one byte would have moved in either direction,
+                        // and the "conflict" could not be resolved from either
+                        // side.
+                        //
+                        // This is not a weakening of the guards below: they
+                        // exist so `place()` never destroys content that was
+                        // not sent, and on this path `place()` is not reached
+                        // at all. A dirty file facing a change that would
+                        // apply something still falls through to them.
+                        if is_current(&abs, cloud_id, etag.as_deref(), *size) {
+                            continue;
+                        }
                         // An edit waiting to be sent is newer than anything the
                         // cloud has to say. Replacing it with a placeholder
                         // would throw away work that exists nowhere else — the
@@ -314,21 +351,6 @@ pub fn apply<M: Materialise>(
                             Ok(hydration_protocol::stamp::State::Dirty)
                         ) {
                             out.kept_local.push(Kept::new(path, Why::ChangedUnderneath));
-                            continue;
-                        }
-                        // Nothing to do is the common case, and doing something
-                        // anyway is destructive.
-                        //
-                        // A real delta feed echoes your own uploads back on the
-                        // next page, and `Discover`'s contract promises a full
-                        // listing behaves like an incremental one — so most
-                        // upserts describe a file that is already exactly right.
-                        // Without this check every one of them was re-placed:
-                        // a file the user had just written and successfully
-                        // uploaded became a placeholder seconds later, which on
-                        // a laptop that is offline by morning is their content
-                        // gone.
-                        if is_current(&abs, cloud_id, etag.as_deref(), *size) {
                             continue;
                         }
                         match mat.place(&abs, *size, cloud_id, etag.as_deref()) {

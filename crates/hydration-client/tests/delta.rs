@@ -387,6 +387,143 @@ fn a_pass_that_brings_no_news_leaves_the_file_alone() {
     assert!(m.placed.is_empty(), "placed: {:?}", m.placed);
 }
 
+/// The echo of an unchanged object must not become a permanent conflict.
+///
+/// The state this constructs is what an *interrupted* fill leaves behind, and it
+/// was observed on a live account rather than deduced: a worker was killed
+/// between writing a range into a placeholder and `settle_range`'s re-stamp (the
+/// smoke test's old machine-wide `pkill -x hydrationd` did exactly that, twice),
+/// leaving partial content, the dehydrated mark still set, and a stamp
+/// describing the pre-fill mtime. Nothing ever re-stamps a file nobody touches —
+/// only the next read event would — so the mismatch is permanent.
+///
+/// The delta feed then re-presents the whole tree every round (`Discover`'s
+/// contract: a full listing and an incremental one behave the same), and the
+/// pass refused the unchanged object as `ChangedUnderneath` every five seconds,
+/// indefinitely: `kept local copy of Backups/…/2026-02-23_00-00.tar.gz` until a
+/// later read happened to fill another range and re-stamp.
+///
+/// The refusal protected nothing. A change that describes exactly what is
+/// already here — same id, same version, same size — applies nothing, so there
+/// is nothing to keep local. "Kept" was a lie both ways: nothing was going to be
+/// destroyed, and the conflict it reported cannot be resolved from either side.
+#[test]
+fn an_interrupted_fill_does_not_turn_the_echo_into_a_permanent_conflict() {
+    use std::os::unix::fs::FileExt;
+
+    let dir = scratch("interrupted-fill");
+    let mut m = Recorder::default();
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+
+    run(
+        &dir,
+        &[upserted("big.tar.gz", 1 << 20, "cloud-1")],
+        &q,
+        &mut m,
+    );
+    let p = dir.join("big.tar.gz");
+    let before = std::fs::metadata(&p).unwrap();
+
+    // The fill, cut off before the stamp. Writing through a fresh handle rather
+    // than any helper of the framework's is the point: the worker's pwrite went
+    // through and its SIGKILL arrived before `settle_range`.
+    let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+    f.write_all_at(&[7u8; 4096], 0).unwrap();
+    drop(f);
+    assert_eq!(
+        hydration_protocol::stamp::state(&p).unwrap(),
+        hydration_protocol::stamp::State::Dirty,
+        "the interrupted fill should have left the stamp stale"
+    );
+    assert!(
+        store::get_xattr(&p, hydration_protocol::xattr::DEHYDRATED)
+            .unwrap()
+            .is_some(),
+        "the file should still be marked: the fill never finished"
+    );
+
+    // The echo, as every round delivers it: same id, same version, same size.
+    let out = run(
+        &dir,
+        &[upserted("big.tar.gz", 1 << 20, "cloud-1")],
+        &q,
+        &mut m,
+    );
+
+    assert_eq!(
+        out,
+        Applied::default(),
+        "a change that describes what is already here applies nothing, so \
+         there is nothing to keep local and nothing to report"
+    );
+    let after = std::fs::metadata(&p).unwrap();
+    assert_eq!(after.ino(), before.ino(), "the placeholder was replaced");
+    let mut held = vec![0u8; 4096];
+    std::fs::File::open(&p)
+        .unwrap()
+        .read_exact_at(&mut held, 0)
+        .unwrap();
+    assert_eq!(held, vec![7u8; 4096], "the partial fill was thrown away");
+}
+
+/// The same stale stamp against a change that is *not* an echo: the protection
+/// this file exists for is untouched by the fix above.
+///
+/// A dirty file cannot be told apart from a user's unreported edit — that is the
+/// stamp's whole design — so a version that genuinely differs must still be
+/// refused, reported, and left exactly as it was found.
+#[test]
+fn a_stale_stamp_still_blocks_a_change_that_would_apply_something() {
+    use std::os::unix::fs::FileExt;
+
+    let dir = scratch("stale-stamp-real-change");
+    let mut m = Recorder::default();
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+
+    run(
+        &dir,
+        &[upserted("big.tar.gz", 1 << 20, "cloud-1")],
+        &q,
+        &mut m,
+    );
+    let p = dir.join("big.tar.gz");
+    let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+    f.write_all_at(&[7u8; 4096], 0).unwrap();
+    drop(f);
+    let placed_before = m.placed.len();
+
+    // Same object, new version.
+    let out = run(
+        &dir,
+        &[Change::Upserted {
+            cloud_id: "cloud-1".into(),
+            path: "big.tar.gz".into(),
+            size: 1 << 20,
+            etag: Some("etag-2".into()),
+        }],
+        &q,
+        &mut m,
+    );
+
+    assert_eq!(
+        out.kept_local,
+        vec![Kept::new("big.tar.gz", Why::ChangedUnderneath)],
+        "{out:?}"
+    );
+    assert_eq!(
+        m.placed.len(),
+        placed_before,
+        "a dirty file was refreshed over: {:?}",
+        m.placed
+    );
+    let mut held = vec![0u8; 4096];
+    std::fs::File::open(&p)
+        .unwrap()
+        .read_exact_at(&mut held, 0)
+        .unwrap();
+    assert_eq!(held, vec![7u8; 4096], "the local bytes were thrown away");
+}
+
 /// And the other side of it: news is still applied.
 #[test]
 fn a_pass_with_a_new_version_still_refreshes() {
