@@ -96,6 +96,20 @@ impl<T: FetchWhole> Fetch for T {
     }
 }
 
+/// How much to fetch when a reader is walking forward through a file.
+///
+/// Serving exactly what each event demanded made small reads of huge files cheap
+/// and made sequential reading of them unusable: every `read()` is its own event
+/// and its own request, so throughput becomes one round trip per read rather
+/// than anything to do with the link. Measured against a live account, a reader
+/// walking a 2.77 GiB object 64 KiB at a time moved at 0.27 MB/s on a connection
+/// that delivers 8 MiB in half a second when asked for it in one piece.
+///
+/// Public because `tests/ranges.rs` has to place a write *outside* this window
+/// to test what it is testing, and a hard-coded number there would silently stop
+/// meaning that the day this changes.
+pub const READAHEAD: u64 = 8 * 1024 * 1024;
+
 /// Resolve the file an event refers to.
 ///
 /// The event fd is the only handle we get, and it is authoritative: it names the
@@ -802,7 +816,7 @@ impl<F: Fetch + 'static> Worker<F> {
         // is what the kernel means by omitting it — a group that did not ask for
         // `FAN_REPORT_FD_ERROR` gets no range and the whole file is implied — and
         // it is also the safe direction to be wrong in.
-        let want = ev
+        let mut want = ev
             .range
             .map(|(off, count)| Span::new(off, count))
             .unwrap_or_else(|| Span::whole(size))
@@ -819,6 +833,7 @@ impl<F: Fetch + 'static> Worker<F> {
         };
         let mut have = match self.partial.standing(id, witness) {
             partial::Standing::Ours(r) => r,
+            // NOTE: `want` is widened below, once `have` is known.
             // Residue from a transfer that was cut off mid-stream, or content
             // somebody else put there.
             //
@@ -838,6 +853,30 @@ impl<F: Fetch + 'static> Worker<F> {
                 partial::Ranges::default()
             }
         };
+
+        // Read ahead, but only for a reader that is walking forward.
+        //
+        // Serving exactly what was asked made small reads of huge files cheap
+        // and made *sequential* reading of them unusable: every `read()` is its
+        // own event and its own request, so the throughput is one round trip per
+        // read rather than anything to do with the link. Measured against a live
+        // account, Ark listing a 2.77 GiB `tar.gz` — which must decompress the
+        // whole stream, so it reads straight through from the start — moved at
+        // 0.27 MB/s and would have needed about three hours, on a connection
+        // delivering 11 MB/s when asked for one large piece.
+        //
+        // Widened rather than made unconditional, because the cost falls on
+        // exactly the reader that would not benefit: a random-access reader —
+        // `mmap` over a database, a seek to a footer — would fetch this window
+        // for every scattered touch. So the trigger is evidence of sequence,
+        // taken from the record we already keep: either the bytes immediately
+        // before this demand are already here, or the demand starts at the top
+        // of the file, which is where a whole-file reader begins.
+        let sequential =
+            want.offset == 0 || (want.offset > 0 && have.covers(Span::new(want.offset - 1, 1)));
+        if sequential && want.len < READAHEAD {
+            want = Span::new(want.offset, READAHEAD).clamped_to(size);
+        }
 
         // Already served this range once. No round trip, and no rewrite of bytes
         // that are already correct.

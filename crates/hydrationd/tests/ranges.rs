@@ -333,7 +333,12 @@ fn a_placeholder_written_by_someone_else_is_not_trusted() {
         skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
         return;
     };
-    const SIZE: u64 = 8 << 20;
+    // Comfortably larger than one readahead window, and the meddling below lands
+    // outside it. A reader starting at the top of a file is taken for a
+    // sequential one, so the first read pulls `READAHEAD` bytes — on a file the
+    // size of that window it would pull the whole thing, and the page this test
+    // needs to be *absent* would already be there.
+    const SIZE: u64 = hydrationd::daemon::READAHEAD * 4;
     let path = placeholder_at(&mnt, "meddled-with.bin", SIZE);
 
     let asked = Asked::default();
@@ -365,10 +370,12 @@ fn a_placeholder_written_by_someone_else_is_not_trusted() {
         if pid == 0 {
             use std::os::unix::fs::FileExt;
             let code = match std::fs::OpenOptions::new().write(true).open(&path) {
-                Ok(f) => match f.write_all_at(b"not from the cloud", 4 << 20) {
-                    Ok(()) => f.sync_all().map(|_| 0).unwrap_or(1),
-                    Err(_) => 1,
-                },
+                Ok(f) => {
+                    match f.write_all_at(b"not from the cloud", hydrationd::daemon::READAHEAD * 2) {
+                        Ok(()) => f.sync_all().map(|_| 0).unwrap_or(1),
+                        Err(_) => 1,
+                    }
+                }
                 Err(_) => 1,
             };
             unsafe { libc::_exit(code) };
