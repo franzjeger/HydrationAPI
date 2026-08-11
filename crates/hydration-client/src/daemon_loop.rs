@@ -120,6 +120,23 @@ impl Changes for QueueChanges {
     }
 }
 
+/// What a resync walk found: what to send, and what it refused to.
+///
+/// Private, like the walk that returns it. The refusals travel out rather than
+/// being printed in place so that the whole decision stays a function of the
+/// directory and can be asserted on — the arm this replaces returned only the
+/// files it queued, so what it wrongly queued was visible nowhere but in the
+/// uploads that followed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Resync {
+    /// Files to queue for upload.
+    send: Vec<FileId>,
+    /// Placeholders that hold bytes. Never sent — see [`dirty_files`] — and
+    /// carried out of the walk rather than dropped, because naming them is the
+    /// only warning anyone gets before the helper discards them.
+    holding: Vec<PathBuf>,
+}
+
 /// Everything in the sync directory the framework has not sent in its current
 /// form.
 ///
@@ -139,11 +156,71 @@ impl Changes for QueueChanges {
 /// hydrated or uploaded is stamped — so an unstamped file with content is, by
 /// construction, one that has never been sent. It also retries uploads that
 /// failed, which nothing else does.
-fn dirty_files(root: &std::path::Path) -> io::Result<Vec<FileId>> {
+///
+/// # A placeholder is never unsent content, whatever its stamp says
+///
+/// The mark is checked once, above both kinds, because it is the same rule
+/// twice and having it in only one arm was a bug. The `Unstamped` arm excluded
+/// marked files from the start; the `Dirty` arm did not, and a placeholder is
+/// `Dirty` in every state that matters:
+///
+/// - A transfer cut off mid-stream. The worker writes through the event fd and
+///   clears the mark in `finish_hydration`; killed in between — which a
+///   machine-wide `pkill hydrationd` did on a live mount on 2026-08-10 — it
+///   leaves a file that is still marked, holds part of the object, and whose
+///   `pwrite` moved the mtime out from under the placeholder's stamp.
+/// - A transfer in progress right now, which looks identical from here.
+/// - A punch of ours whose re-stamp failed. `dehydrate`, `evict` and `abandon`
+///   all stamp with `let _ =`.
+/// - `touch` on a placeholder: mtime moved, no content at all.
+///
+/// Queueing any of those calls `run_upload`, which resolves the path and reads
+/// it — through the mount, which is the whole point. Every missing range fires
+/// a pre-content event, the helper hydrates the entire object, and the upload
+/// then sends the cloud a byte-identical copy of what it just served. A full
+/// down-and-up cycle for a multi-gigabyte file, and a remote version bump every
+/// other device has to apply.
+///
+/// # Why not send them, then, if a user's bytes might be in there
+///
+/// Because the upload path cannot carry them. `run_upload` reads the file to
+/// send it, and *that read* is what makes the helper punch: `clear_residue` is
+/// unconditional, so whatever is in a marked file is gone before a byte of it
+/// reaches the sink, and what gets uploaded is the cloud's own content. Queueing
+/// the file does not rescue an edit — it destroys it and pays for two transfers
+/// to do so.
+///
+/// Clearing the mark first is the one thing that would let those bytes out, and
+/// it must never be done from here. A cut-off transfer holds a *prefix* of the
+/// object with holes after it; unmarked, those holes read as legitimate zeros
+/// and the upload writes them over the cloud object for every device. Nothing on
+/// this side can tell that apart from a user's edit — which is exactly why
+/// `clear_residue` does not try, and why `hydrationd`'s `looks_stripped` refuses
+/// to install an ignore mark on a sized file occupying no disk. Guessing wrong
+/// destroys the object; not guessing costs a log line.
+///
+/// So they are skipped and *named*. A marked file holding bytes is a state that
+/// is not supposed to survive between transfers, this walk is the only thing
+/// that looks at every file, and after the next read the file is quietly the
+/// cloud's copy again with nothing left to notice.
+///
+/// The bytes question is asked only of a placeholder whose stamp already
+/// disagrees, and it is asked with `holds_data` — `SEEK_DATA`, never
+/// `st_blocks`, which reports the same count for an empty placeholder and a
+/// filled one (§8z). A `Clean` placeholder is skipped without asking: putting
+/// bytes in one moves its mtime, and nothing in the framework writes into a
+/// marked file and re-stamps it. That keeps the syscall off the overwhelming
+/// majority of placeholders, which are `Clean`.
+///
+/// Measured before it was used (`probes/seekdata.c`, 7.1.6, btrfs and ext4):
+/// `open` and `lseek(SEEK_DATA)` fire no pre-content event, while a `read` on
+/// the same file fires one. Asking whether a placeholder holds bytes therefore
+/// does not hydrate it — without which the diagnostic would be the harm.
+fn dirty_files(root: &std::path::Path) -> io::Result<Resync> {
     use hydration_protocol::stamp::{self, State};
     use std::os::unix::fs::MetadataExt;
 
-    let mut out = Vec::new();
+    let mut found = Resync::default();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for e in std::fs::read_dir(&dir)?.flatten() {
@@ -161,17 +238,31 @@ fn dirty_files(root: &std::path::Path) -> io::Result<Vec<FileId>> {
             {
                 continue;
             }
-            let worth_sending = match stamp::state(&path) {
+            let state = stamp::state(&path);
+            // Above both arms, not inside one. Neither kind may be a
+            // placeholder, and a placeholder is `Dirty` far more often than it
+            // is `Unstamped` — see this function's docs for what queueing one
+            // costs and why sending it anyway does not save the bytes in it.
+            if matches!(
+                crate::store::get_xattr(&path, hydration_protocol::xattr::DEHYDRATED),
+                Ok(Some(_))
+            ) {
+                // `unwrap_or(false)` says nothing rather than guessing. The
+                // realistic error here is the file having been deleted between
+                // `read_dir` and now, and a warning naming a file that no longer
+                // exists is worse than no warning: §6c wants a log that is true
+                // before it wants one that is complete.
+                if !matches!(state, Ok(State::Clean))
+                    && hydration_protocol::holds_data(&path).unwrap_or(false)
+                {
+                    found.holding.push(path);
+                }
+                continue;
+            }
+            let worth_sending = match state {
                 Ok(State::Dirty) => true,
                 Ok(State::Unstamped) => {
-                    // A placeholder is never "unsent content" — it has no
-                    // content — and reading one to upload it would hydrate the
-                    // very file we are trying to leave alone.
                     md.len() > 0
-                        && !matches!(
-                            crate::store::get_xattr(&path, hydration_protocol::xattr::DEHYDRATED),
-                            Ok(Some(_))
-                        )
                         && !matches!(
                             crate::store::get_xattr(&path, crate::store::XATTR_ID),
                             Ok(Some(_))
@@ -180,14 +271,14 @@ fn dirty_files(root: &std::path::Path) -> io::Result<Vec<FileId>> {
                 _ => false,
             };
             if worth_sending {
-                out.push(FileId {
+                found.send.push(FileId {
                     fsid: md.dev(),
                     ino: md.ino(),
                 });
             }
         }
     }
-    Ok(out)
+    Ok(found)
 }
 
 /// The user's own way in: a line-oriented socket only they can reach.
@@ -401,17 +492,54 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 // every batch.
                 if resync.swap(false, Ordering::SeqCst) {
                     match dirty_files(&mount) {
-                        Ok(found) if !found.is_empty() => {
-                            eprintln!(
-                                "hydration-sync: resync found {} file(s) changed with no event",
-                                found.len()
-                            );
-                            let mut queue = q.lock().unwrap();
-                            for f in found {
-                                queue.touch(f);
+                        Ok(found) => {
+                            if !found.send.is_empty() {
+                                eprintln!(
+                                    "hydration-sync: resync found {} file(s) changed with \
+                                     no event",
+                                    found.send.len()
+                                );
+                                let mut queue = q.lock().unwrap();
+                                for f in found.send {
+                                    queue.touch(f);
+                                }
+                            }
+                            // Not a log detail, for the same reason §6.4a's
+                            // exposure warning is not: these files hold bytes
+                            // the framework will not send and the helper will
+                            // discard, and after the next read there is nothing
+                            // left to notice. This line is the only moment
+                            // anyone can act on them.
+                            if !found.holding.is_empty() {
+                                eprintln!(
+                                    "hydration-sync: WARNING — {} dehydrated file(s) hold \
+                                     bytes and were not queued for upload:",
+                                    found.holding.len()
+                                );
+                                for p in &found.holding {
+                                    eprintln!("hydration-sync:   {}", p.display());
+                                }
+                                // No advice to copy the bytes out, because
+                                // there is none to give: copying is a read,
+                                // and the read is what punches them. Saying
+                                // otherwise would be a diagnostic invented to
+                                // round the sentence off, which is the one
+                                // thing a log here may not do.
+                                eprintln!(
+                                    "hydration-sync:   A dehydrated file's content is the \
+                                     cloud's to supply, so the framework never sends it: \
+                                     reading one in order to upload it hydrates the whole \
+                                     object and sends the cloud its own bytes back. Bytes \
+                                     found in one are a transfer in progress, a transfer \
+                                     that was cut off, or a write that reached the file \
+                                     while nothing was intercepting — indistinguishable \
+                                     from here, and the helper punches all three on the \
+                                     next read and refetches the cloud's copy. Any read \
+                                     of these files, including one taken to copy them \
+                                     elsewhere, is that read."
+                                );
                             }
                         }
-                        Ok(_) => {}
                         Err(e) => eprintln!("hydration-sync: resync walk failed: {e}"),
                     }
                 }
@@ -702,4 +830,193 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store;
+    use hydration_protocol::stamp::{self, State};
+    use hydration_protocol::{holds_data, xattr};
+    use std::path::Path;
+
+    /// Not `/tmp`: every one of these needs user extended attributes and real
+    /// sparseness, and tmpfs has neither in the form this measures.
+    /// `HYDRATION_TEST_DIR` points it at whichever filesystem is under test.
+    ///
+    /// `CARGO_TARGET_TMPDIR` is not available to a unit test inside the library
+    /// — cargo only sets it for integration tests — so the fallback is spelled
+    /// out from the manifest directory, as in `place.rs`.
+    fn scratch(name: &str) -> PathBuf {
+        test_scratch::scratch(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+            &format!("resync-walk/{name}"),
+        )
+    }
+
+    /// Move a file's mtime to a fixed, distant instant.
+    ///
+    /// Not decoration. The kernel stamps mtime from a coarse clock — a write
+    /// microseconds after `stamp::write` can land on the same nanosecond value,
+    /// and the file then reads `Clean`. A test built that way asserts that a
+    /// placeholder is not queued while being unable to fail, because the state
+    /// it claims to set up never existed. Every test here sets the mtime
+    /// explicitly and then asserts the state it meant to create.
+    fn set_mtime(path: &Path, secs: i64) {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+        ];
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(rc, 0, "could not set mtime: {}", io::Error::last_os_error());
+    }
+
+    /// A placeholder as the framework leaves one: sized, empty, marked, stamped.
+    fn placeholder(dir: &Path, name: &str, size: u64) -> PathBuf {
+        let p = dir.join(name);
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(size).unwrap();
+        drop(f);
+        store::set_xattr(&p, xattr::DEHYDRATED, b"1").unwrap();
+        store::set_xattr(&p, store::XATTR_ID, b"cloud-1").unwrap();
+        stamp::write(&p).unwrap();
+        assert_eq!(stamp::state(&p).unwrap(), State::Clean);
+        assert!(
+            !holds_data(&p).unwrap(),
+            "a fresh placeholder holds nothing"
+        );
+        p
+    }
+
+    /// Write into a placeholder's hole without changing its size, the way the
+    /// worker's `write_at` does — and the way a process writing to a file the
+    /// helper is not intercepting does.
+    fn fill_range(path: &Path, len: usize) {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.write_all_at(&vec![b'x'; len], 0).unwrap();
+    }
+
+    /// The reported defect: a fill that was interrupted between the `pwrite` and
+    /// the stamp `finish_hydration` writes.
+    ///
+    /// A `pkill hydrationd` mid-transfer leaves exactly this on a live mount —
+    /// still marked, holding part of the object, and `Dirty` because the write
+    /// moved the mtime the placeholder's stamp describes. Queued, `run_upload`
+    /// reads it through the mount, every hole fires a pre-content event, the
+    /// whole object is hydrated, and the cloud is sent a byte-identical copy of
+    /// what it just served.
+    #[test]
+    fn an_interrupted_fill_is_not_queued_for_upload() {
+        let dir = scratch("interrupted-fill");
+        let p = placeholder(&dir, "big.iso", 1 << 20);
+        fill_range(&p, 4096);
+        set_mtime(&p, 1_700_000_000);
+
+        // The state the test claims to have built, asserted rather than assumed.
+        assert_eq!(stamp::state(&p).unwrap(), State::Dirty);
+        assert!(holds_data(&p).unwrap(), "the interrupted fill left bytes");
+
+        let found = dirty_files(&dir).unwrap();
+        assert_eq!(found.send, Vec::new(), "a placeholder must not be uploaded");
+        assert_eq!(found.holding, vec![p], "and must not be dropped in silence");
+    }
+
+    /// The same shape, arrived at from the other direction: bytes that are the
+    /// user's, in a file that is still marked because nothing intercepted the
+    /// write.
+    ///
+    /// Indistinguishable from the case above by anything on this side, which is
+    /// the point. Queueing it would not save the bytes — `run_upload` reads the
+    /// file to send it, and that read is what makes the helper punch — so the
+    /// only thing left to do with them is say where they are.
+    #[test]
+    fn a_write_into_a_marked_file_is_named_rather_than_sent() {
+        let dir = scratch("unintercepted-write");
+        let p = placeholder(&dir, "notes.txt", 8192);
+        fill_range(&p, 512);
+        set_mtime(&p, 1_700_000_100);
+        assert_eq!(stamp::state(&p).unwrap(), State::Dirty);
+
+        let found = dirty_files(&dir).unwrap();
+        assert_eq!(found.send, Vec::new());
+        assert_eq!(found.holding, vec![p]);
+    }
+
+    /// A placeholder whose mtime moved and whose content did not.
+    ///
+    /// `touch` does this, and so does a punch of ours whose `let _ =` re-stamp
+    /// failed. It is `Dirty` and it holds nothing, so there are no bytes to lose
+    /// and nothing to warn about — reporting it would put a line in front of the
+    /// user on every resync that they must learn to ignore, which is how the
+    /// line that matters stops being read.
+    #[test]
+    fn a_touched_placeholder_is_skipped_without_a_warning() {
+        let dir = scratch("touched");
+        let p = placeholder(&dir, "held.bin", 1 << 20);
+        set_mtime(&p, 1_700_000_200);
+        assert_eq!(stamp::state(&p).unwrap(), State::Dirty);
+        assert!(!holds_data(&p).unwrap());
+
+        let found = dirty_files(&dir).unwrap();
+        assert_eq!(found.send, Vec::new());
+        assert_eq!(found.holding, Vec::<PathBuf>::new());
+    }
+
+    /// The ordinary placeholder, which is most of the sync directory.
+    #[test]
+    fn a_clean_placeholder_is_neither_sent_nor_reported() {
+        let dir = scratch("clean");
+        placeholder(&dir, "quiet.bin", 1 << 20);
+
+        let found = dirty_files(&dir).unwrap();
+        assert_eq!(found, Resync::default());
+    }
+
+    /// The reason the `Dirty` arm exists, and it still has to work: an in-place
+    /// edit of a hydrated file, which no event mentioned.
+    #[test]
+    fn an_edited_file_is_still_queued() {
+        let dir = scratch("edited");
+        let p = dir.join("report.txt");
+        std::fs::write(&p, b"first").unwrap();
+        store::set_xattr(&p, store::XATTR_ID, b"cloud-2").unwrap();
+        stamp::write(&p).unwrap();
+        std::fs::write(&p, b"second, and longer").unwrap();
+        set_mtime(&p, 1_700_000_300);
+        assert_eq!(stamp::state(&p).unwrap(), State::Dirty);
+
+        let found = dirty_files(&dir).unwrap();
+        let md = std::fs::metadata(&p).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            found.send,
+            vec![FileId {
+                fsid: md.dev(),
+                ino: md.ino()
+            }]
+        );
+        assert_eq!(found.holding, Vec::<PathBuf>::new());
+    }
+
+    /// The other arm, unchanged: an editor's write-and-rename leaves an inode
+    /// carrying neither stamp nor cloud id.
+    #[test]
+    fn an_unstamped_file_with_content_is_still_queued() {
+        let dir = scratch("unstamped");
+        let p = dir.join("saved.txt");
+        std::fs::write(&p, b"written by an editor").unwrap();
+
+        let found = dirty_files(&dir).unwrap();
+        assert_eq!(found.send.len(), 1);
+        assert_eq!(found.holding, Vec::<PathBuf>::new());
+    }
 }
