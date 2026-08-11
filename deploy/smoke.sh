@@ -43,9 +43,23 @@ done
 SYNC_USER="${SUDO_USER:-$USER}"
 SYNC_UID="$(id -u "$SYNC_USER")"
 
+# Only ever this run's own processes, scoped by the mount it was given.
+#
+# This used to be `pkill -x hydrationd` and `pkill -f 'hydration-sync --mount'`,
+# which kill *every* matching process on the machine. Running the gates on a
+# workstation that also has a real sync mount up therefore killed the live
+# helper, leaving that user's mount with no process able to answer for it and
+# every placeholder under it reading back as zeros until someone noticed. It cost
+# a testing session and a tree of 145,713 shadow placeholders.
+#
+# Matching on the mount path is what makes it safe: a helper serving a different
+# mount cannot match, and this script refuses to run unless $MOUNT is a mount
+# point of its own. Recording `$!` instead was tried and does not work — `setsid`
+# forks, so `$!` is the wrapper that exits immediately and the real process is
+# orphaned, which left the previous run's helper alive to fight the next one's.
 cleanup() {
-  pkill -x hydrationd 2>/dev/null || true
-  pkill -f 'hydration-sync --mount' 2>/dev/null || true
+  pkill -f "hydrationd --mount $MOUNT" 2>/dev/null || true
+  pkill -f "hydration-sync --mount $MOUNT" 2>/dev/null || true
   rm -rf "$CLOUD" "$SOCK"
   # Part 4 kills the worker, and the supervisor's response to an unrecoverable
   # unit is to detach the mount (§6a-bis) — so by the end of a successful run
