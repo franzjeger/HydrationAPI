@@ -339,8 +339,18 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             Arc::clone(&resync),
         );
         std::thread::spawn(move || {
-            let Ok(mut sink) = role(&access, C::sink) else {
-                return;
+            // Same reasoning as the delta thread below: a queue that grows and
+            // never drains is visible in the status line, but the reason is not,
+            // and the reason is here.
+            let mut sink = match role(&access, C::sink) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "hydration-sync: could not start the upload sink: {e}; \
+                         nothing will be sent"
+                    );
+                    return;
+                }
             };
             let mut store = Store::new();
             while !stop.load(Ordering::SeqCst) {
@@ -415,8 +425,20 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             Arc::clone(&access),
         );
         std::thread::spawn(move || {
-            let Ok(mut cloud) = role(&access, C::discover) else {
-                return;
+            // Leaving quietly here is indistinguishable, from outside, from a
+            // drive with nothing on it: the status thread keeps printing "0
+            // unsent", no placeholder ever appears, and the state directory
+            // stays empty. The only thread that could have said why is the one
+            // that just died. A live Graph account produced exactly that.
+            let mut cloud = match role(&access, C::discover) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "hydration-sync: could not start the delta feed: {e}; \
+                         no delta pass will run"
+                    );
+                    return;
+                }
             };
             let mut placer = TmpfilePlacer::new(&mount);
             let mut store = Store::new();
