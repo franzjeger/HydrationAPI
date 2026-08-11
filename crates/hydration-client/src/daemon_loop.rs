@@ -287,6 +287,43 @@ fn control(
 /// a cloud is beyond the three traits, which is the whole point: swapping
 /// `FolderCloud` for a real service changes this file not at all.
 pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
+    // Before the credential, because this one costs nothing and the failure it
+    // prevents is the worst one available.
+    //
+    // A sync root that is not its own mount can never be marked — §6.4a, a
+    // directory mark delivers nothing — so every placeholder written into it is
+    // a file that reads as zeros with no way to ever fix itself. Starting anyway
+    // and materialising into the bare directory underneath a mount that has not
+    // come up is not a corner case: it happened, and produced 145,711 files and
+    // 102 GB of apparent size, all of it zero, indistinguishable from the real
+    // thing to everything that read it.
+    //
+    // See `mount::is_mount_point` for why this is not an `st_dev` comparison.
+    match crate::mount::is_mount_point(&config.mount) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not a mount point; a sync root has to be its own mount \
+                     or nothing can hydrate what is written into it, and every \
+                     placeholder would read back as zeros",
+                    config.mount.display()
+                ),
+            ))
+        }
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!(
+                    "could not tell whether {} is a mount point ({e}); refusing \
+                     rather than materialising into a directory that may not be one",
+                    config.mount.display()
+                ),
+            ))
+        }
+    }
+
     // Asked once up front so a missing credential — or an unwritable cloud
     // directory — is a startup failure rather than a surprise on the first
     // fetch.
@@ -451,7 +488,43 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // held back on purpose was consumed by silence, and the service
             // never mentions those objects again.
             let mut unfinished = false;
+            // Said once, not once a round: a mount that is gone stays gone until
+            // someone acts, and five seconds of the same line is a log nobody
+            // reads any of.
+            let mut complained = false;
             while !stop.load(Ordering::SeqCst) {
+                // Re-asked every round, because the startup check only covers
+                // startup. The mount can go away under a running daemon —
+                // `hydrationd` detaches it on the way out, an administrator can
+                // unmount it — and from here the sync root would look like an
+                // ordinary empty directory waiting to be filled with 145,711
+                // placeholders that nothing can ever hydrate.
+                match crate::mount::is_mount_point(&mount) {
+                    Ok(true) => complained = false,
+                    other => {
+                        if !complained {
+                            complained = true;
+                            match other {
+                                Ok(false) => eprintln!(
+                                    "hydration-sync: {} is no longer a mount point — \
+                                     nothing will be applied until it is back, because \
+                                     placeholders written into the bare directory would \
+                                     read as zeros",
+                                    mount.display()
+                                ),
+                                Err(e) => eprintln!(
+                                    "hydration-sync: cannot tell whether {} is still a \
+                                     mount point ({e}) — holding off rather than writing \
+                                     into a directory that may not be one",
+                                    mount.display()
+                                ),
+                                Ok(true) => unreachable!(),
+                            }
+                        }
+                        std::thread::sleep(Duration::from_secs(5));
+                        continue;
+                    }
+                }
                 match cloud.changes(&cursor) {
                     Ok((changes, next)) if !changes.is_empty() => {
                         // Snapshotted, then released — not held across the pass.

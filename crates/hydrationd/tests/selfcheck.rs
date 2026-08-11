@@ -205,3 +205,43 @@ fn a_privileged_run_can_decide_its_own_reach() {
         other => panic!("expected a decided reach in the privileged suite, got {other:?}"),
     }
 }
+
+#[test]
+fn a_helper_that_cannot_pair_takes_the_mount_with_it() {
+    let Some(mount) = env() else {
+        return skip("needs root and HYDRATIOND_TEST_MOUNT");
+    };
+    let at = mount.join("unpaired");
+    unmount(&at);
+    assert!(mount_tmpfs(&at), "could not mount a tmpfs to test with");
+
+    // No socket, so the helper gets as far as the mount checks and then cannot
+    // reach anyone. The old behaviour was to exit and leave this mounted, which
+    // under `RequiresMountsFor=` is the ordinary path between boot and login:
+    // a mount full of placeholders with no process able to answer for them.
+    let sock = mount.join("no-such.sock");
+    let out = Command::new(env!("CARGO_BIN_EXE_hydrationd"))
+        .args(["--mount".as_ref(), at.as_os_str()])
+        .args(["--socket".as_ref(), sock.as_os_str()])
+        .output()
+        .expect("run hydrationd");
+
+    let still_mounted = Command::new("mountpoint")
+        .arg("-q")
+        .arg(&at)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    unmount(&at);
+    let _ = std::fs::remove_dir(&at);
+
+    assert!(
+        !out.status.success(),
+        "the helper reported success with no peer to fetch through"
+    );
+    assert!(
+        !still_mounted,
+        "the helper exited and left {} mounted with nothing answering for it",
+        at.display()
+    );
+}

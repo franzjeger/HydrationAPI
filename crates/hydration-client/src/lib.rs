@@ -12,6 +12,7 @@
 pub mod daemon_loop;
 pub mod delta;
 pub mod manifest;
+pub mod mount;
 pub mod namespace;
 pub mod place;
 pub mod providers;

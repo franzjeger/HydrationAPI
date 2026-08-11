@@ -124,6 +124,47 @@ fn connect(args: &Args) -> io::Result<UnixStream> {
     Ok(sock)
 }
 
+/// Take the sync mount out of the namespace, and say so either way.
+///
+/// Lazy, like the one on the shutdown path: a reader already inside is not a
+/// reason to leave the door open behind it, and `MNT_DETACH` stops new access
+/// immediately while letting the existing ones finish.
+///
+/// Silence is not an option in either direction. A detach that happened has
+/// removed the user's files from where they expect them, and a detach that
+/// failed has left them reachable and unprotected. Both are things the person
+/// reading the journal needs told.
+fn detach_or_say_why(mount: &std::path::Path) {
+    let c = match std::ffi::CString::new(mount.as_os_str().as_encoded_bytes()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "hydrationd: cannot name {} to detach it: {e}",
+                mount.display()
+            );
+            return;
+        }
+    };
+    if unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) } == 0 {
+        eprintln!(
+            "hydrationd: detached {} — its files are out of reach rather than \
+             readable as zeros",
+            mount.display()
+        );
+    } else {
+        let e = io::Error::last_os_error();
+        // EINVAL here is the ordinary case, not a fault: the path is not a mount
+        // point, so there was nothing of ours to take down.
+        if e.raw_os_error() != Some(libc::EINVAL) {
+            eprintln!(
+                "hydrationd: could not detach {} ({e}) — anything reading through \
+                 it is unprotected until this service comes back",
+                mount.display()
+            );
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     let args = parse();
     if unsafe { libc::geteuid() } != 0 {
@@ -217,6 +258,17 @@ fn main() -> io::Result<()> {
                 "hydrationd: cannot reach the sync daemon at {}: {e}",
                 args.socket.display()
             );
+            // Leaving without taking the mount down is how a deployment ends up
+            // serving zeros, and it is the ordinary case rather than an exotic
+            // one: `RequiresMountsFor=` puts the mount up as a *precondition* of
+            // starting this service, so between boot and the user's session
+            // there is a mount full of placeholders and no process able to
+            // answer for it. Every restart re-opened that window.
+            //
+            // The shutdown path further down does this after a mark has existed.
+            // Here nothing was ever marked, which does not make the files any
+            // safer — it makes them unprotected without even a group open.
+            detach_or_say_why(&args.mount);
             std::process::exit(1);
         }
     };
