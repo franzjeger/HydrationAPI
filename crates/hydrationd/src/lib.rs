@@ -16,5 +16,6 @@ pub mod placeholder;
 pub mod policy;
 pub mod remote;
 pub mod report;
+pub mod selfcheck;
 pub mod supervisor;
 pub mod watch;

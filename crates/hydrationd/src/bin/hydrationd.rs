@@ -19,11 +19,20 @@ use hydrationd::fanotify::Group;
 use hydrationd::policy::Policy;
 use hydrationd::remote::SocketFetch;
 use hydrationd::report;
+use hydrationd::selfcheck::{self, MountIdentity, Reach};
 use hydrationd::supervisor::{deny, InFlight};
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// How often the supervisor re-asks whether its mark still covers the path.
+///
+/// The answer only changes when something mounts, so this is not a poll of
+/// anything that moves — it is a bound on how long a replaced mount can go
+/// unnoticed. One `statx` per interval, against a supervisor loop that turns ten
+/// times a second and is otherwise idle.
+const MOUNT_CHECK_EVERY: Duration = Duration::from_secs(2);
 
 struct Args {
     mount: PathBuf,
@@ -121,9 +130,51 @@ fn main() -> io::Result<()> {
         eprintln!("hydrationd: needs CAP_SYS_ADMIN (run as root)");
         std::process::exit(1);
     }
-    if !args.mount.is_dir() {
-        eprintln!("hydrationd: {} is not a directory", args.mount.display());
-        std::process::exit(1);
+    // `metadata`, not `is_dir()`. `is_dir()` is false for every stat error, so a
+    // sync root inside a 0700 home — with a capability set that dropped
+    // CAP_DAC_OVERRIDE, which is exactly what the example unit specifies —
+    // reported "is not a directory" and sent a deployment looking for the wrong
+    // thing entirely. Print what stat actually said.
+    match std::fs::metadata(&args.mount) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            eprintln!(
+                "hydrationd: {} exists but is not a directory",
+                args.mount.display()
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("hydrationd: cannot stat {}: {e}", args.mount.display());
+            std::process::exit(1);
+        }
+    }
+
+    // Before anything is marked, because a mark taken from inside a private
+    // mount namespace is the one failure with no symptom: it succeeds, this
+    // process reports it is watching, and every read outside the namespace comes
+    // back as zeros. See `selfcheck` for the measurement and the systemd
+    // directives that cause it.
+    match selfcheck::reach() {
+        Reach::Everyone => {}
+        Reach::OurselvesOnly { ours, init } => {
+            eprintln!(
+                "hydrationd: refusing to start — this process is in its own mount \
+                 namespace ({ours}, init is in {init}), so a mount mark here would \
+                 protect nobody and every placeholder read outside it would return \
+                 zeros.\n\
+                 hydrationd: under systemd, each of PrivateTmp=, PrivateNetwork=, \
+                 ProtectKernelTunables=, ProtectControlGroups= and \
+                 ProtectKernelModules= causes this on its own. Use \
+                 RestrictAddressFamilies=AF_UNIX for network denial instead; it \
+                 needs no namespace."
+            );
+            std::process::exit(1);
+        }
+        Reach::Unknown(why) => eprintln!(
+            "hydrationd: WARNING — could not confirm this process shares init's \
+             mount namespace ({why}); if it does not, nothing here protects anything"
+        ),
     }
 
     // Reported before anything else, because if it is non-empty the guarantee
@@ -158,6 +209,23 @@ fn main() -> io::Result<()> {
 
     let group = Group::new_pre_content()?;
     group.mark_mount(&args.mount)?;
+    // Taken here, between the mark and the fork, so it names the mount the mark
+    // actually went onto. The supervisor re-asks for as long as it runs: a mount
+    // can be replaced under a live mark — this helper detaches its own on the way
+    // out and `RequiresMountsFor=` puts a fresh one up — and the mark stays
+    // perfectly valid while protecting a mount nobody can reach any more.
+    let marked = match MountIdentity::capture(&args.mount) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            // Not fatal, and not silent. Without this the supervisor loses one
+            // check; pretending it still has it would be worse than saying so.
+            eprintln!(
+                "hydrationd: WARNING — cannot identify the mount that was just \
+                 marked ({e}); a mount replaced under this mark will not be noticed"
+            );
+            None
+        }
+    };
     let in_flight = InFlight::new();
     let worker_view = in_flight.share();
 
@@ -224,6 +292,8 @@ fn main() -> io::Result<()> {
     let mut beat = (in_flight.progress(), in_flight.liveness());
     let mut moved = Instant::now();
     let mut stalled = false;
+    let mut unmarked = None;
+    let mut next_mount_check = Instant::now() + MOUNT_CHECK_EVERY;
     loop {
         if unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) } == child {
             break;
@@ -239,7 +309,51 @@ fn main() -> io::Result<()> {
             stalled = true;
             break;
         }
+        // Is the mark still on the mount this path leads to? Asked on a timer
+        // rather than every pass: the answer changes only when something mounts,
+        // and the loop turns ten times a second.
+        //
+        // An error counts as a failure, not as "no news". A path whose mount
+        // cannot be read is a path whose protection cannot be vouched for, and
+        // continuing would mean serving reads through a mount this process can
+        // no longer identify.
+        if let Some(id) = marked {
+            if Instant::now() >= next_mount_check {
+                next_mount_check = Instant::now() + MOUNT_CHECK_EVERY;
+                match id.still_current(&args.mount) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        unmarked = Some("the mount was replaced under the mark".to_string());
+                        break;
+                    }
+                    Err(e) => {
+                        unmarked = Some(format!("the marked mount can no longer be read: {e}"));
+                        break;
+                    }
+                }
+            }
+        }
         std::thread::sleep(Duration::from_millis(100));
+    }
+
+    if let Some(why) = &unmarked {
+        eprintln!(
+            "hydrationd: {why} — everything at {} is now unprotected, and reads \
+             through it would return the zeros a placeholder is made of. Failing \
+             closed.",
+            args.mount.display()
+        );
+        // The worker is still alive and still answering events on a mark that no
+        // longer covers the path. It has to go before the shutdown below, which
+        // exists to clean up after a worker that is already gone.
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        let grace = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < grace {
+            if unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) } == child {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     if stalled {
