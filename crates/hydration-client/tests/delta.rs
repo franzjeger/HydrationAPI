@@ -4,7 +4,7 @@
 //! local copy is the truth. A delta pass may create and may refresh, but it must
 //! never replace content that exists nowhere else.
 
-use hydration_client::delta::{apply, Applied, Change, Kept, Materialise, Why};
+use hydration_client::delta::{apply, Applied, Change, Failed, Failure, Kept, Materialise, Why};
 use hydration_client::store::{self, Store};
 use hydration_client::upload::{Queue, TestClock};
 use hydration_protocol::FileId;
@@ -34,6 +34,11 @@ fn file_id(p: &Path) -> FileId {
 struct Recorder {
     placed: Vec<String>,
     removed: Vec<String>,
+    /// Makes every call fail, for the tests about what a failure is reported as.
+    /// The real placer fails for reasons a test cannot arrange — a read-only
+    /// mount, a directory owned by somebody else — and the reconciler cannot
+    /// tell the difference: it sees an `io::Error` either way.
+    refuse_with: Option<io::ErrorKind>,
 }
 
 impl Materialise for Recorder {
@@ -44,6 +49,9 @@ impl Materialise for Recorder {
         cloud_id: &str,
         etag: Option<&str>,
     ) -> io::Result<()> {
+        if let Some(kind) = self.refuse_with {
+            return Err(kind.into());
+        }
         self.placed.push(path.display().to_string());
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -67,6 +75,9 @@ impl Materialise for Recorder {
     }
 
     fn remove(&mut self, path: &Path) -> io::Result<()> {
+        if let Some(kind) = self.refuse_with {
+            return Err(kind.into());
+        }
         self.removed.push(path.display().to_string());
         std::fs::remove_file(path)
     }
@@ -266,11 +277,54 @@ fn a_cloud_path_that_escapes_the_sync_root_is_refused() {
     );
 
     assert_eq!(out.created, 0);
-    assert_eq!(out.failed.len(), 2, "{out:?}");
+    assert_eq!(
+        out.failed,
+        vec![
+            Failed::new("../../../tmp/evil", Failure::PathRefused),
+            Failed::new("/etc/cron.d/evil", Failure::PathRefused),
+        ],
+        "{out:?}"
+    );
     assert!(
         m.placed.is_empty(),
         "a remote service placed a file outside the sync directory: {:?}",
         m.placed
+    );
+}
+
+/// The failure that started this: a placement that fails carries its errno.
+///
+/// On 2026-08-11 a scratch mount owned by root made every `place` fail with
+/// `EACCES`, and the log said `could not apply <path>` and nothing else — the
+/// same sentence a refused path produces, so the smoke failure was bisected
+/// against the daemon to recover a cause the kernel had already supplied. What
+/// this asserts is not the wording but that the `io::Error` survives at all:
+/// the reason is the thing being tested, so it is compared, not counted.
+#[test]
+fn a_placement_that_fails_says_why() {
+    let dir = scratch("place-fails");
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+    let mut m = Recorder {
+        refuse_with: Some(io::ErrorKind::PermissionDenied),
+        ..Default::default()
+    };
+
+    let out = run(&dir, &[upserted("notes.txt", 10, "cloud-1")], &q, &mut m);
+
+    assert_eq!(out.created, 0, "{out:?}");
+    assert_eq!(
+        out.failed,
+        vec![Failed::new(
+            "notes.txt",
+            Failure::Place(io::Error::from(io::ErrorKind::PermissionDenied).to_string()),
+        )],
+        "{out:?}"
+    );
+    // And the line a user would see names the cause rather than implying one.
+    assert!(
+        out.failed[0].why.to_string().contains("permission denied"),
+        "{}",
+        out.failed[0].why
     );
 }
 

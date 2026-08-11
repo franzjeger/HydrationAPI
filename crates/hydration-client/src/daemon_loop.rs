@@ -582,8 +582,17 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                                         k.path, k.why
                                     );
                                 }
-                                for p in &a.failed {
-                                    eprintln!("hydration-sync:   could not apply {p}");
+                                // With the cause, because without it these lines
+                                // are indistinguishable from each other: a
+                                // permission error on the sync root and a path
+                                // the cloud was never allowed to name printed
+                                // the same sentence, and the difference had to
+                                // be found by bisecting the daemon.
+                                for f in &a.failed {
+                                    eprintln!(
+                                        "hydration-sync:   could not apply {}: {}",
+                                        f.path, f.why
+                                    );
                                 }
                             }
                             Ok(_) => {}

@@ -125,6 +125,84 @@ impl Kept {
     }
 }
 
+/// A change that could not be applied, and what stopped it.
+///
+/// [`Kept`]'s argument from the other side, and it cost an afternoon on
+/// 2026-08-11 to learn that it applies here too. A scratch mount owned by root
+/// made every `Materialise::place` fail with `EACCES`, and each one logged
+/// `could not apply <path>` — the identical line a refused path, an absurd size
+/// or an occupied destination produces. So the smoke failure was bisected
+/// against the daemon to arrive at something the errno had been holding the
+/// whole time.
+///
+/// "Never invent a diagnostic" is usually read as a rule against making causes
+/// up. It forbids omitting them too: a line naming no cause is one the reader
+/// has to invent a cause for, and the first guess was the kernel path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failed {
+    /// As the change named it, so it can be matched against the service's view.
+    /// Removals name the local path instead — a removal carries no path of its
+    /// own, only an object id.
+    pub path: String,
+    pub why: Failure,
+}
+
+/// What stopped a change from being applied.
+///
+/// The three that come from a syscall carry the message and not the
+/// `io::Error`, because `Applied` is `Clone` and `Eq` — a caller comparing two
+/// passes is how "nothing happened" is recognised — and `io::Error` is neither.
+/// The text is `io::Error`'s own; nothing here rewrites it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// `safe_join` refused the path the change arrived with.
+    PathRefused,
+    /// The change claims a size past [`MAX_OBJECT`].
+    TooLarge { size: u64 },
+    /// The object moved, and something else already holds the destination.
+    /// Retryable: the change that frees it may be later in the same feed.
+    DestinationOccupied,
+    /// The local rename that would have followed the object to its new path.
+    Rename(String),
+    /// `Materialise::place` — creating a placeholder, or refreshing one.
+    Place(String),
+    /// `Materialise::remove` — deleting a file the cloud no longer has.
+    Remove(String),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // All three of `safe_join`'s refusals, because the path is on the
+            // same line and the reader can see which one it was. Naming a
+            // single one would be a guess.
+            Self::PathRefused => write!(
+                f,
+                "the path is empty, escapes the sync root, or claims one of our own names"
+            ),
+            Self::TooLarge { size } => {
+                write!(
+                    f,
+                    "it claims {size} bytes, past the {MAX_OBJECT}-byte limit"
+                )
+            }
+            Self::DestinationOccupied => write!(f, "another file is already at that path"),
+            Self::Rename(e) => write!(f, "renaming the local file failed: {e}"),
+            Self::Place(e) => write!(f, "writing the placeholder failed: {e}"),
+            Self::Remove(e) => write!(f, "removing the local file failed: {e}"),
+        }
+    }
+}
+
+impl Failed {
+    pub fn new(path: &str, why: Failure) -> Self {
+        Self {
+            path: path.to_string(),
+            why,
+        }
+    }
+}
+
 /// What a delta pass did, for the status a user is shown.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Applied {
@@ -137,7 +215,8 @@ pub struct Applied {
     /// Changes deliberately not applied because local content would have been
     /// lost. Not an error, and not silent: these are what a conflict UI is for.
     pub kept_local: Vec<Kept>,
-    pub failed: Vec<String>,
+    /// Changes that could not be applied, each with what stopped it.
+    pub failed: Vec<Failed>,
     /// At least one failure could succeed on a later pass — a rename blocked by
     /// a destination that another change will free, most often.
     ///
@@ -189,7 +268,7 @@ pub fn apply<M: Materialise>(
                 etag,
             } => {
                 let Some(abs) = safe_join(root, path) else {
-                    out.failed.push(path.clone());
+                    out.failed.push(Failed::new(path, Failure::PathRefused));
                     continue;
                 };
 
@@ -204,7 +283,8 @@ pub fn apply<M: Materialise>(
                 // the §5.7 failure, and silently choosing a different one would
                 // be inventing an object.
                 if *size > MAX_OBJECT {
-                    out.failed.push(path.clone());
+                    out.failed
+                        .push(Failed::new(path, Failure::TooLarge { size: *size }));
                     continue;
                 }
 
@@ -235,15 +315,17 @@ pub fn apply<M: Materialise>(
                             // retries is a permanent wrong state: the caller
                             // advances its cursor and the service never mentions
                             // these objects again.
-                            out.failed.push(path.clone());
+                            out.failed
+                                .push(Failed::new(path, Failure::DestinationOccupied));
                             out.retryable = true;
                             continue;
                         }
                         if let Some(parent) = abs.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        if std::fs::rename(&existing.path, &abs).is_err() {
-                            out.failed.push(path.clone());
+                        if let Err(e) = std::fs::rename(&existing.path, &abs) {
+                            out.failed
+                                .push(Failed::new(path, Failure::Rename(e.to_string())));
                             out.retryable = true;
                             continue;
                         }
@@ -262,7 +344,9 @@ pub fn apply<M: Materialise>(
                     // Nothing there: this is the ordinary case, a new object.
                     Err(_) => match mat.place(&abs, *size, cloud_id, etag.as_deref()) {
                         Ok(()) => out.created += 1,
-                        Err(_) => out.failed.push(path.clone()),
+                        Err(e) => out
+                            .failed
+                            .push(Failed::new(path, Failure::Place(e.to_string()))),
                     },
                     Ok(md) => {
                         let id = file_id(&md);
@@ -355,7 +439,9 @@ pub fn apply<M: Materialise>(
                         }
                         match mat.place(&abs, *size, cloud_id, etag.as_deref()) {
                             Ok(()) => out.updated += 1,
-                            Err(_) => out.failed.push(path.clone()),
+                            Err(e) => out
+                                .failed
+                                .push(Failed::new(path, Failure::Place(e.to_string()))),
                         }
                     }
                 }
@@ -396,7 +482,10 @@ pub fn apply<M: Materialise>(
                 }
                 match mat.remove(&entry.path) {
                     Ok(()) => out.removed += 1,
-                    Err(_) => out.failed.push(entry.path.display().to_string()),
+                    Err(e) => out.failed.push(Failed::new(
+                        &entry.path.display().to_string(),
+                        Failure::Remove(e.to_string()),
+                    )),
                 }
             }
         }
