@@ -1147,11 +1147,13 @@ So the file is asked directly. At the three moments the framework itself makes c
 
 *The clean-state stamp must describe content that is no newer than what was actually sent.* The upload stamped from the file as it was *afterwards*. An edit that landed during the transfer was thereby blessed as sent — it would never have been queued again, and the next change from the cloud would have destroyed it. A stale stamp costs a redundant upload; a fresh one costs the edit. The state is now observed before the sender reads a single byte.
 
-For the same reason the framework stamps after *its own* punches — eviction, dehydration, and the rollback in a failed hydration. Punching moves the mtime, and a placeholder left standing as `Dirty` would have been refused a refresh by the delta pass *and* queued for upload by a resync walk — where uploading it means reading it, and reading it hydrates it back.
+For the same reason the framework stamps after *its own* punches — eviction, dehydration, and the rollback in a failed hydration. Punching moves the mtime, and a placeholder left standing as `Dirty` would have been refused a refresh by the delta pass *and* queued for upload by a resync walk — where uploading it means reading it, and reading it hydrates it back. Those stamps are now the second guard rather than the only one: the walk refuses a marked file whatever its stamp says (§8e), because every one of them is written with `let _ =` and a transfer killed mid-stream leaves a `Dirty` placeholder that no stamp was ever going to cover.
 
 `Unstamped` is deliberately not the same as `Dirty` as far as the delta pass is concerned: a file the framework has never written must not be overwritten. But for the *upload direction* it is the signal that was missing, and it took a review to see. Most editors write by creating a temporary file and renaming it over the target. A rename swaps the inode, and the clean-state stamp lives on the inode — so the replacement carries neither a stamp nor a cloud id. The event path catches them; the resync walk, which exists precisely for when the event path did not, skipped the most common form of editing there is.
 
 The walk now takes two kinds: `Dirty`, and `Unstamped` with content and without a cloud id. The second is by definition a file the framework has never *sent* — either because the user just created it, or because a rename replaced one that had been sent. It does not queue the whole directory, because everything the framework has placed, hydrated or uploaded is stamped. It also picks up uploads that failed, which nothing else did.
+
+Neither kind may be a placeholder, and the mark is checked above both rather than inside one of them. It was inside `Unstamped` only, and `Dirty` is the arm a placeholder actually lands in — §8e is what that cost and why sending them anyway is not the safer reading it looks like.
 
 The channel says so when it has holes. `FromHelper::Resync` is sent on queue overflow — the marker arrives without a descriptor and was previously discarded along with everything else that lacked an fd, so the one signal that says "you have lost changes" was the only one that was silently thrown away. The client then walks the directory and compares the stamp against `stat`. The same happens at startup and every time the privileged helper reconnects, since both are states in which changes happened that no event will ever mention.
 
@@ -1470,6 +1472,90 @@ Range-based hydration is the real solution for reads, and it is deliberately not
 bundled with this change: it introduces a third file state — partially present —
 which the store, the manifest, the delta pass, eviction and §5.8 are all two-state
 about today.
+
+---
+
+## 8e. A placeholder is never unsent content — and asking whether one holds bytes is free
+
+The resync walk (§6g) took two kinds, and the mark was checked in only one of them.
+`Unstamped` excluded placeholders from the start, with the right reason written down.
+`Dirty` did not — and a placeholder is `Dirty` in every state that matters:
+
+- A transfer cut off between the `pwrite` and the stamp `finish_hydration` writes. A
+  machine-wide `pkill hydrationd` left exactly this on a live mount on 2026-08-10.
+- A transfer in progress right now, which looks identical from the client.
+- A punch of ours whose re-stamp failed — `dehydrate`, `evict` and `abandon` all stamp
+  with `let _ =`.
+- `touch` on a placeholder: the mtime moved and there is no content at all.
+
+Queued, `run_upload` resolves the path and reads it, through the mount. Every missing
+range fires a pre-content event, the helper hydrates the whole object, and the upload
+then sends the cloud a byte-identical copy of what it has just served. A full down-and-up
+cycle for a multi-gigabyte file, and a version bump every other device applies.
+
+**The obvious repair — send them anyway, in case the bytes are the user's — does not
+work, and it is worth being exact about why.** The upload path cannot carry those bytes:
+`run_upload` reads the file in order to send it, and *that read* is what makes the helper
+punch. `clear_residue` is unconditional, so whatever was in the file is gone before a byte
+of it reaches the sink, and what goes up is the cloud's own content. Queueing does not
+rescue an edit; it destroys it and pays for two transfers to do so.
+
+Clearing the mark first is the one thing that would let those bytes out, and it must
+never be done from the client. A cut-off transfer holds a *prefix* of the object with
+holes after it; unmarked, those holes read as legitimate zeros and the upload writes them
+over the cloud object for every device. Nothing on the unprivileged side can tell that
+apart from a user's edit — which is exactly why `clear_residue` does not try, and why
+`looks_stripped` refuses to install an ignore mark on a sized file occupying no disk.
+Guessing wrong destroys the object. Not guessing costs a log line.
+
+So the walk skips them and *names* the ones that hold bytes. That state is not supposed to
+survive between transfers, the walk is the only thing that looks at every file, and after
+the next read the file is quietly the cloud's copy again with nothing left to notice.
+
+The report offers no remedy, and deliberately says so rather than rounding the sentence
+off with one. Copying the bytes somewhere safe is itself a read, and the read is what
+punches them; the only window in which they are readable is the one where both halves of
+the helper are dead and the mount is unmarked — which is the failure the split exists to
+prevent, and is over by the time the reconnect triggers the walk. Actually rescuing them
+would mean the client taking a copy during the walk, which needs a decision this document
+has not made: where a quarantined copy goes. Not inside the sync root (§6a-ter forbids the
+write, and the copy would then be uploaded as a new file), and outside it is a policy
+choice, not a default. Naming the file is what is owed today; a quarantine is the next
+question, not a missing line.
+
+That report needs `holds_data` — `SEEK_DATA`, never `st_blocks`, which reports the same
+count for an empty placeholder and a filled one (§8z). Which raises the question the
+rest of this section answers: the client would be asking it of an ordinary descriptor,
+inside a marked mount. If `SEEK_DATA` fires a pre-content event, the diagnostic hydrates
+the object the walk exists to leave alone, and the distinction cannot be drawn at all.
+
+`probes/seekdata.c`, 7.1.6. `hollow` is a 1 MiB file that is entirely a hole, so
+`SEEK_DATA` has to scan the extent map before it can answer; `residue` is the same size
+with bytes at the front, where it answers immediately. Both shapes, because they are
+different paths in the filesystem.
+
+```
+btrfs                                                ext4 (128-byte inode, 1K block)
+  file             action         events               file             action         events
+  hollow (1 MiB)   open only      0                    hollow (1 MiB)   open only      0
+  hollow (1 MiB)   open+SEEK_DATA 0                    hollow (1 MiB)   open+SEEK_DATA 0
+  hollow (1 MiB)   open+read      1                    hollow (1 MiB)   open+read      1
+  residue (1 MiB)  open only      0                    residue (1 MiB)  open only      0
+  residue (1 MiB)  open+SEEK_DATA 0                    residue (1 MiB)  open+SEEK_DATA 0
+  residue (1 MiB)  open+read      1                    residue (1 MiB)  open+read      1
+```
+
+`open` and `lseek(SEEK_DATA)` fire nothing; the `read` control fires on every row, so the
+zeros are not a mark that failed to take. Asking whether a placeholder holds bytes
+therefore does not hydrate it. (xfs is not measured here: this kernel has no xfs module.
+The mechanism is `rw_verify_area()`, which `lseek` does not go through, so the answer is
+not expected to be filesystem-specific — but that is the argument, and the two rows above
+are the measurement.)
+
+The syscall is still asked only of a placeholder whose stamp already disagrees. Putting
+bytes in one moves its mtime, and nothing in the framework writes into a marked file and
+re-stamps it, so a `Clean` placeholder is skipped without asking — which keeps it off the
+overwhelming majority of them.
 
 ---
 
