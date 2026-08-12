@@ -42,13 +42,30 @@ prevent is one that must not be silent.
 | Unit | Runs as | Holds |
 |---|---|---|
 | `hydration-mount.mount` | system | the sync volume |
+| `hydrationd.path` | system | nothing — it starts the helper when the socket appears |
 | `hydrationd.service` | **root**, `CAP_SYS_ADMIN` only | the fanotify group |
 | `hydration-sync.service` | the user | the credentials |
 
-The ordering is the point. `hydrationd.service` is `BindsTo=` the mount and
-`StopPropagatedFrom=` it, so the two live and die together: if the helper stops
-for any reason — including both its processes being killed — the mount goes with
-it, and the files become *unreachable* rather than readable-as-zeros.
+The ordering is the point, and it runs in two directions that are easy to
+conflate.
+
+**The mount and the helper.** `hydrationd.service` names the mount with
+`RequiresMountsFor=`, and the helper detaches the mount itself on the way out
+(§6a-bis). The two therefore live and die together: if the helper stops for any
+reason — including both its processes being killed — the mount goes with it, and
+the files become *unreachable* rather than readable-as-zeros. `BindsTo=` was the
+obvious spelling and is wrong: systemd reads the helper's own detach as a
+deliberate stop and suppresses the restart entirely, measured `NRestarts=0` with
+both units inactive, permanently. The unit file carries the measurement.
+
+**The helper and its peer.** These are a *system* unit and a *user* unit, so
+systemd cannot order them against each other at all, and the socket the helper
+dials does not exist until the user logs in. `hydrationd.path` is what closes
+that: it starts the helper once, when the socket appears. `hydrationd.service`
+has no `[Install]` section precisely so that nothing else can start it at boot —
+a helper started before its peer exists pulls the mount up, finds nobody to
+fetch from, and exits, and `Restart=always` makes that a loop of windows in which
+the mount is up with nothing answering for it.
 
 `hydration-sync.service` may come and go freely. While it is gone, hydration
 fails with `EIO`, which is a correct answer; when it comes back, the helper
@@ -94,13 +111,20 @@ socket path is the only authentication, and a path is not a credential.
 ## Installing
 
 ```bash
-sudo cp deploy/hydrationd.service deploy/hydration-mount.mount /etc/systemd/system/
+sudo cp deploy/hydrationd.service deploy/hydrationd.path \
+        deploy/hydration-mount.mount /etc/systemd/system/
 mkdir -p ~/.config/systemd/user
 cp deploy/hydration-sync.service ~/.config/systemd/user/
 sudo systemctl daemon-reload && systemctl --user daemon-reload
-sudo systemctl enable --now hydrationd.service
+# The *path* unit, not the service. `hydrationd.service` has no [Install]
+# section and `enable` on it will fail — that is deliberate, see below.
+sudo systemctl enable --now hydrationd.path
 systemctl --user enable --now hydration-sync.service
 ```
+
+Every `CHANGE-ME` has to be replaced first, and the socket path in
+`hydrationd.path` must match the helper's `--socket` argument exactly — the path
+unit is watching for that file and nothing else.
 
 ## Checking it is actually safe
 

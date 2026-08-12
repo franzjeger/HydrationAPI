@@ -35,6 +35,14 @@ Documentation=https://github.com/franzjeger/HydrationAPI
 # units active, and an administrator's `umount` still stops the service.
 RequiresMountsFor=/home/CHANGE-ME/OneDrive
 
+# systemd's default start-rate limit is 5 starts in 10s, and a unit that trips it
+# is left *dead* — which for this unit means a mount with no helper, the one
+# state this deployment must not reach quietly. `hydrationd.path` makes the
+# boot-time storm this was written for impossible, so nothing should reach the
+# limit any more; it stays because being wrong about that costs the deployment
+# and turning it off costs nothing.
+StartLimitIntervalSec=0
+
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/hydrationd --mount /home/CHANGE-ME/OneDrive --socket /run/user/CHANGE-ME/hydration-sync.sock --peer-uid CHANGE-ME
@@ -110,5 +118,13 @@ SystemCallArchitectures=native
 # moment things are going wrong.
 OOMScoreAdjust=-900
 
-[Install]
-WantedBy=multi-user.target
+# No [Install] section, on purpose.
+#
+# Nothing may start this at boot. Between boot and the user's login there is no
+# sync daemon to answer events, and a helper that started anyway would pull the
+# mount up via RequiresMountsFor= and then exit for want of a peer — a mount full
+# of placeholders with nothing answering for them, which is the §6a failure this
+# whole design exists to prevent. With Restart=always it would do that in a loop.
+#
+# `hydrationd.path` is the only trigger: it starts this once, when the socket
+# appears. Enable that, not this.

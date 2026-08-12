@@ -51,6 +51,47 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+      # The unit files are load-bearing and nothing else compiles them.
+      #
+      # Both failures this guards against have already happened. A
+      # `StartLimitIntervalSec=` written into `[Service]` instead of `[Unit]` is
+      # accepted, logged as an unknown key, and ignored — a directive that reads
+      # as present and does nothing. And the helper dials the socket named by its
+      # `--socket` argument while `hydrationd.path` waits for the one named by
+      # `PathExists=`; if those two drift apart the helper is simply never
+      # started, at boot, silently, on a machine nobody is watching.
+      - name: the unit files parse and agree
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          for f in hydrationd.service hydrationd.path hydration-sync.service; do
+            sed -e 's#/home/CHANGE-ME/OneDrive#/tmp/sync-root#g' \
+                -e 's#/run/user/CHANGE-ME/#/run/user/1000/#g' \
+                -e 's#--peer-uid CHANGE-ME#--peer-uid 1000#g' \
+                -e 's#CHANGE-ME#1000#g' "deploy/$f" > "$tmp/$f"
+          done
+          # `verify` reports unknown keys and bad syntax on stderr and still
+          # exits 0, so the output is what has to be checked, not the status.
+          out="$(systemd-analyze verify "$tmp"/*.service "$tmp"/*.path 2>&1 || true)"
+          # Two kinds of noise are expected and are properties of the runner
+          # rather than of the units: the substituted directories do not exist,
+          # and the binaries are not installed at their deployed paths. Anything
+          # else — an unknown key, a bad section, a syntax error — is a defect.
+          bad="$(printf '%s\n' "$out" \
+            | grep -vE 'Failed to (prepare|resolve)|is not executable: No such file or directory|^$' || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::systemd rejected a unit file:"
+            printf '%s\n' "$bad"
+            exit 1
+          fi
+          want="$(grep -oP '(?<=^PathExists=).*' "$tmp/hydrationd.path")"
+          got="$(grep -oP '(?<=--socket )\S+' "$tmp/hydrationd.service")"
+          if [ "$want" != "$got" ]; then
+            echo "::error::hydrationd.path waits for '$want' but the helper dials '$got', so it would never be started"
+            exit 1
+          fi
+          echo "units parse; path unit waits for $want, which is what the helper dials"
+
   # Everything that does not need root or a real filesystem.
   unprivileged:
     name: tests (no root)
