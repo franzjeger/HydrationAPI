@@ -1,0 +1,58 @@
+# Start the privileged helper when its peer's socket appears.
+#
+# The two halves cannot be ordered with `After=`, and this is not a preference:
+# `hydrationd.service` is a *system* unit and `hydration-sync.service` is a
+# *user* unit, so they belong to different managers and systemd has no
+# dependency edge between them. The helper connects *out* to a socket the user's
+# daemon owns under `/run/user/<uid>/`, which does not exist until that user logs
+# in.
+#
+# So a helper started at boot finds nothing to connect to. It is right to refuse
+# — a marked mount with nobody able to fetch content is a mount full of files
+# that read as zeros — but with `Restart=always` it refuses in a loop, and every
+# attempt pulls the sync mount up via `RequiresMountsFor=` and then exits. Each
+# of those is a window with the mount up and no helper answering for it, which
+# is exactly the state §6a exists to prevent. The unit that starts at boot is
+# therefore this one, and `hydrationd.service` has no `[Install]` section at all.
+#
+# Two arrangements were tried here and are wrong:
+#
+#   * `PathChanged=` fires on every change to the file, and a unix socket is
+#     touched by every connection — so the unit hit its own trigger limit within
+#     seconds and disabled itself, silently.
+#   * Triggering a `oneshot` that restarts the helper loops forever: a path unit
+#     re-arms as soon as the unit it triggered finishes, the socket still exists,
+#     so it fires again immediately. Every restart is another window of zeros.
+#
+# `PathExists=` triggering the service directly is what works: the helper is
+# started once, when the socket first appears, and nothing re-triggers it while
+# it runs.
+#
+# Re-pairing after a client restart is *not* this unit's job and does not need
+# to be. The helper reconnects to the socket in process, re-checking the peer's
+# uid on every attempt, so a `systemctl --user restart` never reaches systemd
+# here.
+#
+# Measured on a cold boot (2026-08-12):
+#
+#   14:59:44  boot
+#   14:59:48  hydrationd.path started
+#   15:00:08  socket appeared; hydrationd.service started, once
+#
+# One start, no failed attempts, and no window in which the mount was up without
+# the helper.
+[Unit]
+Description=Watch for the sync daemon's socket
+Documentation=https://github.com/franzjeger/HydrationAPI
+
+[Path]
+# Must name the same socket as the helper's `--socket` argument.
+PathExists=/run/user/CHANGE-ME/hydration-sync.sock
+Unit=hydrationd.service
+# Belt and braces after the `PathChanged=` mistake above: a path unit that
+# disables itself is a silent single point of failure, and this one has already
+# done it once. With no trigger-rate limit there is nothing to trip.
+TriggerLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
