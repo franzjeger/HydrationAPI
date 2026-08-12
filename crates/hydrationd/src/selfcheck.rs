@@ -26,28 +26,16 @@
 //! The first is decided once, before marking. The second cannot be: it is a
 //! change over time, so it has to be re-asked while the process runs.
 //!
-//! # Why the unique mount id, and not the obvious one
-//!
-//! `probes/mntid.c`, on this kernel:
-//!
-//! ```text
-//! first mount:   STATX_MNT_ID = 31   STATX_MNT_ID_UNIQUE = 2147500463
-//! second mount:  STATX_MNT_ID = 31   STATX_MNT_ID_UNIQUE = 2147500479
-//! ```
-//!
-//! Unmount and remount the same path, and the small id — field 1 of
-//! `/proc/self/mountinfo` — comes straight back. A check built on it compares
-//! equal across exactly the replacement it exists to catch, which is the same
-//! shape as the `st_blocks` trap in §8z: the number that looks like the answer
-//! reads the same for both states. The 64-bit id is not reused, and is the only
-//! one of the two that can carry this.
+//! [`MountIdentity`] is the part that carries the second, and it lives in
+//! `hydration-protocol` because the client needs the same answer for its own
+//! reasons — a delta pass must not keep materialising into a sync root whose
+//! mount this helper has detached. Two implementations of "is this still the
+//! same mount" would be two chances to disagree about it.
 
 use std::io;
 use std::path::Path;
 
-/// Linux 6.8. Fills the same `stx_mnt_id` field as [`STATX_MNT_ID`] with the id
-/// that is never handed out twice.
-const STATX_MNT_ID_UNIQUE: libc::c_uint = 0x0000_4000;
+pub use hydration_protocol::mount::MountIdentity;
 
 /// Where this process's mark can take effect.
 #[derive(Debug, PartialEq, Eq)]
@@ -163,86 +151,9 @@ pub fn reach() -> Reach {
     }
 }
 
-/// The identity of the mount a path resolved to at one moment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MountIdentity(u64);
-
-impl MountIdentity {
-    /// Taken immediately after marking, so what is recorded is the mount the
-    /// mark went onto rather than one that replaced it in between.
-    pub fn capture(path: &Path) -> io::Result<Self> {
-        unique_mnt_id(path).map(Self)
-    }
-
-    /// Whether the path still leads to the mount this identity was taken from.
-    ///
-    /// An error is not "unchanged". A path that cannot be stat'ed at all is a
-    /// path whose mount cannot be vouched for, and the caller has to treat it
-    /// the same way as a mount that was swapped.
-    pub fn still_current(&self, path: &Path) -> io::Result<bool> {
-        unique_mnt_id(path).map(|now| now == self.0)
-    }
-}
-
-fn unique_mnt_id(path: &Path) -> io::Result<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c = CString::new(path.as_os_str().as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let mut sx: libc::statx = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::statx(
-            libc::AT_FDCWD,
-            c.as_ptr(),
-            0,
-            STATX_MNT_ID_UNIQUE,
-            &mut sx as *mut libc::statx,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // Asking is not getting. `stx_mask` reports what was actually filled, and a
-    // kernel that does not know this bit returns the small, reused id in the
-    // same field without complaining — which would leave the check silently
-    // reading the one value measured to hide a replacement.
-    if sx.stx_mask & STATX_MNT_ID_UNIQUE == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the kernel did not supply a unique mount id (needs Linux 6.8+); the \
-             reusable one cannot distinguish a replaced mount",
-        ));
-    }
-    Ok(sx.stx_mnt_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_path_has_a_unique_mount_id() {
-        // Any path will do: the claim under test is that the kernel supplies the
-        // 6.8 id at all, because everything else here is built on it being
-        // present rather than silently falling back to the small one.
-        let id = MountIdentity::capture(Path::new("/")).expect("root has a mount id");
-        assert!(
-            MountIdentity::capture(Path::new("/")).unwrap() == id,
-            "the same unreplaced mount answered with two different ids"
-        );
-    }
-
-    #[test]
-    fn a_path_that_is_gone_is_not_reported_as_unchanged() {
-        let id = MountIdentity::capture(Path::new("/")).unwrap();
-        // The distinction that matters: `Err`, never `Ok(true)`. A caller that
-        // treated an unreadable path as "still fine" would keep serving through
-        // a mount it can no longer see.
-        assert!(id
-            .still_current(Path::new("/nonexistent-by-construction-9d3f"))
-            .is_err());
-    }
 
     #[test]
     fn reach_never_claims_more_than_it_checked() {

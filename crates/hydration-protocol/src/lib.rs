@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod mount;
 pub mod transport;
 
 /// The `nodump` inode flag, and its one legitimate use here.

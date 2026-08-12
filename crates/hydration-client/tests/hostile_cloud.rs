@@ -53,7 +53,7 @@ fn upserted(path: &str, size: u64, id: &str, etag: Option<&str>) -> Change {
 
 fn run(root: &Path, changes: &[Change]) -> Applied {
     let mut store = Store::new();
-    let mut placer = TmpfilePlacer::new(root);
+    let mut placer = TmpfilePlacer::new(root).expect("open the sync root");
     apply(root, changes, &mut store, &HashSet::new(), &mut placer).expect("apply")
 }
 

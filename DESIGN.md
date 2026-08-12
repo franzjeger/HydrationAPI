@@ -1330,6 +1330,50 @@ The trigger lives in the running daemon, not in the tool, and that is the point:
 
 ---
 
+## 6i. A delta pass outlives the mount it started on
+
+§6.4a establishes that a sync root which is not its own mount can never be marked, and so the client refuses to start on one and re-asks every delta round. That is the right *question* asked at the wrong *granularity*, and on 2026-08-12 the difference cost 147,540 files.
+
+The sequence, from the rig's own logs:
+
+```
+05:13:56  sync daemon starts, mount up, guard satisfied
+05:18:34  hydrationd's fetcher hangs; the helper detaches the mount and exits
+05:18+    the daemon writes 147,540 placeholders, 37 MB, into the bare
+          @home directory underneath the now-detached mountpoint
+```
+
+The round's check passed and the mount vanished *during* the round. A pass applying 147,540 changes takes minutes, so the window is not an edge — it is most of the pass. Everything written in it reads back as zeros, on a filesystem nothing can ever mark, and looks exactly like a real file. The pass logged `+147540 failed 0`.
+
+**A check cannot close this, and the reason is worth stating in general terms.** Every mount check is check-then-act: it reports on a path at one instant, and the act happens afterwards. Moving the check from once per round to once per change narrows the window from minutes to microseconds, which is a real improvement and still not a fix. Measured, by running the reproduction against a build with the per-change check and nothing else:
+
+| what was in place | placeholders in the bare directory |
+|---|---|
+| nothing | 381 of 400 |
+| per-change mount check only | **1** |
+| descriptor pinning + per-change check | 0 |
+
+One, not none — the change whose check passed microseconds before the detach landed. On the rig that is one unhydratable file per detach, found later by whatever opens it.
+
+**The fix is to stop resolving the path.** `TmpfilePlacer` opens the sync root once, when it has been confirmed a mount, and holds the descriptor. `openat`, `mkdirat`, `linkat` and `renameat` relative to that descriptor land on the filesystem it was opened against, because detaching a mount does not change what an open descriptor means. The mount going away stops being a thing to detect in time and becomes a thing that cannot redirect us. `linkat` refusing to cross a filesystem is the backstop underneath it, and it holds for the boundary production actually crossed — measured in `probes/tmpfile_exdev.c`, `EXDEV` both between two filesystems and between two btrfs subvolumes of one filesystem, which is the `@onedrive` → `@home` case.
+
+**Detection is still worth having; it just has a smaller job.** A pass that carries on writing into a detached filesystem is doing work nobody can see, and `hydrationd` detaching the mount is a *deliberate* fail-closed action that the client should report rather than absorb. So `Materialise::root_still_current` is asked once per change and the pass stops cleanly, keeping its cursor where it is — `Applied::stopped`, not an `Err`, because meeting a deliberate safety action is the system working. Being a change late costs a refusal; being wrong about the destination cost the tree.
+
+**What it is asked with matters as much as when.** The unique mount id (`STATX_MNT_ID_UNIQUE`, §probes/mntid.c) rather than a `/proc/self/mountinfo` parse:
+
+```
+mountinfo read+parse:    13.38 us      "is *a* mount here"
+statx unique mnt id:      0.24 us      "is *the* mount here"    57x cheaper
+```
+
+Cost is the lesser half. Between a detach and the remount that `RequiresMountsFor=` brings up, `mountinfo` answers yes for a mount that is not the one the pass started on; the id does not. The two questions belong at different granularities and both are now asked at theirs: "is this a mount at all" once per incarnation, when a placer is opened, since a sync root that is a plain directory can never be marked; "is it still the same mount" once per change.
+
+A placer's lifetime is therefore exactly one mount incarnation. When a pass stops for this reason the daemon drops it, and the next round has to find a mount before it opens another — an identity captured against a mount that has been replaced is stale forever, and reusing it would answer "changed" for the rest of the process's life.
+
+The residual gap, stated rather than left to be discovered: a rename of the sync root within one filesystem is not a mount change, and the id correctly says so. The descriptor is what keeps the placeholders out of the new directory in that case, and the check contributes nothing — which is the division of labour, in the one situation that makes it visible.
+
+---
+
 ## 7. Cost
 
 Assuming the client (auth, Graph API, delta sync) already exists, as it does in the
