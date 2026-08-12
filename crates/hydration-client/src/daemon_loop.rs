@@ -823,7 +823,13 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     return;
                 }
             };
-            let mut placer = TmpfilePlacer::new(&mount);
+            // Opened when the mount is confirmed, dropped when it goes away, and
+            // opened again only when a mount is back. Not once for the life of
+            // the thread: the placer pins the root it was opened on, so one that
+            // outlived its mount would keep writing into a filesystem nobody can
+            // reach — safe, and pointless. `None` means "no mount right now",
+            // which is the same state the thread starts in.
+            let mut placer: Option<TmpfilePlacer> = None;
             let mut store = Store::new();
             let mut cursor = Cursor::default();
             // Set when a pass deliberately left something for a later one.
@@ -839,38 +845,62 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // reads any of.
             let mut complained = false;
             while !stop.load(Ordering::SeqCst) {
-                // Re-asked every round, because the startup check only covers
-                // startup. The mount can go away under a running daemon —
-                // `hydrationd` detaches it on the way out, an administrator can
-                // unmount it — and from here the sync root would look like an
-                // ordinary empty directory waiting to be filled with 145,711
-                // placeholders that nothing can ever hydrate.
-                match crate::mount::is_mount_point(&mount) {
-                    Ok(true) => complained = false,
-                    other => {
-                        if !complained {
-                            complained = true;
-                            match other {
-                                Ok(false) => eprintln!(
-                                    "hydration-sync: {} is no longer a mount point — \
-                                     nothing will be applied until it is back, because \
-                                     placeholders written into the bare directory would \
-                                     read as zeros",
+                // Two questions, and they are not the same one.
+                //
+                // "Is there a mount here at all" is what `is_mount_point`
+                // answers, and it is the right question exactly once per
+                // incarnation: a sync root that is a plain directory can never
+                // be marked (§6.4a), so opening a placer on one would be
+                // arranging the original failure. It cannot answer the other
+                // question — a mount that was detached and replaced is still *a*
+                // mount — which is why it is asked here, where a new placer is
+                // about to be opened, and not inside the pass.
+                //
+                // "Is it still the mount we started on" is the placer's own, via
+                // the unique mount id it captured at open time, and `apply` asks
+                // it per change. See `place.rs` for why that one cannot be
+                // carried by a path check.
+                if placer.is_none() {
+                    let opened = match crate::mount::is_mount_point(&mount) {
+                        Ok(true) => TmpfilePlacer::new(&mount).map_err(|e| {
+                            format!("could not open the sync root {} ({e})", mount.display())
+                        }),
+                        Ok(false) => Err(format!(
+                            "{} is not a mount point — nothing will be applied until it \
+                             is back, because placeholders written into the bare \
+                             directory would read as zeros",
+                            mount.display()
+                        )),
+                        Err(e) => Err(format!(
+                            "cannot tell whether {} is a mount point ({e}) — holding off \
+                             rather than writing into a directory that may not be one",
+                            mount.display()
+                        )),
+                    };
+                    match opened {
+                        Ok(p) => {
+                            if complained {
+                                eprintln!(
+                                    "hydration-sync: {} is a mount again; resuming",
                                     mount.display()
-                                ),
-                                Err(e) => eprintln!(
-                                    "hydration-sync: cannot tell whether {} is still a \
-                                     mount point ({e}) — holding off rather than writing \
-                                     into a directory that may not be one",
-                                    mount.display()
-                                ),
-                                Ok(true) => unreachable!(),
+                                );
                             }
+                            complained = false;
+                            placer = Some(p);
                         }
-                        std::thread::sleep(Duration::from_secs(5));
-                        continue;
+                        Err(why) => {
+                            if !complained {
+                                complained = true;
+                                eprintln!("hydration-sync: {why}");
+                            }
+                            std::thread::sleep(Duration::from_secs(5));
+                            continue;
+                        }
                     }
                 }
+                let Some(placer_ref) = placer.as_mut() else {
+                    unreachable!("a placer was just opened or the round was skipped")
+                };
                 match cloud.changes(&cursor) {
                     Ok((changes, next)) if !changes.is_empty() => {
                         // Snapshotted, then released — not held across the pass.
@@ -883,7 +913,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         // the stamp check inside `apply` is for.
                         let waiting = q.lock().unwrap().waiting_set();
                         let applied =
-                            delta::apply(&mount, &changes, &mut store, &waiting, &mut placer);
+                            delta::apply(&mount, &changes, &mut store, &waiting, placer_ref);
                         // The cursor moves only past a pass that finished.
                         //
                         // A delta service does not replay a consumed change, so
@@ -891,20 +921,47 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         // refusal is permanent however transient its cause —
                         // two objects swapping paths refuse each other on one
                         // pass and would succeed on the next, if there were one.
+                        // A pass that stopped because the mount went away is not
+                        // an incident. `hydrationd` detaches it on purpose when
+                        // it fails closed, so this is the client meeting a
+                        // deliberate act — reported plainly, with the counts of
+                        // what did land, and then the placer is dropped so the
+                        // next round has to find a mount before it opens
+                        // another. Cursor stays put: what was not applied has
+                        // not been seen.
+                        let lost_the_mount = matches!(&applied, Ok(a) if a.stopped.is_some());
+                        if let Ok(a) = &applied {
+                            if let Some(why) = &a.stopped {
+                                eprintln!(
+                                    "hydration-sync: delta pass stopped after {} of {} \
+                                     changes: {why}; not advancing",
+                                    a.created + a.updated + a.removed,
+                                    changes.len()
+                                );
+                            }
+                        }
                         match &applied {
                             Ok(a) if a.retryable => {
                                 unfinished = true;
-                                eprintln!(
-                                    "hydration-sync: delta pass incomplete ({} deferred); \
-                                     not advancing",
-                                    a.failed.len()
-                                );
+                                // Already explained above when it was the mount;
+                                // saying it twice in different words reads as two
+                                // separate problems.
+                                if !lost_the_mount {
+                                    eprintln!(
+                                        "hydration-sync: delta pass incomplete ({} \
+                                         deferred); not advancing",
+                                        a.failed.len()
+                                    );
+                                }
                             }
                             Ok(_) => {
                                 unfinished = false;
                                 cursor = next;
                             }
                             Err(_) => unfinished = true,
+                        }
+                        if lost_the_mount {
+                            placer = None;
                         }
                         match applied {
                             Ok(a) if a != Applied::default() => {

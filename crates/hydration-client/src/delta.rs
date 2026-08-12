@@ -69,6 +69,30 @@ pub trait Materialise: Send {
 
     /// Remove a file the cloud no longer has.
     fn remove(&mut self, path: &Path) -> io::Result<()>;
+
+    /// Whether the sync root still leads to the filesystem this materialiser was
+    /// opened against.
+    ///
+    /// Asked between changes so a pass can stop when the ground moves under it.
+    /// `hydrationd` detaches the sync mount when it fails closed, and until
+    /// 2026-08-12 a pass that met that carried on to completion: 147,540
+    /// placeholders into the bare directory underneath, reported as
+    /// `+147540 failed 0`.
+    ///
+    /// This is not what makes that safe — [`TmpfilePlacer`] resolves every
+    /// syscall through a descriptor on the root, so it cannot write outside the
+    /// filesystem it opened whatever a path later means. This decides *when to
+    /// stop*, which is a different and much more forgiving job: being late by a
+    /// few changes costs a few refusals, where being wrong about the
+    /// destination cost a silent tree of unhydratable files.
+    ///
+    /// Defaults to `true` for the doubles and the demo cloud, which have no
+    /// mount to lose.
+    ///
+    /// [`TmpfilePlacer`]: crate::place::TmpfilePlacer
+    fn root_still_current(&self) -> io::Result<bool> {
+        Ok(true)
+    }
 }
 
 /// A change that was refused, and which of the four rules refused it.
@@ -225,6 +249,43 @@ pub struct Applied {
     /// never retried is indistinguishable from a permanent one: the local name
     /// stays wrong until the object happens to change again.
     pub retryable: bool,
+    /// Set when the pass gave up partway because the sync root stopped being the
+    /// mount it started against.
+    ///
+    /// Deliberately not an `Err`. `hydrationd` detaching the mount is a
+    /// *deliberate* fail-closed action, so a pass running into it is the system
+    /// working, not the system breaking — and a caller that logged it as a
+    /// failure would be reporting an alarm for the thing that prevented one. The
+    /// counts alongside it are real: what this says is that there was more, and
+    /// that the cursor must stay where it is.
+    pub stopped: Option<Stopped>,
+}
+
+/// Why a pass ended before it ran out of changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stopped {
+    /// The sync root now leads somewhere else — detached, or replaced by a
+    /// different mount at the same path.
+    MountChanged,
+    /// Whether it still leads to the same place could not be established, which
+    /// is treated as if it did not. A root that cannot be vouched for is not a
+    /// root to keep writing into.
+    MountUnverifiable(String),
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MountChanged => write!(
+                f,
+                "the sync root is no longer the mount this pass started against"
+            ),
+            Self::MountUnverifiable(e) => write!(
+                f,
+                "could not confirm the sync root is still the same mount ({e})"
+            ),
+        }
+    }
 }
 
 /// Apply a set of changes to the sync directory.
@@ -259,6 +320,40 @@ pub fn apply<M: Materialise>(
     // second local file claiming the same id, which is the exact corruption the
     // rename handling below exists to prevent.
     for change in coalesce(changes) {
+        // Per change, not per pass.
+        //
+        // The pass this replaces asked once, at the top of the round, and a
+        // round applying 147,540 changes takes minutes — so the answer was
+        // stale for almost all of it, and on 2026-08-12 the mount went away
+        // four minutes into one. Per change is affordable because of what the
+        // question is asked with: one `statx` for the unique mount id, measured
+        // at 0.24 µs against 13.38 µs for the `/proc/self/mountinfo` parse it
+        // replaces (`probes/mountcheck_cost.c`) — 0.03 s across a pass of that
+        // size, against 1.97 s.
+        //
+        // Cost is the smaller half of the argument. `mountinfo` answers "*a*
+        // mount is at this path", and the id answers "*the* mount is", which is
+        // the question with a correct answer during the seconds between a
+        // detach and the remount that follows it.
+        //
+        // Nothing about placement depends on this. `TmpfilePlacer` cannot write
+        // outside the filesystem it opened, so a check that arrives a change
+        // late costs a refusal rather than a file in the wrong place. It is here
+        // to stop cleanly, and it is checked before the change rather than after
+        // so a pass that stops has not half-applied the change it stopped on.
+        match mat.root_still_current() {
+            Ok(true) => {}
+            Ok(false) => {
+                out.stopped = Some(Stopped::MountChanged);
+                out.retryable = true;
+                break;
+            }
+            Err(e) => {
+                out.stopped = Some(Stopped::MountUnverifiable(e.to_string()));
+                out.retryable = true;
+                break;
+            }
+        }
         let change = &change;
         match change {
             Change::Upserted {

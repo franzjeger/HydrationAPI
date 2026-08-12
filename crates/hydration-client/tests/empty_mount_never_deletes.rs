@@ -114,7 +114,7 @@ fn an_empty_mount_deletes_nothing() {
 fn the_recorder_does_see_a_deletion_when_one_is_owed() {
     let root = scratch("control");
     let mut store = Store::new();
-    let mut placer = TmpfilePlacer::new(&root);
+    let mut placer = TmpfilePlacer::new(&root).expect("open the sync root");
 
     // A real local file, known to the store, exactly as one that had been
     // written and was waiting out its debounce.
