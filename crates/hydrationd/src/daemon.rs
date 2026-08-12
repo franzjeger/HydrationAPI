@@ -221,6 +221,16 @@ struct Timed {
     missed: u32,
     /// Transfers that started and had to be given up on.
     abandoned: u32,
+    /// Failures that said the socket is gone, not that the request was slow.
+    ///
+    /// Counted apart from `missed` because the two wedges cost different
+    /// things to test for. A first-byte miss took a full deadline to observe,
+    /// so once there are enough of them the worker stops waiting and denies at
+    /// once. A lost connection fails in microseconds — and, unlike an
+    /// abandoned transfer, leaves nothing running that could ever reply — so
+    /// refusing to try again would make the state permanent by construction.
+    /// The attempt *is* the recovery path: `SocketFetch` reconnects inside it.
+    lost: u32,
     since: Option<std::time::Instant>,
 }
 
@@ -251,7 +261,13 @@ struct Job {
 const WEDGED_AFTER: u32 = 3;
 
 /// Whether this error means the socket is gone rather than the request refused.
-fn is_connection_lost(e: &io::Error) -> bool {
+///
+/// Shared with [`crate::remote`], whose reconnect path must report its own
+/// failures in a kind this predicate recognises — a failed reconnect that
+/// surfaced as `NotFound` (a socket path nobody has bound) would otherwise be
+/// indistinguishable from a per-file refusal, count toward nothing, and leave
+/// the mount serving `EIO` forever with no give-up clock running.
+pub(crate) fn is_connection_lost(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::UnexpectedEof
@@ -310,11 +326,25 @@ impl Timed {
             seq: 0,
             missed: 0,
             abandoned: 0,
+            lost: 0,
             since: None,
         }
     }
 
     fn wedged(&self) -> bool {
+        self.missed >= WEDGED_AFTER || self.abandoned >= WEDGED_AFTER || self.lost >= WEDGED_AFTER
+    }
+
+    /// Wedged in a way that makes another attempt cost a full deadline.
+    ///
+    /// This is what decides whether an event is short-circuited to a denial.
+    /// Deliberately *not* [`wedged`](Self::wedged): a fetcher wedged only by
+    /// lost connections fails in microseconds and must keep being tried,
+    /// because the attempt is where reconnection happens and no late reply
+    /// will ever arrive to prove recovery any other way. [`wedged`] still
+    /// includes it, so the give-up clock runs and §6a-bis's "come down rather
+    /// than serve EIO forever" keeps its bound.
+    fn expensive_to_probe(&self) -> bool {
         self.missed >= WEDGED_AFTER || self.abandoned >= WEDGED_AFTER
     }
 
@@ -327,6 +357,18 @@ impl Timed {
 
     fn missed_one(&mut self) {
         self.missed += 1;
+        self.since.get_or_insert_with(std::time::Instant::now);
+    }
+
+    /// The socket to the sync daemon is gone, and reconnecting inside the
+    /// fetch did not bring it back.
+    ///
+    /// Counts toward giving up — a routine client restart measured on
+    /// 2026-08-12 is exactly this, repeated — but through its own counter, so
+    /// the short-circuit above never stops the probing that is the only way
+    /// this state ever ends.
+    fn lost_one(&mut self) {
+        self.lost += 1;
         self.since.get_or_insert_with(std::time::Instant::now);
     }
 
@@ -345,6 +387,7 @@ impl Timed {
     fn answered(&mut self) {
         self.missed = 0;
         self.abandoned = 0;
+        self.lost = 0;
         self.since = None;
     }
 
@@ -375,10 +418,17 @@ impl Timed {
             }
             unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(n) }
         };
-        if self.wedged() {
+        if self.expensive_to_probe() {
             // Abandoned transfers keep running, and anything from one is proof
             // of life. Draining for it here is what keeps this from being a
             // one-way door.
+            //
+            // A wedge made only of lost connections never takes this branch:
+            // there is no ghost transfer to hear from — the errors already
+            // arrived — and the next attempt costs microseconds, so it is sent
+            // rather than pre-denied. That attempt is where `SocketFetch`
+            // reconnects, and without it a client restart that outlived three
+            // events was permanent no matter when the client came back.
             let mut recovered = false;
             while self.rep.try_recv().is_ok() {
                 recovered = true;
@@ -488,7 +538,7 @@ impl Timed {
                 }
                 Ok((_, Step::Failed(e))) => {
                     if is_connection_lost(&e) {
-                        self.missed_one();
+                        self.lost_one();
                     } else if moved > 0 {
                         self.answered();
                     }

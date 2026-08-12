@@ -68,6 +68,12 @@ pub struct Watcher {
     group: Group,
     /// Writes from these processes are ours and are not changes.
     ignore_pids: Vec<i32>,
+    /// One more ignored pid, read at event time rather than fixed at
+    /// construction: the sync daemon's. Its writes are placeholders and
+    /// updates — reporting them back to it is the feedback loop this filter
+    /// exists to break — and its pid changes on every restart, which the
+    /// reconnect path survives without rebuilding this watcher.
+    peer: Option<std::sync::Arc<std::sync::atomic::AtomicI32>>,
     /// The kernel dropped events because its queue was full.
     overflowed: bool,
 }
@@ -84,8 +90,14 @@ impl Watcher {
         Ok(Self {
             group,
             ignore_pids,
+            peer: None,
             overflowed: false,
         })
+    }
+
+    /// Also ignore whatever pid `cell` names at the moment an event arrives.
+    pub fn ignore_peer(&mut self, cell: std::sync::Arc<std::sync::atomic::AtomicI32>) {
+        self.peer = Some(cell);
     }
 
     /// Whether the kernel dropped events since this was last asked.
@@ -134,9 +146,18 @@ impl Watcher {
                 }
                 continue;
             }
-            // Ours. Dropping it here is what stops hydration from looking like a
-            // local edit and being uploaded back.
-            if self.ignore_pids.contains(&ev.pid) {
+            // Ours, or the sync daemon's. Dropping it here is what stops
+            // hydration from looking like a local edit and being uploaded
+            // back. The peer cell is read per event because the daemon's pid
+            // changes when it restarts; `Relaxed` is enough — a stale read
+            // costs one spurious report, which the daemon's own content check
+            // absorbs, exactly as it absorbs the filter being a pid check at
+            // all.
+            let peer = self
+                .peer
+                .as_ref()
+                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+            if self.ignore_pids.contains(&ev.pid) || peer == Some(ev.pid) {
                 unsafe { libc::close(ev.fd) };
                 continue;
             }

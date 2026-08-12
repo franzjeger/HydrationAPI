@@ -450,10 +450,13 @@ fn a_fetcher_that_recovers_is_used_again() {
 /// A peer that has gone away must not be mistaken for a peer that is refusing.
 ///
 /// The give-up clock counted missed deadlines, and a dead socket fails
-/// instantly rather than slowly — so it never started. The helper connects out
-/// once and has no reconnect path, which meant a routine client restart left the
-/// worker serving instant `EIO` forever, under two units that both looked
-/// healthy. §6a-bis says that state must come down.
+/// instantly rather than slowly — so it never started, and the worker served
+/// instant `EIO` forever under two units that both looked healthy. §6a-bis
+/// says that state must come down. Connection losses therefore count toward
+/// `wedged()` — through their own counter, because unlike a deadline miss they
+/// are cheap to retry and the retry is where `SocketFetch` reconnects
+/// (`tests/reconnect.rs` pins that recovery; this test pins the bound behind
+/// it, for a peer that never comes back).
 ///
 /// The second half matters as much as the first: an ordinary per-file refusal —
 /// "there is no cloud object for this inode" — is an answer, not a fault, and

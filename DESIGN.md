@@ -866,6 +866,83 @@ deadline in this design is now absolute for that reason.
 
 ---
 
+## 6a-quinquies. A client restart must not cost the mount
+
+Found in production on 2026-08-12, in the same journal as §6a-quater's incident:
+`systemctl --user restart` of the sync daemon at 05:13:56, worker gave up at
+05:18:34, mount detached, deployment down — with a healthy client listening at
+the same socket path for all but the first seconds of it. A client restart is
+not exotic: systemd does it on upgrade, on failure, and on a user's whim, and
+the unit file expressly permits it ("may come and go freely").
+
+**Why the old arrangement could not survive it.** The helper connects out once.
+When the client dies, that established socket is dead forever — the client
+coming back binds a *fresh* listener, which resurrects nothing. Every fetch on
+the dead socket failed instantly, three failures made the fetcher `wedged()`,
+and the wedge short-circuited later events *before sending anything*, so the
+code that could have noticed recovery never ran again. `WEDGED_LIMIT` later the
+worker gave up — correctly, by §6a-bis — and the helper tore down a mount whose
+peer had been back for four and a half minutes. "The pair is rebuilt by
+systemd" was the documented recovery, and it is not one: nothing restarts a
+system unit because a user unit came back.
+
+**The fix is to reconnect, and to keep the give-up clock as the bound behind
+it.** Two pieces, both in the privileged helper:
+
+- `SocketFetch` remembers the socket path and the expected uid. When an
+  exchange dies — or leaves the stream mid-frame, which the framing rules
+  already said must be dropped rather than resynchronised — it reconnects and
+  re-asks once for the same span. Within one event the knocking is bounded
+  (eight attempts, 250 ms apart — sized for a `systemctl restart`'s
+  stop-to-bind gap and kept far under the first-byte deadline); a reader that
+  arrives while the client is genuinely down gets `EIO`, which is the answer
+  the deployment always documented for that state.
+- Connection losses count toward `wedged()` through their own counter, and a
+  wedge made only of them does **not** short-circuit: unlike a deadline miss,
+  a lost connection fails in microseconds and leaves no ghost transfer whose
+  late reply could ever prove recovery — the next attempt is the *only* road
+  back, and it is where the reconnect lives. §6a-bis's bound is unchanged: a
+  client that stays gone keeps the clock running and the mount comes down at
+  `WEDGED_LIMIT`, drained and answered, exactly as before.
+
+An earlier attempt made a lost connection terminal immediately — `wedged()`
+true on the first loss, `since` backdated past the limit — and the privileged
+suite caught it leaving a reader blocked: giving up while events were still
+queued means the worker stops answering, and §6a-bis is explicit that every
+event is answered before this process goes. The give-up must only ever happen
+between events, which the worker's loop already guarantees; nothing about
+noticing the peer faster is allowed to change where the noticing takes effect.
+
+**Why reconnecting is not a new hole.** The socket lives in `/run/user/<uid>`,
+0600 in a directory only that uid traverses, and every reconnect re-runs the
+same `SO_PEERCRED` uid check as the first connect — the same function
+(`remote::connect_checked`), not a sibling of it. An impersonating listener
+with the right uid gains nothing it did not already have (§6b: it could
+already write every file it would be serving content for), and one with the
+wrong uid is refused, counted as a loss, and brings the deployment down
+through the same fail-closed road as an absent peer — where the restarted
+helper's startup connect runs the identical check and refuses to start. Two
+details keep the halves consistent across the swap: the shared writer inside
+`HelperConn` is replaced under its lock, so the change-reporting threads
+follow to the new stream instead of writing into a dead one; and the new
+peer's pid — from the same `SO_PEERCRED` read — replaces the old in the change
+watcher's ignore set, so the restarted daemon's own writes are not reported
+back to it as local edits.
+
+The client side needed nothing: its accept loop already treats every new
+connection as a resync point (§6g), which is exactly what a reconnecting
+helper looks like to it.
+
+Pinned by `tests/reconnect.rs`, which restarts a real client behind a real
+socket path under a live worker: the read after the restart must hydrate and
+the fetcher must not be counting toward giving up; and a client that stays
+gone must leave the fetcher wedged with every reader answered promptly. The
+first of those fails against the old code in exactly the incident's shape —
+`EIO` after the restart, wedge running — which is how it was reproduced before
+it was fixed.
+
+---
+
 ## 6a-ter. Writing into a marked mount is the project's sharpest edge
 
 The same bug has appeared **eight times, in eight disguises**, every time by
@@ -1878,8 +1955,13 @@ overwhelming majority of them.
 
 ## 9. What I did not get verified
 
-There is no reconnection in the process. A client restart survives by the pair being
-built up again, not by the connection being repaired.
+~~There is no reconnection in the process. A client restart survives by the pair being
+built up again, not by the connection being repaired.~~ — **closed, the hard way.** The
+"pair rebuilt by systemd" story was measured failing on 2026-08-12: a routine client
+restart cost the mount, because nothing rebuilds a system unit when a user unit comes
+back. The helper now reconnects in-process and re-checks the peer's uid each time;
+§6a-quinquies has the incident, the design and the bound, and `tests/reconnect.rs`
+restarts a real client under a live worker to pin it.
 
 In the interest of honesty, since this is meant to be the basis for a decision:
 

@@ -17,14 +17,13 @@ use hydrationd::daemon::{Worker, DEFAULT_STALL};
 use hydrationd::exposure::ExposureWatch;
 use hydrationd::fanotify::Group;
 use hydrationd::policy::Policy;
-use hydrationd::remote::SocketFetch;
+use hydrationd::remote::{self, SocketFetch};
 use hydrationd::report;
 use hydrationd::selfcheck::{self, MountIdentity, Reach};
 use hydrationd::supervisor::{
     deny, drain_denying, Drained, InFlight, DENY_DRAIN_CAP, DENY_DRAIN_QUIET,
 };
 use std::io;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -65,66 +64,10 @@ fn parse() -> Args {
     }
 }
 
-/// Who is on the other end of this socket, from the kernel rather than from them.
-/// The peer's pid, from the same kernel-filled structure as its uid.
-///
-/// Needed because writes by the sync daemon are not local edits: it is the
-/// process that writes hydrated content back through the socket, and reporting
-/// its writes as changes would upload every hydration straight back. Taken from
-/// `SO_PEERCRED` rather than from anything the peer says about itself.
-fn peer_pid(sock: &UnixStream) -> io::Result<i32> {
-    peer_cred(sock).map(|c| c.0)
-}
-
-fn peer_uid(sock: &UnixStream) -> io::Result<u32> {
-    peer_cred(sock).map(|c| c.1)
-}
-
-fn peer_cred(sock: &UnixStream) -> io::Result<(i32, u32)> {
-    use std::os::fd::AsRawFd;
-    #[repr(C)]
-    struct Ucred {
-        pid: libc::pid_t,
-        uid: libc::uid_t,
-        gid: libc::gid_t,
-    }
-    let mut cred = Ucred {
-        pid: 0,
-        uid: u32::MAX,
-        gid: u32::MAX,
-    };
-    let mut len = std::mem::size_of::<Ucred>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut Ucred as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((cred.pid, cred.uid))
-}
-
-fn connect(args: &Args) -> io::Result<UnixStream> {
-    let sock = UnixStream::connect(&args.socket)?;
-    // Checked with SO_PEERCRED, which the kernel fills in — not from anything
-    // the peer said about itself. Without this the socket path is the only
-    // authentication, and a path is not a credential.
-    if let Some(expected) = args.peer_uid {
-        let actual = peer_uid(&sock)?;
-        if actual != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("the sync daemon socket is owned by uid {actual}, expected {expected}"),
-            ));
-        }
-    }
-    Ok(sock)
-}
+// Who is on the other end of this socket is answered by `remote::peer_cred`
+// and `remote::connect_checked` — the same functions the worker's reconnect
+// path runs, deliberately, so the uid check at startup and the uid check five
+// days in can never be two implementations that have drifted apart.
 
 /// Take the sync mount out of the namespace, and say so either way.
 ///
@@ -250,7 +193,7 @@ fn main() -> io::Result<()> {
         Err(e) => eprintln!("hydrationd: could not check for exposures: {e}"),
     }
 
-    let stream = match connect(&args) {
+    let stream = match remote::connect_checked(&args.socket, args.peer_uid) {
         Ok(s) => s,
         Err(e) => {
             // Refusing to start is the right answer. Marking the mount with
@@ -276,8 +219,10 @@ fn main() -> io::Result<()> {
     };
 
     // Read before the fork, because after it the child needs it and the parent
-    // has no reason to ask again.
-    let watched_pid = peer_pid(&stream).unwrap_or(0);
+    // has no reason to ask again. The pid is needed so the change reporter can
+    // ignore the sync daemon's own writes — reporting them as local edits
+    // would upload every placeholder it lays down straight back.
+    let watched_pid = remote::peer_cred(&stream).map(|c| c.0).unwrap_or(0);
 
     let group = Group::new_pre_content()?;
     group.mark_mount(&args.mount)?;
@@ -311,6 +256,12 @@ fn main() -> io::Result<()> {
     if child == 0 {
         let conn = HelperConn::new(stream).unwrap();
 
+        // The sync daemon's pid, in a cell rather than a number: the daemon is
+        // a user unit that restarts, the fetch path reconnects when it does,
+        // and each reconnect stores the new pid here so the change filter
+        // below keeps matching the process it is meant to ignore.
+        let peer_pid = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(watched_pid));
+
         // Change detection, on its own threads so the event loop never waits on
         // the socket. Spawned after the fork, never before.
         //
@@ -322,7 +273,8 @@ fn main() -> io::Result<()> {
         // but without it the loop is tight enough to matter.
         match report::Reporter::spawn(
             &args.mount,
-            vec![unsafe { libc::getpid() }, watched_pid],
+            vec![unsafe { libc::getpid() }],
+            Some(std::sync::Arc::clone(&peer_pid)),
             conn.notifier(),
             Duration::from_millis(250),
         ) {
@@ -335,7 +287,15 @@ fn main() -> io::Result<()> {
             Err(e) => eprintln!("[worker] change detection unavailable: {e}"),
         }
 
-        let fetch = SocketFetch::new(conn, &args.mount);
+        // Reconnecting, because the peer is a user unit and restarting it is
+        // routine. Before this, its restart cost the mount: the helper's
+        // fetches failed on the dead socket until the worker gave up and the
+        // supervisor detached everything — measured on 2026-08-12, five
+        // minutes from `systemctl --user restart` to teardown. The uid check
+        // re-runs on every reconnect; see `remote` for why that is sufficient
+        // and what an impostor costs.
+        let fetch = SocketFetch::reconnecting(conn, &args.mount, &args.socket, args.peer_uid)
+            .with_peer_pid(peer_pid);
         let mut w = Worker::new(group, fetch, Policy::default(), worker_view);
         // No deadline on the loop itself: this is the service, not a test. The
         // per-event deadline is what bounds any single reader's wait.

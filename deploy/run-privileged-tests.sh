@@ -96,6 +96,7 @@ run hydrationd exposure
 run hydrationd selfcheck
 run hydrationd placeholder_creation
 run hydrationd deadlines
+run hydrationd reconnect
 run hydrationd ranges
 run hydrationd pidfd
 run adapter-framework conformance

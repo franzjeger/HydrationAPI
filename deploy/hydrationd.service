@@ -50,8 +50,12 @@ ExecStart=/usr/local/bin/hydrationd --mount /home/CHANGE-ME/OneDrive --socket /r
 # recovery — this restarts, and RequiresMountsFor= brings the mount back with
 # it. Measured; see DESIGN.md §8b.
 #
-# A client restart is survived the same way: the helper's socket dies, it gives
-# up, and the pair is rebuilt. There is no in-process reconnect path.
+# A client restart is survived in-process: the helper reconnects to the socket
+# and re-checks the peer's uid, so the mount never comes down for it. Measured
+# before that existed (2026-08-12): "the pair is rebuilt by systemd" meant five
+# minutes of EIO and then this unit tearing the mount down, because nothing
+# restarts a *system* unit when a *user* unit comes back. The teardown below is
+# now only for a client that stays gone past the helper's give-up limit.
 Restart=always
 RestartSec=1
 
