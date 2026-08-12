@@ -482,7 +482,7 @@ fn an_interrupted_fill_does_not_turn_the_echo_into_a_permanent_conflict() {
     // than any helper of the framework's is the point: the worker's pwrite went
     // through and its SIGKILL arrived before `settle_range`.
     let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
-    f.write_all_at(&[7u8; 4096], 0).unwrap();
+    write_and_stale_the_stamp(&f, 0);
     drop(f);
     assert_eq!(
         hydration_protocol::stamp::state(&p).unwrap(),
@@ -520,6 +520,40 @@ fn an_interrupted_fill_does_not_turn_the_echo_into_a_permanent_conflict() {
     assert_eq!(held, vec![7u8; 4096], "the partial fill was thrown away");
 }
 
+/// Write into `f`, and make the stamp provably stale afterwards.
+///
+/// The obvious spelling — write, then ask — is a coin flip, and which way it
+/// lands is a property of the filesystem rather than of the code under test.
+/// `stamp` records `<mtime_sec>.<mtime_nsec>:<size>`, and these writes land
+/// inside an existing size, so mtime is the only thing that can differ.
+///
+/// Measured, `probes/mtimegran.c`:
+///
+/// ```text
+///   ext4, 128-byte inode:  nsec reads 0; mtime moves once per 1000.000 ms
+///                          two back-to-back writes are INDISTINGUISHABLE
+///   btrfs:                 nsec stored; mtime moved after 0.623 ms
+/// ```
+///
+/// A 128-byte inode predates the `i_[cma]time_extra` fields that carry the
+/// sub-second part, so there is nowhere to keep it. A write in the same second
+/// as the stamp before it is therefore *correctly* reported `Clean` — the
+/// framework is not wrong, the test's assumption was. Both tests below were
+/// written on btrfs and failed on ext4-128 for that reason alone, which is the
+/// trap CLAUDE.md names: a test that passes while unable to fail for the reason
+/// it claims.
+///
+/// So the mtime is moved by hand instead of being left to the clock. Backwards,
+/// because "an hour ago" cannot collide with a stamp taken a moment ago on any
+/// resolution, where "now plus a bit" can.
+fn write_and_stale_the_stamp(f: &std::fs::File, at: u64) {
+    use std::os::unix::fs::FileExt;
+    f.write_all_at(&[7u8; 4096], at).unwrap();
+    let older = std::time::SystemTime::now() - Duration::from_secs(3600);
+    f.set_times(std::fs::FileTimes::new().set_modified(older))
+        .expect("move mtime");
+}
+
 /// The same stale stamp against a change that is *not* an echo: the protection
 /// this file exists for is untouched by the fix above.
 ///
@@ -542,8 +576,17 @@ fn a_stale_stamp_still_blocks_a_change_that_would_apply_something() {
     );
     let p = dir.join("big.tar.gz");
     let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
-    f.write_all_at(&[7u8; 4096], 0).unwrap();
+    write_and_stale_the_stamp(&f, 0);
     drop(f);
+    // Asserted, not assumed: the rest of this test is about what a *dirty* file
+    // does, and on a filesystem that could not record the write it would sail
+    // through every remaining assertion while measuring a clean one.
+    assert_eq!(
+        hydration_protocol::stamp::state(&p).unwrap(),
+        hydration_protocol::stamp::State::Dirty,
+        "the write did not leave the stamp stale, so this test would be \
+         measuring a clean file against a rule about dirty ones"
+    );
     let placed_before = m.placed.len();
 
     // Same object, new version.

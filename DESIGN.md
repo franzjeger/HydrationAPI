@@ -1492,6 +1492,34 @@ filesystem behaviour does not get to choose which filesystems it meets.
 
 ---
 
+## 8z-bis. mtime is the whole change detector, and one filesystem cannot keep it
+
+Two things in this design decide "has anyone written to this file?" by comparing a recorded timestamp against the file now:
+
+- `hydration_protocol::stamp` records `<mtime_sec>.<mtime_nsec>:<size>`. §5.2's "the local copy is the truth" is enforced with it, and §6g says explicitly that change notifications are *not* authoritative — so this comparison is the only thing that catches a write nobody reported.
+- `partial::Witness` records `{mtime, mtime_nsec, size}`, and decides whether the worker may still believe its own record of which ranges it filled.
+
+Both inherit whatever resolution the filesystem keeps. Measured, `probes/mtimegran.c`:
+
+```text
+ext4, 128-byte inode:  nsec reads 0; mtime moves once per 1000.000 ms
+                       two back-to-back writes are INDISTINGUISHABLE
+btrfs:                 nsec stored; mtime moved after 0.623 ms
+```
+
+A 128-byte inode predates the `i_[cma]time_extra` fields that carry the sub-second part, so there is nowhere to put it. The consequence is not subtle: **on such a filesystem, a write that lands in the same second as the stamp or witness before it cannot be detected at all**, because nothing about the file has changed that either structure records — the size is the same, and the timestamp is the same.
+
+What that costs, concretely:
+
+- A user edit made within a second of the framework's own write reads as `Clean`, and a delta pass may replace it. This is §5.2's failure, reachable on one filesystem and not on the others.
+- A third party overwriting a range within a second of the worker filling it leaves the worker's record standing, so the worker keeps vouching for content it did not put there.
+
+**Not fixed, and stated rather than left to be discovered.** The obvious repairs are worse than they look: `ctime` has the same resolution on the same inode, and `i_version` is not exposed to userspace without `statx(STATX_CHANGE_COOKIE)`, which is not universally available and would need a fallback that lands back here. The honest position is that this framework's change detection is as good as the filesystem's timestamp resolution, that ext4 with 128-byte inodes is the one layout in the CI matrix where that is a whole second, and that 128-byte inodes are deprecated for unrelated reasons (`mkfs.ext4` itself warns they cannot represent dates past 2038).
+
+It was found by three tests failing on the ext4-128 leg and nowhere else. Each was written on btrfs, where the resolution is fine enough that the assumption held invisibly; each now sets the mtime it needs rather than hoping the clock advanced, so what they measure is the rule rather than the clock. That is the trap CLAUDE.md names from the other side — a test that passes while being unable to fail for the reason it claims — and it took a filesystem with a coarser clock to expose it.
+
+---
+
 ## 8a. A read past EOF triggers an event
 
 Worth writing down because the opposite assumption is the natural one, and wrong.

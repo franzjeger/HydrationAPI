@@ -539,7 +539,36 @@ fn a_placeholder_written_by_someone_else_is_not_trusted() {
             let code = match std::fs::OpenOptions::new().write(true).open(&path) {
                 Ok(f) => {
                     match f.write_all_at(b"not from the cloud", hydrationd::daemon::READAHEAD * 2) {
-                        Ok(()) => f.sync_all().map(|_| 0).unwrap_or(1),
+                        // And move the mtime somewhere the worker's witness
+                        // cannot mistake for its own, rather than trusting the
+                        // clock to have advanced.
+                        //
+                        // `partial::Witness` is `{mtime, mtime_nsec, size}`, and
+                        // this write does not change the size. Measured
+                        // (`probes/mtimegran.c`): ext4 with a 128-byte inode has
+                        // no sub-second timestamp field — nsec reads 0 and mtime
+                        // moves once a second — so a meddling write in the same
+                        // second as the fill it lands on is invisible to the
+                        // witness, and the worker correctly-but-uselessly trusts
+                        // a record that no longer describes the file. On btrfs
+                        // the same code is distinguishable within a millisecond
+                        // and the test passed from the day it was written.
+                        //
+                        // That is a real limit and not only a test problem — see
+                        // DESIGN.md §8z-bis. What is asserted here is the
+                        // worker's rule, so the test states the premise the rule
+                        // needs instead of hoping the filesystem supplies it.
+                        Ok(()) => {
+                            let older =
+                                std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+                            match f
+                                .set_times(std::fs::FileTimes::new().set_modified(older))
+                                .and_then(|_| f.sync_all())
+                            {
+                                Ok(()) => 0,
+                                Err(_) => 1,
+                            }
+                        }
                         Err(_) => 1,
                     }
                 }
