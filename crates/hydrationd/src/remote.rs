@@ -412,6 +412,34 @@ impl Fetch for SocketFetch {
 
 #[cfg(test)]
 mod tests {
+
+    /// A socket path short enough for `sockaddr_un`, wherever this is checked out.
+    ///
+    /// `sun_path` is 108 bytes and `bind` is handed the path un-normalised, so
+    /// the `../..` in a manifest-relative scratch directory counts toward the
+    /// limit rather than cancelling out. Measured: under a `.claude/worktrees/`
+    /// checkout the resulting path is ~123 bytes and both tests below fail;
+    /// on the GitHub runner it is close enough to the limit that only the
+    /// longer-named of the two crosses it, so CI failed one test and a worktree
+    /// failed two. A short checkout passes both, which is why this went unnoticed
+    /// until the branch was first pushed.
+    ///
+    /// The length is asserted rather than left to fail inside `bind`, because
+    /// "path must be shorter than SUN_LEN" names the syscall and not the cause,
+    /// and the cause is that the test built its own path out of the checkout
+    /// location. `daemon_loop.rs` reaches the same conclusion from the client
+    /// side via `ctl_scratch`.
+    fn short_socket(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("hydrationd-{name}-{}.sock", std::process::id()));
+        assert!(
+            p.as_os_str().len() < 100,
+            "the temp dir is too long for a unix socket: {}",
+            p.display()
+        );
+        let _ = std::fs::remove_file(&p);
+        p
+    }
     use super::*;
 
     /// A listener owned by the wrong uid must be refused, and the refusal must
@@ -423,11 +451,7 @@ mod tests {
     /// once, used everywhere.
     #[test]
     fn a_reconnect_to_the_wrong_uid_is_refused_and_counts_as_lost() {
-        let dir = test_scratch::scratch(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
-            "reconnect-uid",
-        );
-        let sock = dir.join("s.sock");
+        let sock = short_socket("reconnect-uid");
         let _ = std::fs::remove_file(&sock);
         let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
 
@@ -462,11 +486,7 @@ mod tests {
     /// would read as a per-file refusal and ignore forever.
     #[test]
     fn a_reconnect_to_an_unbound_path_fails_bounded_and_counts_as_lost() {
-        let dir = test_scratch::scratch(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
-            "reconnect-unbound",
-        );
-        let sock = dir.join("never-bound.sock");
+        let sock = short_socket("reconnect-unbound");
         let _ = std::fs::remove_file(&sock);
 
         let (a, _b) = UnixStream::pair().expect("socketpair");
