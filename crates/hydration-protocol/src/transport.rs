@@ -86,6 +86,28 @@ impl HelperConn {
         }
     }
 
+    /// Swap the underlying stream for a fresh one, in place.
+    ///
+    /// This is the helper's reconnect path. The writer is replaced *inside* the
+    /// shared lock, so every [`Notifier`] handed out before the swap follows it
+    /// — the change-reporting threads keep their handles across a reconnect
+    /// instead of writing into a dead socket for the rest of the process's
+    /// life. The reader is rebuilt outright, which also discards anything
+    /// half-read from the old connection: a stream that died mid-frame is
+    /// desynchronised, and the residue must not be parsed as the new peer's
+    /// first frame.
+    pub fn replace(&mut self, stream: UnixStream) -> io::Result<()> {
+        let (reader, writer) = split(stream)?;
+        {
+            let mut w = self.writer.lock().map_err(|_| {
+                io::Error::other("the connection lock was poisoned by a panicking writer")
+            })?;
+            *w = writer;
+        }
+        self.reader = reader;
+        Ok(())
+    }
+
     pub fn send(&mut self, msg: &FromHelper) -> io::Result<()> {
         self.notifier().send(msg)
     }
@@ -519,6 +541,54 @@ mod tests {
         let (resp, body) = helper.recv(4096).unwrap();
         assert!(matches!(resp, FetchResponse::Failed { errno: 5, .. }));
         assert!(body.is_empty(), "a failure must not be followed by bytes");
+    }
+
+    /// A notifier taken before a reconnect must write to the connection that
+    /// exists after it.
+    ///
+    /// The notifier lives on the reporter's threads for the life of the worker,
+    /// while the fetch path can replace the stream under it. If the notifier
+    /// kept the old stream, every change report after the first reconnect would
+    /// go to a socket nobody reads, silently — the resync walk would heal the
+    /// files eventually, but the prompt channel would be gone for good.
+    #[test]
+    fn a_notifier_follows_a_replaced_stream() {
+        let (mut helper, old_daemon) = pair();
+        let notifier = helper.notifier();
+
+        // The old peer dies; a new one appears.
+        drop(old_daemon);
+        let (fresh, other_end) = UnixStream::pair().expect("socketpair");
+        helper.replace(fresh).expect("replace");
+        let mut new_daemon = DaemonConn::new(other_end).unwrap();
+
+        notifier
+            .send(&FromHelper::Resync)
+            .expect("a send after replace must reach the new stream");
+        assert_eq!(
+            new_daemon.recv().unwrap(),
+            Some(FromHelper::Resync),
+            "the notifier wrote somewhere other than the replaced stream"
+        );
+
+        // And the request/reply path is whole on the new stream too.
+        helper
+            .send(&FromHelper::Fetch(FetchRequest {
+                id: 9,
+                file: FileId { fsid: 1, ino: 2 },
+                offset: 0,
+                len: 2,
+                cgroup: None,
+            }))
+            .unwrap();
+        assert!(matches!(
+            new_daemon.recv().unwrap(),
+            Some(FromHelper::Fetch(_))
+        ));
+        new_daemon.send_ready(9, b"ok").unwrap();
+        let (resp, body) = helper.recv(2).unwrap();
+        assert_eq!(resp, FetchResponse::Ready { id: 9, len: 2 });
+        assert_eq!(body, b"ok");
     }
 
     #[test]

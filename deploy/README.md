@@ -50,8 +50,16 @@ The ordering is the point. `hydrationd.service` is `BindsTo=` the mount and
 for any reason — including both its processes being killed — the mount goes with
 it, and the files become *unreachable* rather than readable-as-zeros.
 
-`hydration-sync.service` may come and go freely. Losing it means hydration fails
-with `EIO`, which is a correct answer.
+`hydration-sync.service` may come and go freely. While it is gone, hydration
+fails with `EIO`, which is a correct answer; when it comes back, the helper
+reconnects on the next read — re-running the same `SO_PEERCRED` uid check as at
+startup — and hydration resumes without the mount ever having moved. A client
+that stays gone past the helper's give-up limit (5 minutes) still brings the
+deployment down rather than leaving it answering `EIO` forever behind two
+healthy-looking units. Before the reconnect path existed, a routine
+`systemctl --user restart` of this unit cost the mount: measured 2026-08-12,
+five minutes from restart to teardown, with a healthy client listening the
+whole time.
 
 ## Try it without a cloud account
 

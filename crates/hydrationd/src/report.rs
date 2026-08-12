@@ -96,9 +96,15 @@ pub struct Reporter {
 impl Reporter {
     /// `ignore_pids` must include every process that writes hydrated content,
     /// or each hydration is reported as a local edit and uploaded straight back.
+    ///
+    /// `peer` names the sync daemon's pid, through a cell rather than a number
+    /// because the daemon restarts and the reconnect path updates it in place —
+    /// see [`crate::remote::SocketFetch::with_peer_pid`]. `None` turns the
+    /// dynamic half of the filter off.
     pub fn spawn(
         mount: &std::path::Path,
         ignore_pids: Vec<i32>,
+        peer: Option<Arc<std::sync::atomic::AtomicI32>>,
         notifier: Notifier,
         batch_every: Duration,
     ) -> std::io::Result<Self> {
@@ -118,6 +124,9 @@ impl Reporter {
         raise_fd_limit();
 
         let mut watcher = Watcher::new(mount, ignore_pids)?;
+        if let Some(cell) = peer {
+            watcher.ignore_peer(cell);
+        }
         let drain = Arc::clone(&dirty);
         std::thread::spawn(move || loop {
             match watcher.poll(Duration::from_millis(200)) {
@@ -169,11 +178,27 @@ impl Reporter {
             // Resync first. It says "what follows is incomplete", and a daemon
             // that acted on the batch before hearing that would believe it had
             // the whole story for a moment.
+            //
+            // A failed send is an outage, not the end: the fetch path replaces
+            // the stream under this notifier when the sync daemon comes back
+            // (`HelperConn::replace`), so returning here — which was right when
+            // a dead connection was permanent — would now kill change
+            // reporting on the first edit made during a client restart, and it
+            // would stay dead for the rest of the worker's life. The batch that
+            // was taken is gone from the set, so the loss is recorded where it
+            // belongs: `lost` goes back up, and the first batch after the line
+            // heals opens with the `Resync` that tells the daemon to walk.
             if lost && notifier.send(&FromHelper::Resync).is_err() {
-                return;
+                if let Ok(mut d) = send.lock() {
+                    d.lost = true;
+                }
+                continue;
             }
             if !files.is_empty() && notifier.send(&FromHelper::Changed { files }).is_err() {
-                return;
+                if let Ok(mut d) = send.lock() {
+                    d.lost = true;
+                }
+                continue;
             }
         });
 

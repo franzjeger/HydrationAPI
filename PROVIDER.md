@@ -16,7 +16,8 @@ There are three traits. None of them are about POSIX; the framework owns all of
 that.
 
 ```rust
-trait Provider { fn fetch(&mut self, cloud_id: &str, size: u64, out: &mut Body<'_>) -> io::Result<()>; }
+trait Provider { fn fetch(&mut self, cloud_id: &str, size: u64, tag: Option<&str>,
+                          span: Span, out: &mut Body<'_>) -> io::Result<()>; }
 trait Sink     { fn upload(&mut self, path: &Path, existing: Option<&str>) -> io::Result<Uploaded>;
                  fn remove(&mut self, cloud_id: &str) -> io::Result<()>; }
 trait Discover { fn changes(&mut self, cursor: &Cursor) -> io::Result<(Vec<Change>, Cursor)>; }
@@ -81,16 +82,28 @@ is arranged against, and length alone does not catch it.
 implementation:
 
 ```rust
-fn fetch(&mut self, id: &str, _size: u64, out: &mut Body<'_>) -> io::Result<()> {
-    let mut body = self.http.get(self.url(id)).send()?;
+fn fetch(&mut self, id: &str, _size: u64, _tag: Option<&str>,
+         span: Span, out: &mut Body<'_>) -> io::Result<()> {
+    let mut body = self.http.get(self.url(id))
+        .header("range", format!("bytes={}-{}", span.offset, span.end() - 1))
+        .send()?;
     std::io::copy(&mut body, out)?;
     Ok(())
 }
 ```
 
-`Body` knows the object's size before you start, because the framework took it
-from the placeholder rather than from you. Writing past it fails at the offending
-byte; finishing short becomes an abort rather than a truncated file. There is no
+`span` is what a reader actually demanded, and it is usually far smaller than the
+object — opening a 2.77 GiB archive to look at its header is a 4096-byte demand
+(§8d-bis). If your service has no ranged reads, fetch the object and write only
+the span out of it; that is correct, and no worse than what every fetch did before
+ranges existed. It is not optional, though: `Body` refuses bytes past the span,
+and a whole-object transfer behind a small read is what made multi-gigabyte files
+unreadable.
+
+`Body` knows how much you owe before you start, because the framework took the
+size from the placeholder rather than from you and the span from the kernel.
+Writing past it fails at the offending byte; finishing short becomes an abort
+rather than a truncated file. There is no
 partial success here and adding one is not a small change — §5.7 exists because a
 half-hydrated file is indistinguishable from a real one afterwards. Returning
 `Err` abandons the transfer cleanly: the placeholder is put back exactly as it
@@ -251,9 +264,16 @@ the user's file moved to the sync root on the next pass.
 
 ## What the framework guarantees you
 
-- **It never asks for a range.** v1 fetches whole objects. The pre-content event
-  does carry an offset, but the measured `count` is the readahead window rather
-  than what the application asked for, so range-based fetching would be guessing.
+- **It asks for exactly the range a reader demanded, and never more.** The
+  measured `count` in a pre-content event is what the application asked for, not a
+  readahead window: a 4 KiB read of a 2.77 GiB object demands 4096 bytes, at any
+  object size (§8d-bis, `probes/bigdemand.c`). Spans never run past the object,
+  and a span may legitimately be the whole object — check `span.is_whole(size)`
+  before verifying a whole-object content hash, because a range cannot be checked
+  against one.
+- **A file is only reported hydrated when every byte of it has arrived.** Ranges
+  accumulate across reads; until the object is complete the file keeps its
+  placeholder mark and you may be asked for more of it.
 - **Each instance is called from one thread at a time.** The shipped daemon
   builds a *separate* instance per role — the startup check, the upload thread,
   the delta thread, the fetch loop — and three of those run concurrently. So one
@@ -325,11 +345,18 @@ real improvement of roughly sixty-fold, and it is **not** the same as no limit.
 Above it, refuse the object with a clear error rather than spending ten minutes
 to fail anyway.
 
-Note what streaming does *not* fix. A `read()` demands only the page it needs, so
-a sequentially-read file produces many small demands — but a **mapped** read
-demands the whole object in one event (measured, §8d), and nothing can decompose
-that. `mmap` is every ELF loader, every runtime loading a library, sqlite, `grep`
-on a large file. For those the cap is the ceiling, exactly.
+The cap now bounds **one span**, not the object, so an ordinary `read()` of any
+size of any object is nowhere near it. What is still bounded by it is a single
+large *demand* — and the one that matters is `mmap` over a whole object, which
+asks for the whole object in one event. Mapping a *window* or a *segment* demands
+only that window (measured, §8d-bis — this corrects §8d, which could not tell the
+two apart on a 4 MiB file), so a segment-mapping ELF loader is fine. A program
+that maps a multi-gigabyte file in one call is not, and for it the cap is the
+ceiling, exactly.
+
+While a large span is in flight the worker reports progress every five seconds,
+because a transfer that is working and one that is wedged are otherwise
+indistinguishable from outside for as long as either lasts.
 
 **Restoring from a backup needs a procedure you have to write.** A restore
 reproduces content without extended attributes, so every restored file looks like

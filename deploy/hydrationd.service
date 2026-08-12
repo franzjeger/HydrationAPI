@@ -50,30 +50,60 @@ ExecStart=/usr/local/bin/hydrationd --mount /home/CHANGE-ME/OneDrive --socket /r
 # recovery — this restarts, and RequiresMountsFor= brings the mount back with
 # it. Measured; see DESIGN.md §8b.
 #
-# A client restart is survived the same way: the helper's socket dies, it gives
-# up, and the pair is rebuilt. There is no in-process reconnect path.
+# A client restart is survived in-process: the helper reconnects to the socket
+# and re-checks the peer's uid, so the mount never comes down for it. Measured
+# before that existed (2026-08-12): "the pair is rebuilt by systemd" meant five
+# minutes of EIO and then this unit tearing the mount down, because nothing
+# restarts a *system* unit when a *user* unit comes back. The teardown below is
+# now only for a client that stays gone past the helper's give-up limit.
 Restart=always
 RestartSec=1
 
 # Everything a helper this small does not need.
+# NO DIRECTIVE HERE MAY CREATE A MOUNT NAMESPACE.
+#
+# This is the constraint the rest of the sandboxing has to fit around, and it is
+# not obvious from any of the directive names. `fanotify_mark(FAN_MARK_MOUNT)`
+# marks the `vfsmount` in the *caller's* mount namespace: give this unit one of
+# its own and it marks a private copy, logs that it is watching, and every read
+# from the user's session goes through an unmarked mount and returns the zeros a
+# placeholder is made of. Measured on a real deployment — a 3,557-byte file read
+# back 3,557 zero bytes with the unit reporting active throughout.
+#
+# Measured, each of these *alone* is enough to cause it. None may be used:
+#
+#   PrivateTmp=  PrivateNetwork=  ProtectKernelTunables=
+#   ProtectControlGroups=  ProtectKernelModules=
+#
+# This earlier shipped with all five. `hydrationd` now refuses to start when it
+# finds itself in a namespace of its own (`selfcheck::reach`), so the mistake is
+# loud rather than silent — but a unit that trips that check is still a unit that
+# does not run.
 User=root
-AmbientCapabilities=CAP_SYS_ADMIN
-CapabilityBoundingSet=CAP_SYS_ADMIN
+
+# CAP_SYS_ADMIN is what fanotify needs. CAP_DAC_OVERRIDE is what "root" normally
+# means, and dropping it costs this process access to its own mount: a sync root
+# inside a 0700 home returns EACCES from `stat`, and the sync daemon's socket is
+# 0600, which needs write permission to connect to. Both were measured.
+#
+# Narrow it to CAP_SYS_ADMIN alone only if the sync root, every directory above
+# it, and the socket are all traversable by root without the DAC bypass — which
+# on a single-user desktop they are not.
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+
 NoNewPrivileges=yes
-PrivateNetwork=yes
-PrivateTmp=yes
-ProtectKernelModules=yes
-ProtectKernelTunables=yes
-ProtectControlGroups=yes
+# The network denial, done without a namespace. This process has no business
+# reaching a network, and if it ever tries, that is the incident. This replaces
+# PrivateNetwork=yes, which achieves the same thing and takes a mount namespace
+# with it — systemd mounts a private /sys for the network namespace.
 RestrictAddressFamilies=AF_UNIX
+# Seccomp filters and personality bits. None of these create a namespace.
 RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
-
-# PrivateNetwork is not hardening theatre here: this process has no business
-# reaching a network, and if it ever tries, that is the incident.
 
 # The supervisor exists to outlive the worker. Letting the kernel choose it as
 # an OOM victim would remove the thing that makes failures safe, at exactly the

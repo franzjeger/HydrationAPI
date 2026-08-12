@@ -177,7 +177,21 @@ pub fn reclaim(
     // Built anonymously and swapped in, so the file is never observable in a
     // half-evicted state: it is either the full content or a complete
     // placeholder, and nothing in between is ever reachable by name.
-    let mut placer = TmpfilePlacer::new(root);
+    //
+    // Opened per eviction rather than held, because eviction is rare and the
+    // descriptor a placer pins would otherwise keep a detached sync filesystem
+    // alive for the life of the daemon. Opening here also means the root is
+    // resolved once, at the start of the swap, rather than separately by each
+    // syscall that makes it up.
+    //
+    // `real_root`, not `root`. The placer works out where to put a file by
+    // taking the path apart against its own root, so the two have to be in the
+    // same form — and `path` is `real`, which is canonical. Handed the
+    // uncanonical `root` it refused every eviction the moment the caller's root
+    // contained a `..` or a symlink, which is what `crates/…/../../target` in
+    // the test harness is. Refusing was the right response to being given two
+    // paths that do not agree; agreeing is better.
+    let mut placer = TmpfilePlacer::new(&real_root)?;
     placer.place(path, md.len(), &cloud_id, etag.as_deref())?;
 
     // Measured rather than assumed, for the same reason §5.8 probes for the

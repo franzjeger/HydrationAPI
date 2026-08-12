@@ -28,9 +28,9 @@ use hydration_protocol::transport::DaemonConn;
 use hydration_protocol::FileId;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -281,6 +281,178 @@ fn dirty_files(root: &std::path::Path) -> io::Result<Resync> {
     Ok(found)
 }
 
+/// One `watch` line's worth of state: the three numbers a tray displays.
+///
+/// `PartialEq` *is* the contract's change test — a line goes out when this
+/// tuple differs from the last one written to that connection, so equality here
+/// is the definition of "nothing changed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WatchState {
+    /// What [`Queue::pending`] returned: waiting and in flight.
+    unsent: u64,
+    /// The manifest's file count as of its last build — see [`control`] for why
+    /// it is a stored number and not a fresh walk.
+    excluded: u64,
+    /// How many other mounts expose the sync files (§6.4a).
+    exposures: u64,
+}
+
+impl WatchState {
+    /// The wire form, without the trailing newline.
+    ///
+    /// Key order is fixed and new keys may only ever be appended: a reader is
+    /// told to ignore keys it does not recognise, and that promise is only
+    /// worth having if the keys it does recognise stay where they were.
+    fn line(&self) -> String {
+        format!(
+            "unsent={} excluded={} exposures={}",
+            self.unsent, self.excluded, self.exposures
+        )
+    }
+}
+
+/// The watch tuple as of this instant.
+///
+/// Each lock is taken for one length read and dropped before the next is
+/// touched, and both are dropped before any socket sees a byte. The queue lock
+/// in particular is the one the helper's change notifications take, and that
+/// thread answers fetches — a reader would sit blocked inside `read()` for as
+/// long as a status sample held it.
+fn watch_state(
+    queue: &Mutex<Queue<SystemClock>>,
+    excluded: &AtomicU64,
+    exposures: &Mutex<Vec<String>>,
+) -> WatchState {
+    let unsent = queue.lock().unwrap().pending() as u64;
+    let exposures = exposures.lock().unwrap().len() as u64;
+    WatchState {
+        unsent,
+        excluded: excluded.load(Ordering::SeqCst),
+        exposures,
+    }
+}
+
+/// More live watchers than this and new ones are refused by closing them.
+///
+/// The registry has to be bounded because its entries outlive their moment on
+/// the accept thread: a connect loop faster than the once-a-second cull could
+/// otherwise walk the daemon into its fd limit, which is shared with the helper
+/// connection and every hydration in flight. The legitimate population is a
+/// tray and a D-Bus bridge; dozens is already generous.
+const MAX_WATCHERS: usize = 32;
+
+/// Every connection that asked to `watch`, and the last line each was told.
+///
+/// One registry served by one already-existing thread, rather than a thread per
+/// connection. A watcher is long-lived *by design*, so the obvious
+/// thread-per-connection shape hands anything that reconnects in a loop one
+/// parked thread per attempt, and nothing on the accept side can tell that loop
+/// from an enthusiastic tray. Here a reconnect costs one registry slot, dead
+/// slots are reclaimed on every tick and every registration, and the daemon has
+/// the same number of threads with thirty watchers as with none.
+#[derive(Default)]
+struct Watchers {
+    conns: Mutex<Vec<Watcher>>,
+}
+
+struct Watcher {
+    conn: UnixStream,
+    last: WatchState,
+}
+
+/// Whether the peer end of this stream has gone away.
+///
+/// A zero-timeout poll asking for no events at all: `POLLHUP`, `POLLERR` and
+/// `POLLNVAL` are reported whether or not they were requested, and they are the
+/// only three of interest. `POLLIN` must *not* be in the mask — a watcher's
+/// bytes are ignored rather than read, so "readable" means an unread buffer,
+/// not a departure. Without this probe a watcher that disconnects during a
+/// quiet stretch would sit in the registry forever: culling on write failure
+/// alone needs the state to change first, and the normal state of a synced
+/// drive is that it does not.
+fn peer_gone(conn: &UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut p = libc::pollfd {
+        fd: conn.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut p, 1, 0) };
+    rc > 0 && (p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+}
+
+fn write_line(conn: &mut UnixStream, state: WatchState) -> io::Result<()> {
+    use std::io::Write;
+    writeln!(conn, "{}", state.line())
+}
+
+impl Watchers {
+    /// Take ownership of a connection whose peer asked to watch.
+    ///
+    /// The first state line is written here, synchronously, so that `watch` is
+    /// answered immediately rather than on the next tick — the peer can read
+    /// one line and then own nothing but a quiet socket. The state may move
+    /// between this line and the registration becoming visible to a broadcast;
+    /// that costs at most one extra line on the next tick, never a missed final
+    /// state, because a broadcast compares against what each connection was
+    /// actually told.
+    fn adopt(&self, conn: UnixStream, state: WatchState) {
+        let Ok(mut conns) = self.conns.lock() else {
+            return;
+        };
+        // Reclaim before counting: the cap must measure live peers, not the
+        // residue of a reconnect loop that already closed its last attempts.
+        conns.retain(|w| !peer_gone(&w.conn));
+        if conns.len() >= MAX_WATCHERS {
+            // Dropping the stream closes it; EOF is the refusal. There is no
+            // error line to send, because after `watch` the connection speaks
+            // state lines and nothing else — a reader would have to parse the
+            // apology as one.
+            return;
+        }
+        // A watcher that stops draining must not park the thread every other
+        // watcher's lines come from. The socket's send buffer absorbs
+        // thousands of state lines before a write can block at all, so this
+        // only ever fires on a peer that has plainly stopped reading — and
+        // dropping it is then the answer, at worst costing the peer a torn
+        // final line before the EOF that tells it to reconnect.
+        let _ = conn.set_write_timeout(Some(Duration::from_secs(1)));
+        let mut w = Watcher { conn, last: state };
+        if write_line(&mut w.conn, state).is_ok() {
+            conns.push(w);
+        }
+    }
+
+    /// Tell every watcher whose last line differs, and drop the departed.
+    ///
+    /// An identical tuple is deliberately not re-sent: the verb exists so a
+    /// tray can sleep instead of polling, and a repeated line is a wakeup that
+    /// says nothing — the polling this replaces, moved one process over.
+    fn broadcast(&self, state: WatchState) {
+        let Ok(mut conns) = self.conns.lock() else {
+            return;
+        };
+        conns.retain_mut(|w| {
+            if peer_gone(&w.conn) {
+                return false;
+            }
+            if w.last == state {
+                return true;
+            }
+            if write_line(&mut w.conn, state).is_err() {
+                return false;
+            }
+            w.last = state;
+            true
+        });
+    }
+
+    #[cfg(test)]
+    fn live(&self) -> usize {
+        self.conns.lock().unwrap().len()
+    }
+}
+
 /// The user's own way in: a line-oriented socket only they can reach.
 ///
 /// Eviction and status both have to be triggered by somebody, and the trigger
@@ -294,11 +466,29 @@ fn dirty_files(root: &std::path::Path) -> io::Result<Resync> {
 /// upload's delete-during-upload rule would then see the inode change and remove
 /// the object it had just created (§5.5). Only the process that owns the queue
 /// can refuse that, so only it does the work.
+///
+/// Three verbs, one per line:
+///
+/// - `status` — one report per request, human-readable on purpose: it is what
+///   `hydration-ctl status` shows a person, and its wording is not a machine
+///   surface. Machines get `watch`.
+/// - `evict <path>` — turn a file the cloud already holds back into a
+///   placeholder.
+/// - `watch` — one state line immediately, another every time the state
+///   changes, and nothing else ever, until the peer disconnects. A state line
+///   is `key=value` pairs joined by single spaces, newline-terminated,
+///   currently `unsent=<u64> excluded=<u64> exposures=<u64>`: the upload
+///   queue's pending count, the manifest's file count as of its last build,
+///   and how many other mounts expose the sync files. Keys stay in that order
+///   and new keys are only ever appended, so a reader must ignore keys it does
+///   not recognise. An unchanged tuple is never re-sent.
 fn control(
     socket: &std::path::Path,
     mount: PathBuf,
     queue: Arc<Mutex<Queue<SystemClock>>>,
     exposures: Arc<Mutex<Vec<String>>>,
+    excluded: Arc<AtomicU64>,
+    watchers: Arc<Watchers>,
 ) -> io::Result<()> {
     use std::io::{BufRead, BufReader, Write};
 
@@ -347,6 +537,10 @@ fn control(
                 "status" => {
                     let pending = queue.lock().unwrap().pending();
                     let m = Manifest::build(&mount).unwrap_or_default();
+                    // A fresh count was just paid for; publishing it costs
+                    // nothing and spares watchers up to a whole status-thread
+                    // period of staleness after an eviction.
+                    excluded.store(m.len() as u64, Ordering::SeqCst);
                     let seen = exposures.lock().unwrap();
                     format!(
                         "{pending} unsent\n{}\n{}",
@@ -360,6 +554,22 @@ fn control(
                             )
                         }
                     )
+                }
+                "watch" => {
+                    // From here this connection is written to and never read —
+                    // one state line now, another per change, nothing else —
+                    // so it leaves the accept thread before the next
+                    // `incoming()`. It joins a registry the status thread
+                    // already serves once a second, rather than getting a
+                    // thread of its own: a watcher is long-lived *by design*,
+                    // so serving it here would park the user's only status and
+                    // eviction channel for its whole lifetime — the exact
+                    // condition the read timeout above exists to prevent,
+                    // except that a watcher never times out on purpose — and
+                    // thread-per-watcher would let a reconnect loop grow the
+                    // daemon by one parked thread per attempt.
+                    watchers.adopt(out, watch_state(&queue, &excluded, &exposures));
+                    break;
                 }
                 "" => continue,
                 other => format!("unknown command: {other}"),
@@ -378,6 +588,43 @@ fn control(
 /// a cloud is beyond the three traits, which is the whole point: swapping
 /// `FolderCloud` for a real service changes this file not at all.
 pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
+    // Before the credential, because this one costs nothing and the failure it
+    // prevents is the worst one available.
+    //
+    // A sync root that is not its own mount can never be marked — §6.4a, a
+    // directory mark delivers nothing — so every placeholder written into it is
+    // a file that reads as zeros with no way to ever fix itself. Starting anyway
+    // and materialising into the bare directory underneath a mount that has not
+    // come up is not a corner case: it happened, and produced 145,711 files and
+    // 102 GB of apparent size, all of it zero, indistinguishable from the real
+    // thing to everything that read it.
+    //
+    // See `mount::is_mount_point` for why this is not an `st_dev` comparison.
+    match crate::mount::is_mount_point(&config.mount) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not a mount point; a sync root has to be its own mount \
+                     or nothing can hydrate what is written into it, and every \
+                     placeholder would read back as zeros",
+                    config.mount.display()
+                ),
+            ))
+        }
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!(
+                    "could not tell whether {} is a mount point ({e}); refusing \
+                     rather than materialising into a directory that may not be one",
+                    config.mount.display()
+                ),
+            ))
+        }
+    }
+
     // Asked once up front so a missing credential — or an unwritable cloud
     // directory — is a startup failure rather than a surprise on the first
     // fetch.
@@ -401,6 +648,14 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     let resync = Arc::new(AtomicBool::new(true));
     // Reported by the helper, shown by the status thread. §6.4a.
     let exposures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // The manifest's file count as of its last build, for `watch`. A stored
+    // number rather than a call, so telling a watcher the count never walks
+    // the directory the manifest describes — the status thread walks it on its
+    // own cadence anyway, and `status` refreshes the number for free whenever
+    // it builds a manifest of its own.
+    let excluded = Arc::new(AtomicU64::new(0));
+    // Everyone who asked to be told when the numbers above move.
+    let watchers = Arc::new(Watchers::default());
 
     let _ = std::fs::remove_file(&config.socket);
     let listener = UnixListener::bind(&config.socket)?;
@@ -430,8 +685,18 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             Arc::clone(&resync),
         );
         std::thread::spawn(move || {
-            let Ok(mut sink) = role(&access, C::sink) else {
-                return;
+            // Same reasoning as the delta thread below: a queue that grows and
+            // never drains is visible in the status line, but the reason is not,
+            // and the reason is here.
+            let mut sink = match role(&access, C::sink) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "hydration-sync: could not start the upload sink: {e}; \
+                         nothing will be sent"
+                    );
+                    return;
+                }
             };
             let mut store = Store::new();
             while !stop.load(Ordering::SeqCst) {
@@ -543,10 +808,28 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             Arc::clone(&access),
         );
         std::thread::spawn(move || {
-            let Ok(mut cloud) = role(&access, C::discover) else {
-                return;
+            // Leaving quietly here is indistinguishable, from outside, from a
+            // drive with nothing on it: the status thread keeps printing "0
+            // unsent", no placeholder ever appears, and the state directory
+            // stays empty. The only thread that could have said why is the one
+            // that just died. A live Graph account produced exactly that.
+            let mut cloud = match role(&access, C::discover) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "hydration-sync: could not start the delta feed: {e}; \
+                         no delta pass will run"
+                    );
+                    return;
+                }
             };
-            let mut placer = TmpfilePlacer::new(&mount);
+            // Opened when the mount is confirmed, dropped when it goes away, and
+            // opened again only when a mount is back. Not once for the life of
+            // the thread: the placer pins the root it was opened on, so one that
+            // outlived its mount would keep writing into a filesystem nobody can
+            // reach — safe, and pointless. `None` means "no mount right now",
+            // which is the same state the thread starts in.
+            let mut placer: Option<TmpfilePlacer> = None;
             let mut store = Store::new();
             let mut cursor = Cursor::default();
             // Set when a pass deliberately left something for a later one.
@@ -557,7 +840,67 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // held back on purpose was consumed by silence, and the service
             // never mentions those objects again.
             let mut unfinished = false;
+            // Said once, not once a round: a mount that is gone stays gone until
+            // someone acts, and five seconds of the same line is a log nobody
+            // reads any of.
+            let mut complained = false;
             while !stop.load(Ordering::SeqCst) {
+                // Two questions, and they are not the same one.
+                //
+                // "Is there a mount here at all" is what `is_mount_point`
+                // answers, and it is the right question exactly once per
+                // incarnation: a sync root that is a plain directory can never
+                // be marked (§6.4a), so opening a placer on one would be
+                // arranging the original failure. It cannot answer the other
+                // question — a mount that was detached and replaced is still *a*
+                // mount — which is why it is asked here, where a new placer is
+                // about to be opened, and not inside the pass.
+                //
+                // "Is it still the mount we started on" is the placer's own, via
+                // the unique mount id it captured at open time, and `apply` asks
+                // it per change. See `place.rs` for why that one cannot be
+                // carried by a path check.
+                if placer.is_none() {
+                    let opened = match crate::mount::is_mount_point(&mount) {
+                        Ok(true) => TmpfilePlacer::new(&mount).map_err(|e| {
+                            format!("could not open the sync root {} ({e})", mount.display())
+                        }),
+                        Ok(false) => Err(format!(
+                            "{} is not a mount point — nothing will be applied until it \
+                             is back, because placeholders written into the bare \
+                             directory would read as zeros",
+                            mount.display()
+                        )),
+                        Err(e) => Err(format!(
+                            "cannot tell whether {} is a mount point ({e}) — holding off \
+                             rather than writing into a directory that may not be one",
+                            mount.display()
+                        )),
+                    };
+                    match opened {
+                        Ok(p) => {
+                            if complained {
+                                eprintln!(
+                                    "hydration-sync: {} is a mount again; resuming",
+                                    mount.display()
+                                );
+                            }
+                            complained = false;
+                            placer = Some(p);
+                        }
+                        Err(why) => {
+                            if !complained {
+                                complained = true;
+                                eprintln!("hydration-sync: {why}");
+                            }
+                            std::thread::sleep(Duration::from_secs(5));
+                            continue;
+                        }
+                    }
+                }
+                let Some(placer_ref) = placer.as_mut() else {
+                    unreachable!("a placer was just opened or the round was skipped")
+                };
                 match cloud.changes(&cursor) {
                     Ok((changes, next)) if !changes.is_empty() => {
                         // Snapshotted, then released — not held across the pass.
@@ -570,7 +913,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         // the stamp check inside `apply` is for.
                         let waiting = q.lock().unwrap().waiting_set();
                         let applied =
-                            delta::apply(&mount, &changes, &mut store, &waiting, &mut placer);
+                            delta::apply(&mount, &changes, &mut store, &waiting, placer_ref);
                         // The cursor moves only past a pass that finished.
                         //
                         // A delta service does not replay a consumed change, so
@@ -578,20 +921,47 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         // refusal is permanent however transient its cause —
                         // two objects swapping paths refuse each other on one
                         // pass and would succeed on the next, if there were one.
+                        // A pass that stopped because the mount went away is not
+                        // an incident. `hydrationd` detaches it on purpose when
+                        // it fails closed, so this is the client meeting a
+                        // deliberate act — reported plainly, with the counts of
+                        // what did land, and then the placer is dropped so the
+                        // next round has to find a mount before it opens
+                        // another. Cursor stays put: what was not applied has
+                        // not been seen.
+                        let lost_the_mount = matches!(&applied, Ok(a) if a.stopped.is_some());
+                        if let Ok(a) = &applied {
+                            if let Some(why) = &a.stopped {
+                                eprintln!(
+                                    "hydration-sync: delta pass stopped after {} of {} \
+                                     changes: {why}; not advancing",
+                                    a.created + a.updated + a.removed,
+                                    changes.len()
+                                );
+                            }
+                        }
                         match &applied {
                             Ok(a) if a.retryable => {
                                 unfinished = true;
-                                eprintln!(
-                                    "hydration-sync: delta pass incomplete ({} deferred); \
-                                     not advancing",
-                                    a.failed.len()
-                                );
+                                // Already explained above when it was the mount;
+                                // saying it twice in different words reads as two
+                                // separate problems.
+                                if !lost_the_mount {
+                                    eprintln!(
+                                        "hydration-sync: delta pass incomplete ({} \
+                                         deferred); not advancing",
+                                        a.failed.len()
+                                    );
+                                }
                             }
                             Ok(_) => {
                                 unfinished = false;
                                 cursor = next;
                             }
                             Err(_) => unfinished = true,
+                        }
+                        if lost_the_mount {
+                            placer = None;
                         }
                         match applied {
                             Ok(a) if a != Applied::default() => {
@@ -609,11 +979,23 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                                 // changes the framework deliberately refused to
                                 // apply because local work would have been lost,
                                 // and they are what a conflict UI is for.
-                                for p in &a.kept_local {
-                                    eprintln!("hydration-sync:   kept local copy of {p}");
+                                for k in &a.kept_local {
+                                    eprintln!(
+                                        "hydration-sync:   kept local copy of {}: {}",
+                                        k.path, k.why
+                                    );
                                 }
-                                for p in &a.failed {
-                                    eprintln!("hydration-sync:   could not apply {p}");
+                                // With the cause, because without it these lines
+                                // are indistinguishable from each other: a
+                                // permission error on the sync root and a path
+                                // the cloud was never allowed to name printed
+                                // the same sentence, and the difference had to
+                                // be found by bisecting the daemon.
+                                for f in &a.failed {
+                                    eprintln!(
+                                        "hydration-sync:   could not apply {}: {}",
+                                        f.path, f.why
+                                    );
                                 }
                             }
                             Ok(_) => {}
@@ -636,55 +1018,80 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // asked for.
     {
         let ctl = config.socket.with_extension("ctl");
-        let (mount, q, ex) = (
+        let (mount, q, ex, exc, ws) = (
             config.mount.clone(),
             Arc::clone(&queue),
             Arc::clone(&exposures),
+            Arc::clone(&excluded),
+            Arc::clone(&watchers),
         );
         eprintln!("hydration-sync: control socket at {}", ctl.display());
         std::thread::spawn(move || {
-            if let Err(e) = control(&ctl, mount, q, ex) {
+            if let Err(e) = control(&ctl, mount, q, ex, exc, ws) {
                 eprintln!("hydration-sync: control socket unavailable: {e}");
             }
         });
     }
 
-    // Status, and the manifest that makes a backup honest.
+    // Status, the manifest that makes a backup honest — and the `watch`
+    // broadcasts, which ride this thread rather than getting one of their own.
     {
-        let (q, stop, mount, exposures) = (
+        let (q, stop, mount, exposures, excluded, watchers) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             config.mount.clone(),
             Arc::clone(&exposures),
+            Arc::clone(&excluded),
+            Arc::clone(&watchers),
         );
         std::thread::spawn(move || {
+            // The walk keeps its thirty-second cadence; only the sleep is
+            // sliced finer. Watchers are told on a one-second sample, not per
+            // change notification, because two of the three numbers they are
+            // told are only ever as fresh as somebody's walk or sample anyway:
+            // notifying per change would mean either a directory walk per
+            // event — a stat storm under a burst of saves — or a line about a
+            // count that has not been recomputed. Sampling the cheap two (a
+            // queue length under its mutex, a vector length) and reusing this
+            // thread's walk for the third puts a tray within a second of the
+            // number that actually moves, for one extra wakeup a second in a
+            // process whose upload driver already wakes five times a second.
+            const TICKS_PER_MANIFEST: u32 = 30;
+            let mut tick = 0;
             while !stop.load(Ordering::SeqCst) {
-                if let Ok(m) = Manifest::build(&mount) {
-                    let _ = m.write(&mount);
-                    // §6d: the count goes where "everything synced" goes, not
-                    // into a log file nobody opens. This is a daemon, so the log
-                    // is what it has — a UI would show the same sentence.
-                    eprintln!(
-                        "hydration-sync: {} unsent, {}",
-                        q.lock().unwrap().pending(),
-                        crate::manifest::status_line(BackupPolicy::Exclude, m.len())
-                    );
-                    // §6.4a. Not a log detail: another mount over the same files
-                    // bypasses hydration entirely, and anything reading through
-                    // it gets the zeros a placeholder is made of. The framework
-                    // cannot prevent it, so the one thing it owes the user is
-                    // that it never happens quietly.
-                    let seen = exposures.lock().unwrap();
-                    if !seen.is_empty() {
+                if tick == 0 {
+                    if let Ok(m) = Manifest::build(&mount) {
+                        let _ = m.write(&mount);
+                        // The count `watch` hands out, from the walk that was
+                        // happening regardless.
+                        excluded.store(m.len() as u64, Ordering::SeqCst);
+                        // §6d: the count goes where "everything synced" goes, not
+                        // into a log file nobody opens. This is a daemon, so the log
+                        // is what it has — a UI would show the same sentence.
                         eprintln!(
-                            "hydration-sync: WARNING — {} other mount(s) expose these files \
-                             and bypass hydration: {:?}",
-                            seen.len(),
-                            *seen
+                            "hydration-sync: {} unsent, {}",
+                            q.lock().unwrap().pending(),
+                            crate::manifest::status_line(BackupPolicy::Exclude, m.len())
                         );
+                        // §6.4a. Not a log detail: another mount over the same files
+                        // bypasses hydration entirely, and anything reading through
+                        // it gets the zeros a placeholder is made of. The framework
+                        // cannot prevent it, so the one thing it owes the user is
+                        // that it never happens quietly.
+                        let seen = exposures.lock().unwrap();
+                        if !seen.is_empty() {
+                            eprintln!(
+                                "hydration-sync: WARNING — {} other mount(s) expose these files \
+                                 and bypass hydration: {:?}",
+                                seen.len(),
+                                *seen
+                            );
+                        }
                     }
                 }
-                std::thread::sleep(Duration::from_secs(30));
+                tick = (tick + 1) % TICKS_PER_MANIFEST;
+                watchers.broadcast(watch_state(&q, &excluded, &exposures));
+                std::thread::sleep(Duration::from_secs(1));
             }
         });
     }
@@ -911,5 +1318,209 @@ mod tests {
         let found = dirty_files(&dir).unwrap();
         assert_eq!(found.send.len(), 1);
         assert_eq!(found.holding, Vec::<PathBuf>::new());
+    }
+
+    /// A scratch directory whose *canonical* path is used, because these tests
+    /// bind sockets in it. A socket path has a 108-byte ceiling (`sun_path`),
+    /// and the uncanonicalized fallback — manifest dir plus `../../target` —
+    /// is long enough to cross it on a deep checkout. Short test names, same
+    /// reason.
+    fn ctl_scratch(name: &str) -> PathBuf {
+        let d = test_scratch::scratch(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+            &format!("control-socket/{name}"),
+        );
+        d.canonicalize().unwrap_or(d)
+    }
+
+    fn state(unsent: u64, excluded: u64, exposures: u64) -> WatchState {
+        WatchState {
+            unsent,
+            excluded,
+            exposures,
+        }
+    }
+
+    /// The regression `watch` invites, and the reason it is not served on the
+    /// accept thread: a watcher is long-lived and silent *by design*, and the
+    /// old shape held each connection there until its read timed out — so one
+    /// watcher would park `status` and `evict`, the user's only channel, for
+    /// ten seconds per reconnect, forever.
+    #[test]
+    fn a_watcher_does_not_park_status_or_evict() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        let dir = ctl_scratch("no-park");
+        let mount = dir.join("m");
+        std::fs::create_dir_all(&mount).unwrap();
+        let sock = dir.join("ctl");
+
+        let queue = Arc::new(Mutex::new(Queue::new(
+            Duration::from_secs(900),
+            SystemClock::default(),
+        )));
+        let exposures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let excluded = Arc::new(AtomicU64::new(7));
+        let watchers = Arc::new(Watchers::default());
+        {
+            let (s, m, q, e, x, w) = (
+                sock.clone(),
+                mount.clone(),
+                Arc::clone(&queue),
+                Arc::clone(&exposures),
+                Arc::clone(&excluded),
+                Arc::clone(&watchers),
+            );
+            std::thread::spawn(move || control(&s, m, q, e, x, w));
+        }
+        // The listener comes up on another thread; connecting retries until it
+        // has. Deadlines are generous because the test machines run gates
+        // concurrently, and a tight deadline measures the machine, not the
+        // code.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let connect = |what: &str| -> UnixStream {
+            loop {
+                match UnixStream::connect(&sock) {
+                    Ok(c) => {
+                        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        return c;
+                    }
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(e) => panic!("could not connect for {what}: {e}"),
+                }
+            }
+        };
+
+        let mut watcher = connect("watch");
+        writeln!(watcher, "watch").unwrap();
+        let mut first = String::new();
+        BufReader::new(watcher.try_clone().unwrap())
+            .read_line(&mut first)
+            .expect("watch was not answered with an immediate state line");
+        assert_eq!(first, "unsent=0 excluded=7 exposures=0\n");
+
+        // The watcher stays connected and says nothing more. Both other verbs
+        // must still be answered on fresh connections, inside the read timeout
+        // — with the watcher parked on the accept thread they would not be.
+        let mut status = connect("status");
+        writeln!(status, "status").unwrap();
+        let mut line = String::new();
+        BufReader::new(status)
+            .read_line(&mut line)
+            .expect("status went unanswered while a watcher was connected");
+        assert_eq!(line, "0 unsent\n");
+
+        let mut evict = connect("evict");
+        writeln!(evict, "evict no-such-file").unwrap();
+        let mut line = String::new();
+        BufReader::new(evict)
+            .read_line(&mut line)
+            .expect("evict went unanswered while a watcher was connected");
+        assert!(
+            !line.trim().is_empty(),
+            "evict must answer something, even a refusal"
+        );
+    }
+
+    /// The contract's quietest clause: an unchanged tuple emits nothing. A
+    /// line that repeats the last line is a wakeup that says nothing — the
+    /// polling this verb exists to remove, moved one process over.
+    #[test]
+    fn an_unchanged_state_emits_no_line() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        theirs
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut peer = BufReader::new(theirs);
+
+        let watchers = Watchers::default();
+        watchers.adopt(ours, state(3, 1, 0));
+
+        let mut line = String::new();
+        peer.read_line(&mut line).unwrap();
+        assert_eq!(line, "unsent=3 excluded=1 exposures=0\n");
+
+        // The same tuple, twice. `broadcast` writes synchronously, so had a
+        // line been written it would already be in our buffer — the timeout
+        // below can only fire in the correct case, it cannot save a buggy
+        // build by racing it.
+        watchers.broadcast(state(3, 1, 0));
+        watchers.broadcast(state(3, 1, 0));
+        line.clear();
+        let err = peer
+            .read_line(&mut line)
+            .expect_err("an identical state was re-broadcast");
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "expected silence, got: {err}"
+        );
+
+        // And the moment one number moves, exactly one line, keys in order.
+        watchers.broadcast(state(2, 1, 0));
+        line.clear();
+        peer.read_line(&mut line).unwrap();
+        assert_eq!(line, "unsent=2 excluded=1 exposures=0\n");
+    }
+
+    /// A watcher that hangs up during a quiet stretch must be noticed without
+    /// a state change. Culling on write failure alone needs the state to move
+    /// first, and "nothing changed for an hour" is the normal state of a
+    /// synced drive — a reconnecting tray would otherwise grow the registry by
+    /// one dead entry per attempt until something happened to change a number.
+    #[test]
+    fn a_departed_watcher_is_culled_without_a_state_change() {
+        use std::os::unix::net::UnixStream;
+
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let watchers = Watchers::default();
+        watchers.adopt(ours, state(0, 0, 0));
+        assert_eq!(watchers.live(), 1);
+
+        drop(theirs);
+        // The state has not changed, so no write will fail: only the hangup
+        // probe can notice the departure.
+        watchers.broadcast(state(0, 0, 0));
+        assert_eq!(watchers.live(), 0);
+    }
+
+    /// The registry is a bound, not a leak: a connection past the cap is
+    /// closed, and closed is observable as an immediate EOF rather than a
+    /// hang or a half-protocol.
+    #[test]
+    fn a_watcher_beyond_the_cap_is_refused_with_eof() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+
+        let watchers = Watchers::default();
+        // Held open, so the cap is measuring live peers and not exercising
+        // the registration-time cull.
+        let mut peers = Vec::new();
+        for _ in 0..MAX_WATCHERS {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            watchers.adopt(ours, state(0, 0, 0));
+            peers.push(theirs);
+        }
+        assert_eq!(watchers.live(), MAX_WATCHERS);
+
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        watchers.adopt(ours, state(0, 0, 0));
+        assert_eq!(watchers.live(), MAX_WATCHERS, "the cap must hold");
+
+        theirs
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut line = String::new();
+        let n = BufReader::new(theirs).read_line(&mut line).unwrap();
+        assert_eq!(n, 0, "a refused watcher must see EOF, got {line:?}");
+        drop(peers);
     }
 }

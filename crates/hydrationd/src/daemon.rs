@@ -1,11 +1,13 @@
 //! The hydration loop, and the fork that makes it fail closed.
 
 use crate::fanotify::{self, Group};
+use crate::partial;
 use crate::placeholder;
 use crate::policy::{cgroup_of, Decision, DenialLog, Policy};
 use crate::supervisor::{allow, deny, take_over, InFlight};
-use hydration_protocol::FileId;
+use hydration_protocol::{FileId, Span};
 use std::io;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
 /// Where content comes from.
@@ -15,17 +17,28 @@ use std::path::{Path, PathBuf};
 /// holding the credentials, and they are on the other side of a socket in the
 /// real daemon.
 pub trait Fetch: Send {
-    /// Deliver the object by writing it into `dest`, chunk by chunk.
+    /// Deliver `span` of the object by writing it into `dest`, chunk by chunk.
     ///
-    /// `dest` is called with `(bytes, offset)` as they arrive and `progress`
-    /// after each one. Streaming rather than returning a `Vec` is what lifts the
-    /// size ceiling from "whatever fits in one deadline" to "whatever the
-    /// transfer cap allows" — and what stops a root process from allocating an
-    /// object's worth of memory per read (§8d).
+    /// `dest` is called with `(bytes, offset)` as they arrive — the offset is
+    /// **absolute within the file**, not relative to the span, because the only
+    /// thing the worker does with it is `pwrite` at that position and a
+    /// span-relative offset would put the burden of adding `span.offset` on
+    /// every implementation. `progress` reports the running total of bytes
+    /// delivered *for this span*.
+    ///
+    /// `size` is the whole object's size even when the span is a slice of it: it
+    /// is what the placeholder promised, and a provider verifying a whole-object
+    /// content hash needs it to know that it may.
+    ///
+    /// Streaming rather than returning a `Vec` is what stops a root process from
+    /// allocating a span's worth of memory per read; asking for a span rather
+    /// than the object is what stops a 4 KiB read of a 2.77 GiB file from
+    /// waiting for 2.77 GiB (§8d, §8d-bis).
     fn fetch_into(
         &mut self,
         file: FileId,
         size: u64,
+        span: Span,
         dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
         progress: &mut dyn FnMut(u64),
     ) -> io::Result<()>;
@@ -46,31 +59,57 @@ impl<T: FetchWhole> Fetch for T {
         &mut self,
         file: FileId,
         size: u64,
+        span: Span,
         dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
         progress: &mut dyn FnMut(u64),
     ) -> io::Result<()> {
         let body = self.fetch(file, size)?;
+        // The whole object is checked before a byte of it is used. A source that
+        // hands back the wrong length is not something to serve a slice of and
+        // hope: the slice would be silently misaligned with what the placeholder
+        // promised, which is §5.7's failure arrived at by arithmetic.
+        if body.len() as u64 != size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("delivered {} of {size} bytes", body.len()),
+            ));
+        }
+        let Some(slice) = body.get(span.offset as usize..span.end() as usize) else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "asked for {}..{} of an object that is {size} bytes",
+                    span.offset,
+                    span.end()
+                ),
+            ));
+        };
         // Delivered in chunks even though it is all here, so that a caller which
         // swaps a local source for a network one changes nothing about how the
         // worker sees it.
-        let mut off = 0u64;
-        for part in body.chunks(hydration_protocol::MAX_CHUNK as usize) {
-            dest(part, off)?;
-            off += part.len() as u64;
-            progress(off);
-        }
-        // A short body is the provider's failure, not a partial success (§5.7),
-        // and answering the event with less than it demanded would hand the
-        // reader zeros (§8d).
-        if off != size {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!("delivered {off} of {size} bytes"),
-            ));
+        let mut done = 0u64;
+        for part in slice.chunks(hydration_protocol::MAX_CHUNK as usize) {
+            dest(part, span.offset + done)?;
+            done += part.len() as u64;
+            progress(done);
         }
         Ok(())
     }
 }
+
+/// How much to fetch when a reader is walking forward through a file.
+///
+/// Serving exactly what each event demanded made small reads of huge files cheap
+/// and made sequential reading of them unusable: every `read()` is its own event
+/// and its own request, so throughput becomes one round trip per read rather
+/// than anything to do with the link. Measured against a live account, a reader
+/// walking a 2.77 GiB object 64 KiB at a time moved at 0.27 MB/s on a connection
+/// that delivers 8 MiB in half a second when asked for it in one piece.
+///
+/// Public because `tests/ranges.rs` has to place a write *outside* this window
+/// to test what it is testing, and a hard-coded number there would silently stop
+/// meaning that the day this changes.
+pub const READAHEAD: u64 = 8 * 1024 * 1024;
 
 /// Resolve the file an event refers to.
 ///
@@ -87,6 +126,21 @@ fn path_of(event_fd: i32) -> io::Result<PathBuf> {
 pub enum Handled {
     Hydrated {
         bytes: u64,
+    },
+    /// The range this reader demanded was delivered, and the file is still a
+    /// placeholder because the rest of it is not here (§8d-bis).
+    ///
+    /// Distinct from `Hydrated` because the two are different facts and the
+    /// difference is the whole point of serving ranges: `Hydrated` says the
+    /// object is now local and will never cost another round trip, `Served` says
+    /// this reader got what it asked for and the next one may not.
+    Served {
+        /// What this reader demanded.
+        bytes: u64,
+        /// What the file holds in total now.
+        held: u64,
+        /// What it will hold when it is complete.
+        size: u64,
     },
     /// A placeholder with no name and no content. Allowed without fetching,
     /// because there is nothing to fetch.
@@ -167,6 +221,16 @@ struct Timed {
     missed: u32,
     /// Transfers that started and had to be given up on.
     abandoned: u32,
+    /// Failures that said the socket is gone, not that the request was slow.
+    ///
+    /// Counted apart from `missed` because the two wedges cost different
+    /// things to test for. A first-byte miss took a full deadline to observe,
+    /// so once there are enough of them the worker stops waiting and denies at
+    /// once. A lost connection fails in microseconds — and, unlike an
+    /// abandoned transfer, leaves nothing running that could ever reply — so
+    /// refusing to try again would make the state permanent by construction.
+    /// The attempt *is* the recovery path: `SocketFetch` reconnects inside it.
+    lost: u32,
     since: Option<std::time::Instant>,
 }
 
@@ -174,6 +238,8 @@ struct Job {
     seq: u64,
     file: FileId,
     size: u64,
+    /// What this transfer owes. Not the object unless the reader demanded it.
+    span: Span,
     /// The fetch thread's **own** descriptor, not the worker's number.
     ///
     /// A raw `i32` here was a use-after-close, and a bad one. The worker closes
@@ -195,7 +261,13 @@ struct Job {
 const WEDGED_AFTER: u32 = 3;
 
 /// Whether this error means the socket is gone rather than the request refused.
-fn is_connection_lost(e: &io::Error) -> bool {
+///
+/// Shared with [`crate::remote`], whose reconnect path must report its own
+/// failures in a kind this predicate recognises — a failed reconnect that
+/// surfaced as `NotFound` (a socket path nobody has bound) would otherwise be
+/// indistinguishable from a per-file refusal, count toward nothing, and leave
+/// the mount serving `EIO` forever with no give-up clock running.
+pub(crate) fn is_connection_lost(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::UnexpectedEof
@@ -238,7 +310,7 @@ impl Timed {
                 let mut tick = |total: u64| {
                     let _ = tx.send((job.seq, Step::Progress(total)));
                 };
-                let outcome = fetch.fetch_into(job.file, job.size, &mut wrote, &mut tick);
+                let outcome = fetch.fetch_into(job.file, job.size, job.span, &mut wrote, &mut tick);
                 let step = match outcome {
                     Ok(()) => Step::Done,
                     Err(e) => Step::Failed(e),
@@ -254,11 +326,25 @@ impl Timed {
             seq: 0,
             missed: 0,
             abandoned: 0,
+            lost: 0,
             since: None,
         }
     }
 
     fn wedged(&self) -> bool {
+        self.missed >= WEDGED_AFTER || self.abandoned >= WEDGED_AFTER || self.lost >= WEDGED_AFTER
+    }
+
+    /// Wedged in a way that makes another attempt cost a full deadline.
+    ///
+    /// This is what decides whether an event is short-circuited to a denial.
+    /// Deliberately *not* [`wedged`](Self::wedged): a fetcher wedged only by
+    /// lost connections fails in microseconds and must keep being tried,
+    /// because the attempt is where reconnection happens and no late reply
+    /// will ever arrive to prove recovery any other way. [`wedged`] still
+    /// includes it, so the give-up clock runs and §6a-bis's "come down rather
+    /// than serve EIO forever" keeps its bound.
+    fn expensive_to_probe(&self) -> bool {
         self.missed >= WEDGED_AFTER || self.abandoned >= WEDGED_AFTER
     }
 
@@ -271,6 +357,18 @@ impl Timed {
 
     fn missed_one(&mut self) {
         self.missed += 1;
+        self.since.get_or_insert_with(std::time::Instant::now);
+    }
+
+    /// The socket to the sync daemon is gone, and reconnecting inside the
+    /// fetch did not bring it back.
+    ///
+    /// Counts toward giving up — a routine client restart measured on
+    /// 2026-08-12 is exactly this, repeated — but through its own counter, so
+    /// the short-circuit above never stops the probing that is the only way
+    /// this state ever ends.
+    fn lost_one(&mut self) {
+        self.lost += 1;
         self.since.get_or_insert_with(std::time::Instant::now);
     }
 
@@ -289,6 +387,7 @@ impl Timed {
     fn answered(&mut self) {
         self.missed = 0;
         self.abandoned = 0;
+        self.lost = 0;
         self.since = None;
     }
 
@@ -299,13 +398,16 @@ impl Timed {
     /// lets a provider dribbling one byte per stall-window hold the mount for
     /// what is arithmetically forever. This one moves at a rate the *worker*
     /// controls, and the worker is the thing that decides when patience runs out.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &mut self,
         file: FileId,
         size: u64,
+        span: Span,
         fd: i32,
         limits: Limits,
         alive: &mut dyn FnMut(),
+        say: &mut dyn FnMut(u64, u64),
     ) -> Result<u64, TransferError> {
         // Duplicated before the job is sent, so the transfer's descriptor
         // outlives the worker's answer. See `Job::fd`.
@@ -316,10 +418,17 @@ impl Timed {
             }
             unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(n) }
         };
-        if self.wedged() {
+        if self.expensive_to_probe() {
             // Abandoned transfers keep running, and anything from one is proof
             // of life. Draining for it here is what keeps this from being a
             // one-way door.
+            //
+            // A wedge made only of lost connections never takes this branch:
+            // there is no ghost transfer to hear from — the errors already
+            // arrived — and the next attempt costs microseconds, so it is sent
+            // rather than pre-denied. That attempt is where `SocketFetch`
+            // reconnects, and without it a client restart that outlived three
+            // events was permanent no matter when the client came back.
             let mut recovered = false;
             while self.rep.try_recv().is_ok() {
                 recovered = true;
@@ -339,6 +448,7 @@ impl Timed {
                 seq: want,
                 file,
                 size,
+                span,
                 fd: owned,
             })
             .is_err()
@@ -349,11 +459,29 @@ impl Timed {
         let began = std::time::Instant::now();
         let mut deadline = began + limits.first_byte;
         let mut moved = 0u64;
+        let mut said = began;
         loop {
             alive();
             if began.elapsed() > limits.total {
                 self.abandoned_one();
-                return Err(TransferError::TooLong { got: moved, size });
+                return Err(TransferError::TooLong {
+                    got: moved,
+                    size: span.len,
+                });
+            }
+            // A transfer that is working and a transfer that is wedged look
+            // identical from outside for as long as either lasts, and the only
+            // process that can tell them apart is this one. Ten minutes is the
+            // cap; a user watching a file manager sit there has no way to know
+            // whether to wait or to kill it, and "no output" is the answer they
+            // are currently given for both.
+            //
+            // Rate-limited rather than reported per chunk: a 1 MiB chunk size
+            // over a gigabyte is a thousand lines nobody reads, which is its own
+            // way of saying nothing.
+            if moved > 0 && said.elapsed() >= PROGRESS_EVERY {
+                said = std::time::Instant::now();
+                say(moved, span.len);
             }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
@@ -362,7 +490,10 @@ impl Timed {
                     return Err(TransferError::NoFirstByte);
                 }
                 self.abandoned_one();
-                return Err(TransferError::Stalled { got: moved, size });
+                return Err(TransferError::Stalled {
+                    got: moved,
+                    size: span.len,
+                });
             }
             match self.rep.recv_timeout(left.min(HEARTBEAT)) {
                 Ok((got, _)) if got != want => continue,
@@ -386,20 +517,28 @@ impl Timed {
                     self.answered();
                     // §5.7, for the privileged trait as well as the
                     // unprivileged one. `Body` holds a *provider* to the
-                    // object's length; nothing held a `Fetch` to it, so an
-                    // implementation that wrote half the object and returned
-                    // `Ok` produced a file that was half content and half zeros,
-                    // unmarked, reported as hydrated. The guarantee cannot live
-                    // only in the half of the stack that happens to be typed for
-                    // it.
-                    if moved != size {
-                        return Err(TransferError::Short { got: moved, size });
+                    // length it promised; nothing held a `Fetch` to it, so an
+                    // implementation that wrote half of what was asked for and
+                    // returned `Ok` produced a file that was half content and
+                    // half zeros, unmarked, reported as hydrated. The guarantee
+                    // cannot live only in the half of the stack that happens to
+                    // be typed for it.
+                    //
+                    // Checked against the *span*, which is the length this
+                    // transfer owes. Checking against the object's size was
+                    // right only while every transfer was the whole object, and
+                    // would now fail every ranged fill.
+                    if moved != span.len {
+                        return Err(TransferError::Short {
+                            got: moved,
+                            size: span.len,
+                        });
                     }
                     return Ok(moved);
                 }
                 Ok((_, Step::Failed(e))) => {
                     if is_connection_lost(&e) {
-                        self.missed_one();
+                        self.lost_one();
                     } else if moved > 0 {
                         self.answered();
                     }
@@ -416,6 +555,13 @@ impl Timed {
 
 /// How often the worker proves it is alive while waiting on a transfer.
 const HEARTBEAT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How often a transfer in progress says so.
+///
+/// Long enough that an ordinary small hydration never says anything — it is
+/// finished well inside this — and short enough that a user watching a frozen
+/// file manager gets an answer before they decide the machine is broken.
+const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What bounds a transfer.
 #[derive(Debug, Clone, Copy)]
@@ -477,6 +623,9 @@ pub struct Worker<F: Fetch> {
     policy: Policy,
     pub log: DenialLog,
     in_flight: InFlight,
+    /// Placeholders this worker has filled part of. Memory only — see
+    /// [`partial`] for why the third file state must not reach the disk.
+    partial: partial::Partial,
     /// What bounds a transfer: first byte, stall, and total. §6a-bis.
     limits: Limits,
     /// So a denial count is announced when it changes rather than every loop.
@@ -527,6 +676,7 @@ impl<F: Fetch + 'static> Worker<F> {
             policy,
             log: DenialLog::default(),
             in_flight,
+            partial: partial::Partial::default(),
             limits,
             reported_denials: 0,
             _fetch: std::marker::PhantomData,
@@ -574,9 +724,10 @@ impl<F: Fetch + 'static> Worker<F> {
             );
         }
         let r = match &outcome {
-            Handled::Hydrated { .. } | Handled::AlreadyPresent | Handled::Empty => {
-                allow(&self.group, fd)
-            }
+            Handled::Hydrated { .. }
+            | Handled::Served { .. }
+            | Handled::AlreadyPresent
+            | Handled::Empty => allow(&self.group, fd),
             Handled::Denied { .. } | Handled::Failed { .. } | Handled::Abandoned { .. } => {
                 deny(&self.group, fd)
             }
@@ -636,10 +787,11 @@ impl<F: Fetch + 'static> Worker<F> {
                 // creation back across the privilege boundary.
                 if let Some(p) = &path {
                     if self.looks_stripped(ev.fd) {
-                        // The reader's cgroup is deliberately not looked up: the
-                        // pidfd is consumed by the policy check further down,
-                        // and who read it is not the point. What is worth
-                        // recording is that a file in this state was served.
+                        // The reader's cgroup is deliberately not looked up:
+                        // policy does not apply to a file that already holds its
+                        // content, and who read it is not the point. What is
+                        // worth recording is that a file in this state was
+                        // served.
                         self.log.record(
                             "-",
                             "sized file occupying no disk; not suppressing future events",
@@ -682,11 +834,14 @@ impl<F: Fetch + 'static> Worker<F> {
             return outcome;
         }
 
-        let cgroup = ev.pidfd.and_then(|pfd| {
-            let c = cgroup_of(pfd).ok();
-            unsafe { libc::close(pfd) };
-            c
-        });
+        // Borrowed, not consumed: the event owns the pidfd and closes it when it
+        // is dropped, whichever way this function returned. Closing it here was
+        // the leak — the branches above return before reaching this line, and
+        // the two commonest reads on the system take one of them.
+        let cgroup = ev
+            .pidfd
+            .as_ref()
+            .and_then(|pfd| cgroup_of(pfd.as_fd()).ok());
 
         if let Decision::Deny { rule } = self.policy.decide(cgroup.as_deref()) {
             self.log
@@ -703,18 +858,133 @@ impl<F: Fetch + 'static> Worker<F> {
             }
         };
 
-        // Residue from a transfer that was cut off mid-stream.
+        // What this reader actually demanded.
         //
-        // A marked file that occupies disk cannot exist between transfers, but
-        // it is exactly what a crash during one leaves — and the supervisor
-        // cannot clean it up, because it holds the event fd's *number* and not
-        // the descriptor, so it can answer but not punch. The next transfer is
-        // therefore the only place it can be done.
-        if let Err(e) = placeholder::clear_residue(borrowed, size) {
-            return Handled::Failed {
-                reason: format!("could not clear an interrupted transfer: {e}"),
-            };
+        // The event carries it, and until `probes/bigdemand.c` was run this code
+        // threw it away and fetched the whole object instead. On a small file the
+        // two are the same and nothing showed; on a 2.77 GiB file they are not,
+        // and the difference is the bug: a 4096-byte read waited for 2.77 GiB,
+        // could not finish inside the deadlines, and got `EIO` after 61.7
+        // seconds having asked for four kilobytes.
+        //
+        // An event with no range record is treated as demanding the object. That
+        // is what the kernel means by omitting it — a group that did not ask for
+        // `FAN_REPORT_FD_ERROR` gets no range and the whole file is implied — and
+        // it is also the safe direction to be wrong in.
+        //
+        // Kept for the whole of this function under its own name, because
+        // readahead widens `want` below and the two then mean different things:
+        // `want` is what will be fetched, `demanded` is what must arrive for the
+        // event to be answered. Only the second one may decide whether a reader
+        // gets `EIO`.
+        let demanded = ev
+            .range
+            .map(|(off, count)| Span::new(off, count))
+            .unwrap_or_else(|| Span::whole(size))
+            .clamped_to(size);
+        let mut want = demanded;
+
+        // What is already there, and whether we are entitled to believe it.
+        let witness = match partial::Witness::of(borrowed) {
+            Ok(w) => w,
+            Err(e) => {
+                return Handled::Failed {
+                    reason: format!("could not stat the event fd: {e}"),
+                }
+            }
+        };
+        let mut have = match self.partial.standing(id, witness) {
+            partial::Standing::Ours(r) => r,
+            // NOTE: `want` is widened below, once `have` is known.
+            // Residue from a transfer that was cut off mid-stream, or content
+            // somebody else put there.
+            //
+            // A marked file that occupies disk used to be impossible between
+            // transfers, and this punch was unconditional because of it. Ranged
+            // fills make it ordinary — but only while the worker's own record
+            // vouches for it. With no record the old reasoning applies exactly:
+            // a crash mid-stream leaves bytes the supervisor cannot clean up,
+            // because it holds the event fd's *number* and not the descriptor,
+            // so the next transfer is the only place it can be done.
+            partial::Standing::Unknown => {
+                if let Err(e) = placeholder::clear_residue(borrowed, size) {
+                    return Handled::Failed {
+                        reason: format!("could not clear an interrupted transfer: {e}"),
+                    };
+                }
+                partial::Ranges::default()
+            }
+        };
+
+        // Already served this demand once. No round trip, and no rewrite of
+        // bytes that are already correct.
+        //
+        // This case is not rare and is not an optimisation: re-reading a range
+        // that has been filled fires a fresh event every time, because the file
+        // is still marked and the ignore mark only goes on when it is complete
+        // (measured — `probes/bigdemand.c`, third event of the two-range case).
+        // Answering it costs 7–9 µs against a 0.2 µs unmarked read (measured,
+        // `examples/presentcost.rs`), which is why staying marked until every
+        // byte is present is affordable and nothing here tries to shed the mark
+        // early.
+        //
+        // Decided on the *demand*, before any widening, and the order is
+        // load-bearing. This check used to sit after the widening and ask about
+        // the widened span, which meant a covered read near the trailing edge of
+        // a walk was never "already present" — its window always poked past the
+        // frontier — so every read of a sequential walk carried its own fetch.
+        // See the frontier comment below for what that cost.
+        let missing_of_demand = have.missing(demanded);
+        let Some(first_missing) = missing_of_demand.first() else {
+            return Handled::AlreadyPresent;
+        };
+        let frontier = first_missing.offset;
+
+        // Read ahead, but only for a reader that is walking forward.
+        //
+        // Serving exactly what was asked made small reads of huge files cheap
+        // and made *sequential* reading of them unusable: every `read()` is its
+        // own event and its own request, so the throughput is one round trip per
+        // read rather than anything to do with the link. Measured against a live
+        // account, Ark listing a 2.77 GiB `tar.gz` — which must decompress the
+        // whole stream, so it reads straight through from the start — moved at
+        // 0.27 MB/s and would have needed about three hours, on a connection
+        // delivering 11 MB/s when asked for one large piece.
+        //
+        // Widened rather than made unconditional, because the cost falls on
+        // exactly the reader that would not benefit: a random-access reader —
+        // `mmap` over a database, a seek to a footer — would fetch this window
+        // for every scattered touch. So the trigger is evidence of sequence,
+        // taken from the record we already keep: either the bytes immediately
+        // before this demand are already here, or the demand starts at the top
+        // of the file, which is where a whole-file reader begins.
+        //
+        // Anchored at the frontier — the first byte of the demand that is
+        // actually missing — and not at the demand's own offset. Anchoring at
+        // the demand looked the same in the stride tests and was not: a window
+        // re-anchored per event advances one reader-stride at a time, so after
+        // the first window every read of a continuous walk fetched exactly one
+        // stride at the frontier. Measured (`examples/presentcost.rs`): a 64 MiB
+        // walk in 128 KiB reads cost 449 fetches — one of 8 MiB, then 448 of
+        // 128 KiB — and each fetch pays the ~160 ms fixed price a Graph span
+        // costs (§8d-ter), which is 0.8 MB/s however fast the link. Reaching
+        // `READAHEAD` past the frontier instead makes it one fetch per window —
+        // 8 in that same walk — and every read in between is the cheap
+        // already-present answer above. The over-fetch bound does not move: the
+        // window still ends at most `READAHEAD` beyond a byte the reader
+        // demanded, and a reader that stops walking strands at most one window,
+        // exactly as before.
+        let sequential = demanded.offset == 0
+            || (demanded.offset > 0 && have.covers(Span::new(demanded.offset - 1, 1)));
+        if sequential {
+            let end = demanded
+                .end()
+                .max(frontier.saturating_add(READAHEAD))
+                .min(size);
+            want = Span::new(demanded.offset, end - demanded.offset);
         }
+
+        let missing = have.missing(want);
 
         // Written through the event fd as the bytes arrive, never by re-opening
         // the path. A write to a freshly opened file inside the marked mount
@@ -725,14 +995,64 @@ impl<F: Fetch + 'static> Worker<F> {
         // their own, and no bystander can observe the half-filled file, because
         // their own event queues behind the one being served. That is what makes
         // filling incrementally safe rather than merely convenient.
-        let limits = self.limits;
-        let in_flight = self.in_flight.clone();
-        let mut alive = move || in_flight.working();
-        let outcome = self.fetch.run(id, size, ev.fd, limits, &mut alive);
+        let named = path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| format!("inode {}", id.ino));
+        for span in missing {
+            let Err(e) = self.transfer(id, size, span, ev.fd, &named) else {
+                have.add(span);
+                continue;
+            };
+            // What arrived for *this* span is punched back out, so no reader
+            // can be served a part of a range as though it were the whole of
+            // one — answering `FAN_ALLOW` with less than the event demanded
+            // hands them zeros in silence (§8d). Ranges filled earlier are
+            // kept: they are complete, they are ours, and throwing them away
+            // would restart a sequential read from the beginning over one
+            // transient error.
+            let _ = placeholder::punch_range_fd(borrowed, span.offset, span.len);
 
-        match outcome {
-            Ok(_) => match placeholder::finish_hydration(borrowed, size) {
+            // Readahead must not be able to fail a read that would have
+            // succeeded. Widening `want` above put speculative bytes into the
+            // same transfer as the demanded ones, so a span that failed may have
+            // failed for a reason that lies entirely outside what the reader
+            // asked for — and the pre-readahead code would have served that
+            // reader without ever touching the byte that broke.
+            match span.intersect(demanded) {
+                // Speculation only. The reader already has everything it
+                // demanded, so this is a fetch not made rather than a failed
+                // read. No further spans are tried: they are speculative too,
+                // whatever is wrong will still be wrong one span further on, and
+                // a reader is blocked inside `read()` for every moment of it.
+                None => break,
+                // The demand was inside a span that also carried readahead. Ask
+                // again for just the demanded part, so the reader's outcome
+                // depends only on the bytes the reader asked for. It costs a
+                // second round trip, on a path that has already failed once.
+                Some(only) if only != span => {
+                    if let Err(again) = self.transfer(id, size, only, ev.fd, &named) {
+                        let _ = placeholder::punch_range_fd(borrowed, only.offset, only.len);
+                        return self.fill_failed(id, borrowed, have, again, path.as_deref());
+                    }
+                    have.add(only);
+                    break;
+                }
+                // Nothing speculative was in it. This is the path exactly as it
+                // was before readahead existed.
+                Some(_) => return self.fill_failed(id, borrowed, have, e, path.as_deref()),
+            }
+        }
+
+        // Complete, or not yet.
+        //
+        // Only a file with every byte present may lose its mark: the mark is
+        // what stands between a hole and a reader, and clearing it while holes
+        // remain is the one mistake this whole module is arranged to prevent.
+        if have.covers(Span::whole(size)) {
+            match placeholder::finish_hydration(borrowed, size) {
                 Ok(()) => {
+                    self.partial.forget(&id);
                     // The mark is cleared inside `finish_hydration`, in the same
                     // operation that fsynced the content — one owner, so the two
                     // cannot disagree.
@@ -746,31 +1066,112 @@ impl<F: Fetch + 'static> Worker<F> {
                 }
                 Err(e) => {
                     let _ = placeholder::abandon(borrowed, size);
+                    self.partial.forget(&id);
                     Handled::Failed {
                         reason: format!("hydration refused: {e}"),
                     }
                 }
-            },
-            Err(e) => {
-                // The whole object or nothing (§5.7). Whatever landed is punched
-                // back out, so the placeholder is exactly as it was found — and
-                // the reader gets an error rather than the part that arrived,
-                // because answering `FAN_ALLOW` with less than the event asked
-                // for hands them zeros in silence (§8d).
-                let _ = placeholder::abandon(borrowed, size);
-                let abandoned = matches!(
-                    e,
-                    TransferError::TooLong { .. } | TransferError::Stalled { .. }
-                );
-                let reason = format!("{e}");
-                if abandoned {
-                    self.log.record("-", "transfer abandoned", path.as_deref());
-                    Handled::Abandoned { reason }
-                } else {
-                    Handled::Failed { reason }
+            }
+        } else {
+            // Still a placeholder, and it keeps its mark and its lack of an
+            // ignore mark — so the next read of a part that is not here yet
+            // reaches us. The file now occupies disk while marked, which nothing
+            // outside this process is told about and nothing outside this
+            // process needs to know: to every other component it is a
+            // placeholder, which is what it is.
+            match placeholder::settle_range(borrowed) {
+                Ok(()) => {
+                    let held = have.total();
+                    match partial::Witness::of(borrowed) {
+                        Ok(w) => self.partial.record(id, w, have),
+                        // Without a witness the record cannot be believed later,
+                        // so it is not kept. The bytes stay on disk and the next
+                        // event punches them and fetches again — wasteful and
+                        // correct, which is the right way round.
+                        Err(_) => self.partial.forget(&id),
+                    }
+                    Handled::Served {
+                        // What the *reader* demanded, which is what this field
+                        // is documented to mean. Reporting the widened window
+                        // here would say a 4 KiB read was served 8 MiB, and the
+                        // bytes readahead put on disk are already reported —
+                        // that is what `held` is.
+                        bytes: demanded.len,
+                        held,
+                        size,
+                    }
+                }
+                Err(e) => {
+                    let _ = placeholder::abandon(borrowed, size);
+                    self.partial.forget(&id);
+                    Handled::Failed {
+                        reason: format!("could not settle a partial fill: {e}"),
+                    }
                 }
             }
         }
+    }
+
+    /// One transfer of one span into the event fd.
+    ///
+    /// Split out because there are now two callers and they have to be the same
+    /// code: the second is the retry that re-asks for only what the reader
+    /// demanded after a span carrying readahead failed, and a retry that
+    /// differed in its limits or its heartbeat would be a second path pretending
+    /// to be the first.
+    fn transfer(
+        &mut self,
+        id: FileId,
+        size: u64,
+        span: Span,
+        fd: i32,
+        named: &str,
+    ) -> Result<(), TransferError> {
+        let limits = self.limits;
+        let in_flight = self.in_flight.clone();
+        let mut alive = move || in_flight.working();
+        let mut say = |got: u64, owed: u64| {
+            let pct = got.saturating_mul(100).checked_div(owed).unwrap_or(100);
+            eprintln!(
+                "[worker] hydrating {named}: {got} of {owed} bytes ({pct}%) \
+                 at offset {}",
+                span.offset
+            );
+        };
+        self.fetch
+            .run(id, size, span, fd, limits, &mut alive, &mut say)
+            .map(|_| ())
+    }
+
+    /// What a failed fill leaves behind.
+    ///
+    /// The caller has already punched whatever arrived for the span that failed.
+    /// This keeps the record of the ranges that are still ours — earlier spans
+    /// that completed in full — so one transient error costs one span rather
+    /// than a sequential read from the beginning.
+    fn fill_failed(
+        &mut self,
+        id: FileId,
+        borrowed: std::os::fd::BorrowedFd<'_>,
+        have: partial::Ranges,
+        error: TransferError,
+        path: Option<&Path>,
+    ) -> Handled {
+        let _ = hydration_protocol::stamp::write_fd(borrowed);
+        match partial::Witness::of(borrowed) {
+            Ok(w) => self.partial.record(id, w, have),
+            Err(_) => self.partial.forget(&id),
+        }
+        let abandoned = matches!(
+            error,
+            TransferError::TooLong { .. } | TransferError::Stalled { .. }
+        );
+        let reason = format!("{error}");
+        if abandoned {
+            self.log.record("-", "transfer abandoned", path);
+            return Handled::Abandoned { reason };
+        }
+        Handled::Failed { reason }
     }
 
     /// A file that claims a size but occupies no disk.
@@ -1034,6 +1435,12 @@ impl SplitHandle {
             }
             let len = self.group.read_events(&mut buf)?;
             for ev in fanotify::events(&buf, len) {
+                // The event fd is closed by hand and the pidfd is not, which
+                // looks inconsistent and is not: this loop discards the event
+                // whole, so its `Option<OwnedFd>` closes with it. The event fd
+                // cannot work that way — a response is matched by *number*, and
+                // the supervisor answers for fds it never opened, so it holds
+                // numbers rather than descriptors throughout.
                 if ev.fd >= 0 {
                     let _ = deny(&self.group, ev.fd);
                     unsafe { libc::close(ev.fd) };

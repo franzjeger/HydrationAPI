@@ -20,6 +20,7 @@
 
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::Path;
 
 /// What to do with a reader.
@@ -106,7 +107,13 @@ impl Policy {
 /// time this runs the process may be gone and its pid reused by something else.
 /// A pidfd pins the pid for as long as it is open, so the `/proc` lookup below
 /// cannot land on a different process than the one that generated the event.
-pub fn cgroup_of(pidfd: i32) -> io::Result<String> {
+///
+/// Takes a borrow rather than a number: the caller keeps the descriptor, and the
+/// lookup has no business closing it. The number-taking version invited the
+/// caller to dispose of the pidfd here, and the disposal then only happened on
+/// the paths that reached this call — a leak on every other path out of the
+/// decision.
+pub fn cgroup_of(pidfd: BorrowedFd<'_>) -> io::Result<String> {
     let pid = pid_from_pidfd(pidfd)?;
     let raw = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
     // cgroup v2: a single "0::/path" line.
@@ -119,8 +126,8 @@ pub fn cgroup_of(pidfd: i32) -> io::Result<String> {
     Ok(path)
 }
 
-fn pid_from_pidfd(pidfd: i32) -> io::Result<i32> {
-    let info = fs::read_to_string(format!("/proc/self/fdinfo/{pidfd}"))?;
+fn pid_from_pidfd(pidfd: BorrowedFd<'_>) -> io::Result<i32> {
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))?;
     info.lines()
         .find_map(|l| l.strip_prefix("Pid:"))
         .and_then(|v| v.trim().parse().ok())

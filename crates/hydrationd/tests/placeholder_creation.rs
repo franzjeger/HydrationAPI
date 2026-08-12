@@ -76,7 +76,7 @@ fn place_while_answering(
 
     let child = unsafe { libc::fork() };
     if child == 0 {
-        let mut p = TmpfilePlacer::new(&root);
+        let mut p = TmpfilePlacer::new(&root).expect("open the sync root");
         let code = match p.place(&target, size, &cloud_id, Some("etag-1")) {
             Ok(()) => 0,
             Err(e) => {

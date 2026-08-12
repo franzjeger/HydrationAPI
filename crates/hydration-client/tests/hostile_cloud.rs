@@ -17,7 +17,7 @@
 //! Where the framework's answer is "refuse", that is a pass. Where it is
 //! "quietly accept", that is the bug.
 
-use hydration_client::delta::{apply, safe_join, Applied, Change};
+use hydration_client::delta::{apply, safe_join, Applied, Change, Failed, Failure};
 use hydration_client::place::TmpfilePlacer;
 use hydration_client::store::{self, Store};
 use hydration_client::upload::{run_upload, Outcome, Queue, Sink, TestClock, Uploaded};
@@ -53,7 +53,7 @@ fn upserted(path: &str, size: u64, id: &str, etag: Option<&str>) -> Change {
 
 fn run(root: &Path, changes: &[Change]) -> Applied {
     let mut store = Store::new();
-    let mut placer = TmpfilePlacer::new(root);
+    let mut placer = TmpfilePlacer::new(root).expect("open the sync root");
     apply(root, changes, &mut store, &HashSet::new(), &mut placer).expect("apply")
 }
 
@@ -718,6 +718,13 @@ fn an_absurd_size_is_refused_rather_than_becoming_a_placeholder() {
         ],
     );
     assert_eq!(out.created, 1, "{out:?}");
-    assert_eq!(out.failed, vec!["huge.bin".to_string()], "{out:?}");
+    assert_eq!(
+        out.failed,
+        vec![Failed::new(
+            "huge.bin",
+            Failure::TooLarge { size: u64::MAX / 2 }
+        )],
+        "{out:?}"
+    );
     assert!(!dir.join("huge.bin").exists());
 }

@@ -69,6 +69,162 @@ pub trait Materialise: Send {
 
     /// Remove a file the cloud no longer has.
     fn remove(&mut self, path: &Path) -> io::Result<()>;
+
+    /// Whether the sync root still leads to the filesystem this materialiser was
+    /// opened against.
+    ///
+    /// Asked between changes so a pass can stop when the ground moves under it.
+    /// `hydrationd` detaches the sync mount when it fails closed, and until
+    /// 2026-08-12 a pass that met that carried on to completion: 147,540
+    /// placeholders into the bare directory underneath, reported as
+    /// `+147540 failed 0`.
+    ///
+    /// This is not what makes that safe — [`TmpfilePlacer`] resolves every
+    /// syscall through a descriptor on the root, so it cannot write outside the
+    /// filesystem it opened whatever a path later means. This decides *when to
+    /// stop*, which is a different and much more forgiving job: being late by a
+    /// few changes costs a few refusals, where being wrong about the
+    /// destination cost a silent tree of unhydratable files.
+    ///
+    /// Defaults to `true` for the doubles and the demo cloud, which have no
+    /// mount to lose.
+    ///
+    /// [`TmpfilePlacer`]: crate::place::TmpfilePlacer
+    fn root_still_current(&self) -> io::Result<bool> {
+        Ok(true)
+    }
+}
+
+/// A change that was refused, and which of the four rules refused it.
+///
+/// The reason used to be dropped on the floor, and a live account showed why that
+/// was not good enough: a 2.77 GiB file logged `kept local copy of …` on every
+/// pass, indefinitely, and the line said nothing that could be acted on. Every
+/// condition below evaluates cleanly against a file from outside — the stamp
+/// matched, the cloud id was present, the queue was empty — so from the log alone
+/// there was no way to tell which rule was firing, or whether the refusal was
+/// protecting anything at all.
+///
+/// "Never invent a diagnostic" cuts both ways: a diagnostic that names no cause
+/// is one the reader has to invent for themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    /// As the change named it, so it can be matched against the service's view.
+    pub path: String,
+    pub why: Why,
+}
+
+/// Why a change was not applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// An edit is queued for upload. It is newer than anything the cloud can say
+    /// and exists nowhere else.
+    EditWaiting,
+    /// Local content with no cloud id: never uploaded, so there is no remote copy
+    /// to fall back on.
+    NeverUploaded,
+    /// The file no longer looks the way the framework left it, so somebody wrote
+    /// to it and we were not told.
+    ChangedUnderneath,
+}
+
+impl std::fmt::Display for Why {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EditWaiting => write!(f, "an edit is waiting to be uploaded"),
+            Self::NeverUploaded => write!(f, "it has never been uploaded"),
+            Self::ChangedUnderneath => {
+                write!(f, "it has changed since the framework last wrote it")
+            }
+        }
+    }
+}
+
+impl Kept {
+    pub fn new(path: &str, why: Why) -> Self {
+        Self {
+            path: path.to_string(),
+            why,
+        }
+    }
+}
+
+/// A change that could not be applied, and what stopped it.
+///
+/// [`Kept`]'s argument from the other side, and it cost an afternoon on
+/// 2026-08-11 to learn that it applies here too. A scratch mount owned by root
+/// made every `Materialise::place` fail with `EACCES`, and each one logged
+/// `could not apply <path>` — the identical line a refused path, an absurd size
+/// or an occupied destination produces. So the smoke failure was bisected
+/// against the daemon to arrive at something the errno had been holding the
+/// whole time.
+///
+/// "Never invent a diagnostic" is usually read as a rule against making causes
+/// up. It forbids omitting them too: a line naming no cause is one the reader
+/// has to invent a cause for, and the first guess was the kernel path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failed {
+    /// As the change named it, so it can be matched against the service's view.
+    /// Removals name the local path instead — a removal carries no path of its
+    /// own, only an object id.
+    pub path: String,
+    pub why: Failure,
+}
+
+/// What stopped a change from being applied.
+///
+/// The three that come from a syscall carry the message and not the
+/// `io::Error`, because `Applied` is `Clone` and `Eq` — a caller comparing two
+/// passes is how "nothing happened" is recognised — and `io::Error` is neither.
+/// The text is `io::Error`'s own; nothing here rewrites it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// `safe_join` refused the path the change arrived with.
+    PathRefused,
+    /// The change claims a size past [`MAX_OBJECT`].
+    TooLarge { size: u64 },
+    /// The object moved, and something else already holds the destination.
+    /// Retryable: the change that frees it may be later in the same feed.
+    DestinationOccupied,
+    /// The local rename that would have followed the object to its new path.
+    Rename(String),
+    /// `Materialise::place` — creating a placeholder, or refreshing one.
+    Place(String),
+    /// `Materialise::remove` — deleting a file the cloud no longer has.
+    Remove(String),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // All three of `safe_join`'s refusals, because the path is on the
+            // same line and the reader can see which one it was. Naming a
+            // single one would be a guess.
+            Self::PathRefused => write!(
+                f,
+                "the path is empty, escapes the sync root, or claims one of our own names"
+            ),
+            Self::TooLarge { size } => {
+                write!(
+                    f,
+                    "it claims {size} bytes, past the {MAX_OBJECT}-byte limit"
+                )
+            }
+            Self::DestinationOccupied => write!(f, "another file is already at that path"),
+            Self::Rename(e) => write!(f, "renaming the local file failed: {e}"),
+            Self::Place(e) => write!(f, "writing the placeholder failed: {e}"),
+            Self::Remove(e) => write!(f, "removing the local file failed: {e}"),
+        }
+    }
+}
+
+impl Failed {
+    pub fn new(path: &str, why: Failure) -> Self {
+        Self {
+            path: path.to_string(),
+            why,
+        }
+    }
 }
 
 /// What a delta pass did, for the status a user is shown.
@@ -82,8 +238,9 @@ pub struct Applied {
     pub moved: usize,
     /// Changes deliberately not applied because local content would have been
     /// lost. Not an error, and not silent: these are what a conflict UI is for.
-    pub kept_local: Vec<String>,
-    pub failed: Vec<String>,
+    pub kept_local: Vec<Kept>,
+    /// Changes that could not be applied, each with what stopped it.
+    pub failed: Vec<Failed>,
     /// At least one failure could succeed on a later pass — a rename blocked by
     /// a destination that another change will free, most often.
     ///
@@ -92,6 +249,43 @@ pub struct Applied {
     /// never retried is indistinguishable from a permanent one: the local name
     /// stays wrong until the object happens to change again.
     pub retryable: bool,
+    /// Set when the pass gave up partway because the sync root stopped being the
+    /// mount it started against.
+    ///
+    /// Deliberately not an `Err`. `hydrationd` detaching the mount is a
+    /// *deliberate* fail-closed action, so a pass running into it is the system
+    /// working, not the system breaking — and a caller that logged it as a
+    /// failure would be reporting an alarm for the thing that prevented one. The
+    /// counts alongside it are real: what this says is that there was more, and
+    /// that the cursor must stay where it is.
+    pub stopped: Option<Stopped>,
+}
+
+/// Why a pass ended before it ran out of changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stopped {
+    /// The sync root now leads somewhere else — detached, or replaced by a
+    /// different mount at the same path.
+    MountChanged,
+    /// Whether it still leads to the same place could not be established, which
+    /// is treated as if it did not. A root that cannot be vouched for is not a
+    /// root to keep writing into.
+    MountUnverifiable(String),
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MountChanged => write!(
+                f,
+                "the sync root is no longer the mount this pass started against"
+            ),
+            Self::MountUnverifiable(e) => write!(
+                f,
+                "could not confirm the sync root is still the same mount ({e})"
+            ),
+        }
+    }
 }
 
 /// Apply a set of changes to the sync directory.
@@ -126,6 +320,40 @@ pub fn apply<M: Materialise>(
     // second local file claiming the same id, which is the exact corruption the
     // rename handling below exists to prevent.
     for change in coalesce(changes) {
+        // Per change, not per pass.
+        //
+        // The pass this replaces asked once, at the top of the round, and a
+        // round applying 147,540 changes takes minutes — so the answer was
+        // stale for almost all of it, and on 2026-08-12 the mount went away
+        // four minutes into one. Per change is affordable because of what the
+        // question is asked with: one `statx` for the unique mount id, measured
+        // at 0.24 µs against 13.38 µs for the `/proc/self/mountinfo` parse it
+        // replaces (`probes/mountcheck_cost.c`) — 0.03 s across a pass of that
+        // size, against 1.97 s.
+        //
+        // Cost is the smaller half of the argument. `mountinfo` answers "*a*
+        // mount is at this path", and the id answers "*the* mount is", which is
+        // the question with a correct answer during the seconds between a
+        // detach and the remount that follows it.
+        //
+        // Nothing about placement depends on this. `TmpfilePlacer` cannot write
+        // outside the filesystem it opened, so a check that arrives a change
+        // late costs a refusal rather than a file in the wrong place. It is here
+        // to stop cleanly, and it is checked before the change rather than after
+        // so a pass that stops has not half-applied the change it stopped on.
+        match mat.root_still_current() {
+            Ok(true) => {}
+            Ok(false) => {
+                out.stopped = Some(Stopped::MountChanged);
+                out.retryable = true;
+                break;
+            }
+            Err(e) => {
+                out.stopped = Some(Stopped::MountUnverifiable(e.to_string()));
+                out.retryable = true;
+                break;
+            }
+        }
         let change = &change;
         match change {
             Change::Upserted {
@@ -135,7 +363,7 @@ pub fn apply<M: Materialise>(
                 etag,
             } => {
                 let Some(abs) = safe_join(root, path) else {
-                    out.failed.push(path.clone());
+                    out.failed.push(Failed::new(path, Failure::PathRefused));
                     continue;
                 };
 
@@ -150,7 +378,8 @@ pub fn apply<M: Materialise>(
                 // the §5.7 failure, and silently choosing a different one would
                 // be inventing an object.
                 if *size > MAX_OBJECT {
-                    out.failed.push(path.clone());
+                    out.failed
+                        .push(Failed::new(path, Failure::TooLarge { size: *size }));
                     continue;
                 }
 
@@ -181,15 +410,17 @@ pub fn apply<M: Materialise>(
                             // retries is a permanent wrong state: the caller
                             // advances its cursor and the service never mentions
                             // these objects again.
-                            out.failed.push(path.clone());
+                            out.failed
+                                .push(Failed::new(path, Failure::DestinationOccupied));
                             out.retryable = true;
                             continue;
                         }
                         if let Some(parent) = abs.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        if std::fs::rename(&existing.path, &abs).is_err() {
-                            out.failed.push(path.clone());
+                        if let Err(e) = std::fs::rename(&existing.path, &abs) {
+                            out.failed
+                                .push(Failed::new(path, Failure::Rename(e.to_string())));
                             out.retryable = true;
                             continue;
                         }
@@ -208,16 +439,55 @@ pub fn apply<M: Materialise>(
                     // Nothing there: this is the ordinary case, a new object.
                     Err(_) => match mat.place(&abs, *size, cloud_id, etag.as_deref()) {
                         Ok(()) => out.created += 1,
-                        Err(_) => out.failed.push(path.clone()),
+                        Err(e) => out
+                            .failed
+                            .push(Failed::new(path, Failure::Place(e.to_string()))),
                     },
                     Ok(md) => {
                         let id = file_id(&md);
+                        // Nothing to do is the common case, and it is decided
+                        // *before* the protections below, not after.
+                        //
+                        // Both feeds re-present unchanged objects on every
+                        // round: `Discover` promises a full listing behaves
+                        // like an incremental one, and the Graph provider
+                        // returns its whole tree each pass for exactly that
+                        // reason. So most upserts describe a file that is
+                        // already right, and applying one is a no-op — there
+                        // is no `place()` to refuse, and therefore nothing for
+                        // `kept_local` to be about. (Before this check existed
+                        // at all, every echo was re-placed: a file the user
+                        // had just written and successfully uploaded became a
+                        // placeholder seconds later, which on a laptop that is
+                        // offline by morning is their content gone.)
+                        //
+                        // When this check ran after the stamp check, a stale
+                        // stamp turned that no-op into a permanent conflict. A
+                        // live account showed the shape: a worker killed
+                        // between writing a range into a placeholder and
+                        // `settle_range`'s re-stamp left the file dirty, and
+                        // nothing re-stamps a file nobody touches — so the
+                        // echo of the unchanged object was refused as
+                        // `ChangedUnderneath` every five seconds, indefinitely,
+                        // for a file whose id, version and size all matched.
+                        // Not one byte would have moved in either direction,
+                        // and the "conflict" could not be resolved from either
+                        // side.
+                        //
+                        // This is not a weakening of the guards below: they
+                        // exist so `place()` never destroys content that was
+                        // not sent, and on this path `place()` is not reached
+                        // at all. A dirty file facing a change that would
+                        // apply something still falls through to them.
+                        if is_current(&abs, cloud_id, etag.as_deref(), *size) {
+                            continue;
+                        }
                         // An edit waiting to be sent is newer than anything the
                         // cloud has to say. Replacing it with a placeholder
                         // would throw away work that exists nowhere else — the
                         // one outcome this framework must never produce.
                         if waiting.contains(&id) {
-                            out.kept_local.push(path.clone());
+                            out.kept_local.push(Kept::new(path, Why::EditWaiting));
                             continue;
                         }
                         // Local content that has never been uploaded is in the
@@ -238,7 +508,7 @@ pub fn apply<M: Materialise>(
                             .flatten()
                             .filter(|v| !v.is_empty());
                         if known.is_none() && md.len() > 0 {
-                            out.kept_local.push(path.clone());
+                            out.kept_local.push(Kept::new(path, Why::NeverUploaded));
                             continue;
                         }
                         // And the queue is not enough on its own.
@@ -259,27 +529,14 @@ pub fn apply<M: Materialise>(
                             hydration_protocol::stamp::state(&abs),
                             Ok(hydration_protocol::stamp::State::Dirty)
                         ) {
-                            out.kept_local.push(path.clone());
-                            continue;
-                        }
-                        // Nothing to do is the common case, and doing something
-                        // anyway is destructive.
-                        //
-                        // A real delta feed echoes your own uploads back on the
-                        // next page, and `Discover`'s contract promises a full
-                        // listing behaves like an incremental one — so most
-                        // upserts describe a file that is already exactly right.
-                        // Without this check every one of them was re-placed:
-                        // a file the user had just written and successfully
-                        // uploaded became a placeholder seconds later, which on
-                        // a laptop that is offline by morning is their content
-                        // gone.
-                        if is_current(&abs, cloud_id, etag.as_deref(), *size) {
+                            out.kept_local.push(Kept::new(path, Why::ChangedUnderneath));
                             continue;
                         }
                         match mat.place(&abs, *size, cloud_id, etag.as_deref()) {
                             Ok(()) => out.updated += 1,
-                            Err(_) => out.failed.push(path.clone()),
+                            Err(e) => out
+                                .failed
+                                .push(Failed::new(path, Failure::Place(e.to_string()))),
                         }
                     }
                 }
@@ -299,7 +556,10 @@ pub fn apply<M: Materialise>(
                 // delete, because the edit is the newer intention *here* and
                 // nothing else has a copy of it.
                 if waiting.contains(&id) {
-                    out.kept_local.push(entry.path.display().to_string());
+                    out.kept_local.push(Kept::new(
+                        &entry.path.display().to_string(),
+                        Why::EditWaiting,
+                    ));
                     continue;
                 }
                 // Same check as the upsert side, for the same reason: a delete
@@ -309,12 +569,18 @@ pub fn apply<M: Materialise>(
                     hydration_protocol::stamp::state(&entry.path),
                     Ok(hydration_protocol::stamp::State::Dirty)
                 ) {
-                    out.kept_local.push(entry.path.display().to_string());
+                    out.kept_local.push(Kept::new(
+                        &entry.path.display().to_string(),
+                        Why::ChangedUnderneath,
+                    ));
                     continue;
                 }
                 match mat.remove(&entry.path) {
                     Ok(()) => out.removed += 1,
-                    Err(_) => out.failed.push(entry.path.display().to_string()),
+                    Err(e) => out.failed.push(Failed::new(
+                        &entry.path.display().to_string(),
+                        Failure::Remove(e.to_string()),
+                    )),
                 }
             }
         }

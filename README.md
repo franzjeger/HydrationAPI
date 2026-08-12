@@ -285,8 +285,13 @@ gcc -O1 -Wall -o probes/build/dirmark probes/dirmark.c
   is accepted and delivers nothing, which is worse than being rejected.
 - `demand.c` — is the event's `count` a hint or a demand? A demand. Answer
   `FAN_ALLOW` having written less than it asked for and the reader gets zeros,
-  silently, with no second event. A mapped read demands the whole object in one
-  event, which is why streaming moves the size ceiling rather than removing it.
+  silently, with no second event.
+- `bigdemand.c` — the same questions on a 2.77 GiB object, where the answers can
+  differ from the 4 MiB ones. `count` does not grow with the object: a 4 KiB read
+  demands 4096 bytes. Distinct ranges fire distinct events, including a repeat, so
+  ranges can accumulate. And `mmap` demands the **mapping**, not the object —
+  which corrects `demand.c`'s reading, since a probe that maps a small file whole
+  cannot tell the two apart. Hydration serves the demanded range because of this.
 - `stream.c` — is a half-filled placeholder observable? No: a second reader's
   event queues behind the one being served. That is what makes filling
   incrementally safe rather than merely convenient.

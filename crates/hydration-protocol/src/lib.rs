@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod mount;
 pub mod transport;
 
 /// The `nodump` inode flag, and its one legitimate use here.
@@ -375,6 +376,82 @@ pub mod names {
     }
 }
 
+/// The slice of an object a transfer is responsible for.
+///
+/// Exists so that "the whole object" and "the range this reader demanded" are
+/// the same type rather than two conventions about what a bare `size` argument
+/// means. Every signature that used to take one `size` now takes the object's
+/// size *and* a span, because both are needed and for different things: the size
+/// is what the placeholder promised and what a whole-object content hash is
+/// computed over, the span is what must actually arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Span {
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl Span {
+    pub const fn new(offset: u64, len: u64) -> Self {
+        Self { offset, len }
+    }
+
+    /// The span covering an entire object.
+    pub const fn whole(size: u64) -> Self {
+        Self {
+            offset: 0,
+            len: size,
+        }
+    }
+
+    /// One past the last byte.
+    pub const fn end(&self) -> u64 {
+        self.offset.saturating_add(self.len)
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether this span is the whole of an object of `size` bytes.
+    ///
+    /// The distinction is not cosmetic. A provider can verify a whole-object
+    /// content hash and cannot verify a range against one, so this is the
+    /// predicate that decides whether the integrity check in a provider is
+    /// available at all.
+    pub const fn is_whole(&self, size: u64) -> bool {
+        self.offset == 0 && self.len == size
+    }
+
+    /// Cut the span down to what actually exists.
+    ///
+    /// The kernel's demand is page-aligned, so the last one in a file whose size
+    /// is not a multiple of the page size asks for bytes past the end. Serving
+    /// them is impossible and refusing them would fail every read of the tail of
+    /// almost every file, so the span is clamped and the reader gets the part
+    /// that exists — which is exactly what a read of a fully present file
+    /// returns.
+    pub fn clamped_to(self, size: u64) -> Self {
+        let offset = self.offset.min(size);
+        Self {
+            offset,
+            len: self.end().min(size).saturating_sub(offset),
+        }
+    }
+
+    /// The part of this span that is also in `other`, or `None` if they do not
+    /// overlap.
+    ///
+    /// Needed where a transfer covers more than the reader demanded: when such a
+    /// transfer fails, the demanded part has to be separable from the
+    /// speculative part, so that reading ahead can never turn a read that would
+    /// have succeeded into an error.
+    pub fn intersect(self, other: Span) -> Option<Span> {
+        let offset = self.offset.max(other.offset);
+        let end = self.end().min(other.end());
+        (offset < end).then(|| Span::new(offset, end - offset))
+    }
+}
+
 /// Identifies a file without naming it.
 ///
 /// A path would be a destination, and destinations are the privileged side's
@@ -392,11 +469,25 @@ pub struct FetchRequest {
     /// Correlates the response. Monotonic per connection.
     pub id: u64,
     pub file: FileId,
-    /// The byte range the kernel asked about.
+    /// The byte range that must be delivered — a contract, not advice.
     ///
-    /// Treated as advice, not a contract: the measured range is the readahead
-    /// window, not what the application asked for, and overlapping repeats are
-    /// normal. v1 fetches whole files and ignores this beyond logging.
+    /// This field carried the opposite comment until `probes/bigdemand.c` was
+    /// run: it said the range was the readahead window rather than what the
+    /// application asked for, so v1 ignored it and fetched whole objects. Both
+    /// halves of that were wrong. `count` is what the reader demanded (§8d), and
+    /// on an object big enough for the two to differ it is *only* what the
+    /// reader demanded — a 4 KiB `read()` of a 2.77 GiB file asks for 4096
+    /// bytes, not for 2.77 GiB (§8d-bis).
+    ///
+    /// Fetching the whole object for such a read is what made a multi-gigabyte
+    /// file unreadable: the transfer could not finish inside the deadlines, so
+    /// the reader got `EIO` after a minute of waiting for bytes it had not asked
+    /// for.
+    ///
+    /// The daemon must deliver exactly `len` bytes starting at `offset`.
+    /// Delivering fewer is an abort, not a short success — answering the event
+    /// after filling less than it demanded hands the reader zeros with no error
+    /// (§8d).
     pub offset: u64,
     pub len: u64,
     /// Who is reading, for the hydration policy in §6c. A cgroup path rather
@@ -559,6 +650,37 @@ pub fn decode<T: for<'de> Deserialize<'de>>(line: &str) -> serde_json::Result<T>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What readahead needs from `intersect`: given a transfer that covered more
+    /// than the reader demanded, which part of it the reader was actually owed.
+    #[test]
+    fn intersect_separates_a_demand_from_the_speculation_around_it() {
+        let demanded = Span::new(0, 4096);
+        // The widened fetch: the demand is the front of it.
+        assert_eq!(
+            Span::new(0, 8 << 20).intersect(demanded),
+            Some(Span::new(0, 4096))
+        );
+        // A later span of the same widening owes the reader nothing, and that is
+        // the case that must be `None` rather than an empty span — an empty span
+        // is "covered", and would send a failed readahead down the path that
+        // fails the read.
+        assert_eq!(Span::new(8 << 20, 8 << 20).intersect(demanded), None);
+        // Touching but not overlapping is not an overlap.
+        assert_eq!(Span::new(4096, 4096).intersect(demanded), None);
+        // A demand in the middle of a fetch, and the symmetry that says the
+        // answer does not depend on which way round it is asked.
+        let inner = Span::new(100, 50);
+        assert_eq!(Span::new(0, 4096).intersect(inner), Some(inner));
+        assert_eq!(inner.intersect(Span::new(0, 4096)), Some(inner));
+        // Partial overlap at each end.
+        assert_eq!(
+            Span::new(50, 100).intersect(Span::new(100, 100)),
+            Some(Span::new(100, 50))
+        );
+        // Nothing intersects an empty span, including itself.
+        assert_eq!(Span::new(0, 4096).intersect(Span::new(100, 0)), None);
+    }
 
     #[test]
     fn a_request_names_an_inode_and_never_a_path() {

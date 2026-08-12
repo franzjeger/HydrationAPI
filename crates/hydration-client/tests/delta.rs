@@ -4,7 +4,7 @@
 //! local copy is the truth. A delta pass may create and may refresh, but it must
 //! never replace content that exists nowhere else.
 
-use hydration_client::delta::{apply, Applied, Change, Materialise};
+use hydration_client::delta::{apply, Applied, Change, Failed, Failure, Kept, Materialise, Why};
 use hydration_client::store::{self, Store};
 use hydration_client::upload::{Queue, TestClock};
 use hydration_protocol::FileId;
@@ -34,6 +34,11 @@ fn file_id(p: &Path) -> FileId {
 struct Recorder {
     placed: Vec<String>,
     removed: Vec<String>,
+    /// Makes every call fail, for the tests about what a failure is reported as.
+    /// The real placer fails for reasons a test cannot arrange — a read-only
+    /// mount, a directory owned by somebody else — and the reconciler cannot
+    /// tell the difference: it sees an `io::Error` either way.
+    refuse_with: Option<io::ErrorKind>,
 }
 
 impl Materialise for Recorder {
@@ -44,6 +49,9 @@ impl Materialise for Recorder {
         cloud_id: &str,
         etag: Option<&str>,
     ) -> io::Result<()> {
+        if let Some(kind) = self.refuse_with {
+            return Err(kind.into());
+        }
         self.placed.push(path.display().to_string());
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -67,6 +75,9 @@ impl Materialise for Recorder {
     }
 
     fn remove(&mut self, path: &Path) -> io::Result<()> {
+        if let Some(kind) = self.refuse_with {
+            return Err(kind.into());
+        }
         self.removed.push(path.display().to_string());
         std::fs::remove_file(path)
     }
@@ -129,7 +140,11 @@ fn an_unsent_local_edit_is_never_replaced_by_the_cloud_version() {
     let mut m = Recorder::default();
     let out = run(&dir, &[upserted("notes.txt", 9, "cloud-1")], &q, &mut m);
 
-    assert_eq!(out.kept_local, vec!["notes.txt".to_string()], "{out:?}");
+    assert_eq!(
+        out.kept_local,
+        vec![Kept::new("notes.txt", Why::EditWaiting)],
+        "{out:?}"
+    );
     assert_eq!(out.updated, 0);
     assert!(m.placed.is_empty(), "the local edit was overwritten");
     assert_eq!(
@@ -151,7 +166,11 @@ fn local_content_that_was_never_uploaded_is_kept() {
     let mut m = Recorder::default();
     let out = run(&dir, &[upserted("draft.md", 5, "cloud-9")], &q, &mut m);
 
-    assert_eq!(out.kept_local, vec!["draft.md".to_string()], "{out:?}");
+    assert_eq!(
+        out.kept_local,
+        vec![Kept::new("draft.md", Why::NeverUploaded)],
+        "{out:?}"
+    );
     assert_eq!(std::fs::read(&p).unwrap(), b"written offline, never sent");
 }
 
@@ -258,11 +277,54 @@ fn a_cloud_path_that_escapes_the_sync_root_is_refused() {
     );
 
     assert_eq!(out.created, 0);
-    assert_eq!(out.failed.len(), 2, "{out:?}");
+    assert_eq!(
+        out.failed,
+        vec![
+            Failed::new("../../../tmp/evil", Failure::PathRefused),
+            Failed::new("/etc/cron.d/evil", Failure::PathRefused),
+        ],
+        "{out:?}"
+    );
     assert!(
         m.placed.is_empty(),
         "a remote service placed a file outside the sync directory: {:?}",
         m.placed
+    );
+}
+
+/// The failure that started this: a placement that fails carries its errno.
+///
+/// On 2026-08-11 a scratch mount owned by root made every `place` fail with
+/// `EACCES`, and the log said `could not apply <path>` and nothing else — the
+/// same sentence a refused path produces, so the smoke failure was bisected
+/// against the daemon to recover a cause the kernel had already supplied. What
+/// this asserts is not the wording but that the `io::Error` survives at all:
+/// the reason is the thing being tested, so it is compared, not counted.
+#[test]
+fn a_placement_that_fails_says_why() {
+    let dir = scratch("place-fails");
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+    let mut m = Recorder {
+        refuse_with: Some(io::ErrorKind::PermissionDenied),
+        ..Default::default()
+    };
+
+    let out = run(&dir, &[upserted("notes.txt", 10, "cloud-1")], &q, &mut m);
+
+    assert_eq!(out.created, 0, "{out:?}");
+    assert_eq!(
+        out.failed,
+        vec![Failed::new(
+            "notes.txt",
+            Failure::Place(io::Error::from(io::ErrorKind::PermissionDenied).to_string()),
+        )],
+        "{out:?}"
+    );
+    // And the line a user would see names the cause rather than implying one.
+    assert!(
+        out.failed[0].why.to_string().contains("permission denied"),
+        "{}",
+        out.failed[0].why
     );
 }
 
@@ -302,7 +364,11 @@ fn an_edit_nobody_reported_is_still_not_overwritten() {
 
     assert_eq!(
         out.kept_local,
-        vec!["doc.txt".to_string()],
+        // The reason matters as much as the refusal: this file is protected by
+        // the stamp check and by nothing else, because no event was ever
+        // delivered for the edit. A pass that refused it for some other reason
+        // would leave that gap open and still pass an assertion on the path.
+        vec![Kept::new("doc.txt", Why::ChangedUnderneath)],
         "a delta pass overwrote an edit it had not been told about: {out:?}"
     );
     assert_eq!(
@@ -373,6 +439,186 @@ fn a_pass_that_brings_no_news_leaves_the_file_alone() {
     );
     assert_eq!(out.updated, 0, "{out:?}");
     assert!(m.placed.is_empty(), "placed: {:?}", m.placed);
+}
+
+/// The echo of an unchanged object must not become a permanent conflict.
+///
+/// The state this constructs is what an *interrupted* fill leaves behind, and it
+/// was observed on a live account rather than deduced: a worker was killed
+/// between writing a range into a placeholder and `settle_range`'s re-stamp (the
+/// smoke test's old machine-wide `pkill -x hydrationd` did exactly that, twice),
+/// leaving partial content, the dehydrated mark still set, and a stamp
+/// describing the pre-fill mtime. Nothing ever re-stamps a file nobody touches —
+/// only the next read event would — so the mismatch is permanent.
+///
+/// The delta feed then re-presents the whole tree every round (`Discover`'s
+/// contract: a full listing and an incremental one behave the same), and the
+/// pass refused the unchanged object as `ChangedUnderneath` every five seconds,
+/// indefinitely: `kept local copy of Backups/…/2026-02-23_00-00.tar.gz` until a
+/// later read happened to fill another range and re-stamp.
+///
+/// The refusal protected nothing. A change that describes exactly what is
+/// already here — same id, same version, same size — applies nothing, so there
+/// is nothing to keep local. "Kept" was a lie both ways: nothing was going to be
+/// destroyed, and the conflict it reported cannot be resolved from either side.
+#[test]
+fn an_interrupted_fill_does_not_turn_the_echo_into_a_permanent_conflict() {
+    use std::os::unix::fs::FileExt;
+
+    let dir = scratch("interrupted-fill");
+    let mut m = Recorder::default();
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+
+    run(
+        &dir,
+        &[upserted("big.tar.gz", 1 << 20, "cloud-1")],
+        &q,
+        &mut m,
+    );
+    let p = dir.join("big.tar.gz");
+    let before = std::fs::metadata(&p).unwrap();
+
+    // The fill, cut off before the stamp. Writing through a fresh handle rather
+    // than any helper of the framework's is the point: the worker's pwrite went
+    // through and its SIGKILL arrived before `settle_range`.
+    let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+    write_and_stale_the_stamp(&f, 0);
+    drop(f);
+    assert_eq!(
+        hydration_protocol::stamp::state(&p).unwrap(),
+        hydration_protocol::stamp::State::Dirty,
+        "the interrupted fill should have left the stamp stale"
+    );
+    assert!(
+        store::get_xattr(&p, hydration_protocol::xattr::DEHYDRATED)
+            .unwrap()
+            .is_some(),
+        "the file should still be marked: the fill never finished"
+    );
+
+    // The echo, as every round delivers it: same id, same version, same size.
+    let out = run(
+        &dir,
+        &[upserted("big.tar.gz", 1 << 20, "cloud-1")],
+        &q,
+        &mut m,
+    );
+
+    assert_eq!(
+        out,
+        Applied::default(),
+        "a change that describes what is already here applies nothing, so \
+         there is nothing to keep local and nothing to report"
+    );
+    let after = std::fs::metadata(&p).unwrap();
+    assert_eq!(after.ino(), before.ino(), "the placeholder was replaced");
+    let mut held = vec![0u8; 4096];
+    std::fs::File::open(&p)
+        .unwrap()
+        .read_exact_at(&mut held, 0)
+        .unwrap();
+    assert_eq!(held, vec![7u8; 4096], "the partial fill was thrown away");
+}
+
+/// Write into `f`, and make the stamp provably stale afterwards.
+///
+/// The obvious spelling — write, then ask — is a coin flip, and which way it
+/// lands is a property of the filesystem rather than of the code under test.
+/// `stamp` records `<mtime_sec>.<mtime_nsec>:<size>`, and these writes land
+/// inside an existing size, so mtime is the only thing that can differ.
+///
+/// Measured, `probes/mtimegran.c`:
+///
+/// ```text
+///   ext4, 128-byte inode:  nsec reads 0; mtime moves once per 1000.000 ms
+///                          two back-to-back writes are INDISTINGUISHABLE
+///   btrfs:                 nsec stored; mtime moved after 0.623 ms
+/// ```
+///
+/// A 128-byte inode predates the `i_[cma]time_extra` fields that carry the
+/// sub-second part, so there is nowhere to keep it. A write in the same second
+/// as the stamp before it is therefore *correctly* reported `Clean` — the
+/// framework is not wrong, the test's assumption was. Both tests below were
+/// written on btrfs and failed on ext4-128 for that reason alone, which is the
+/// trap CLAUDE.md names: a test that passes while unable to fail for the reason
+/// it claims.
+///
+/// So the mtime is moved by hand instead of being left to the clock. Backwards,
+/// because "an hour ago" cannot collide with a stamp taken a moment ago on any
+/// resolution, where "now plus a bit" can.
+fn write_and_stale_the_stamp(f: &std::fs::File, at: u64) {
+    use std::os::unix::fs::FileExt;
+    f.write_all_at(&[7u8; 4096], at).unwrap();
+    let older = std::time::SystemTime::now() - Duration::from_secs(3600);
+    f.set_times(std::fs::FileTimes::new().set_modified(older))
+        .expect("move mtime");
+}
+
+/// The same stale stamp against a change that is *not* an echo: the protection
+/// this file exists for is untouched by the fix above.
+///
+/// A dirty file cannot be told apart from a user's unreported edit — that is the
+/// stamp's whole design — so a version that genuinely differs must still be
+/// refused, reported, and left exactly as it was found.
+#[test]
+fn a_stale_stamp_still_blocks_a_change_that_would_apply_something() {
+    use std::os::unix::fs::FileExt;
+
+    let dir = scratch("stale-stamp-real-change");
+    let mut m = Recorder::default();
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+
+    run(
+        &dir,
+        &[upserted("big.tar.gz", 1 << 20, "cloud-1")],
+        &q,
+        &mut m,
+    );
+    let p = dir.join("big.tar.gz");
+    let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+    write_and_stale_the_stamp(&f, 0);
+    drop(f);
+    // Asserted, not assumed: the rest of this test is about what a *dirty* file
+    // does, and on a filesystem that could not record the write it would sail
+    // through every remaining assertion while measuring a clean one.
+    assert_eq!(
+        hydration_protocol::stamp::state(&p).unwrap(),
+        hydration_protocol::stamp::State::Dirty,
+        "the write did not leave the stamp stale, so this test would be \
+         measuring a clean file against a rule about dirty ones"
+    );
+    let placed_before = m.placed.len();
+
+    // Same object, new version.
+    let out = run(
+        &dir,
+        &[Change::Upserted {
+            cloud_id: "cloud-1".into(),
+            path: "big.tar.gz".into(),
+            size: 1 << 20,
+            etag: Some("etag-2".into()),
+        }],
+        &q,
+        &mut m,
+    );
+
+    assert_eq!(
+        out.kept_local,
+        vec![Kept::new("big.tar.gz", Why::ChangedUnderneath)],
+        "{out:?}"
+    );
+    assert_eq!(
+        m.placed.len(),
+        placed_before,
+        "a dirty file was refreshed over: {:?}",
+        m.placed
+    );
+    let mut held = vec![0u8; 4096];
+    std::fs::File::open(&p)
+        .unwrap()
+        .read_exact_at(&mut held, 0)
+        .unwrap();
+    assert_eq!(held, vec![7u8; 4096], "the local bytes were thrown away");
 }
 
 /// And the other side of it: news is still applied.

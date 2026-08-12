@@ -738,8 +738,10 @@ the mount looked healthy, `mountpoint` said yes, `touch` worked, and everything 
 - **The mount is torn down without failing open.** Exiting the process would have closed
   the group, and a mount without a group fails *open*: every placeholder becomes a
   source of zeros. So the mount is detached with `MNT_DETACH` while the process
-  stays up and denies everything already in flight, and exits only once
-  it has been quiet for 10 s. `BindsTo=` covers the same thing from systemd's side;
+  stays up and denies everything already in flight, and exits once it has been
+  quiet for 10 s **or after 60 s regardless** — see §6a-quater for why the second
+  half of that sentence is not a tidiness limit but the only reason it terminates.
+  `BindsTo=` covers the same thing from systemd's side;
   the helper does it itself as well, so the guarantee does not depend on having been
   deployed with the accompanying units.
 
@@ -790,6 +792,154 @@ it get `EIO` rather than content. That is a *degradation*, not a lockup, and tha
 the distinction §6a-bis is about: every reader is answered quickly. Removing it requires
 pipelining, which the protocol's `id` field already allows for and the transport does not yet
 implement.
+
+---
+
+## 6a-quater. A hung supervisor defeats every recovery there is
+
+Found in production on 2026-08-12, and it is §6a-bis one level up: everything
+§6a-bis built to survive a hung *worker* was defeated by a hung *supervisor* on
+its way out.
+
+The sequence, from the journal. The worker gave up on its fetcher after 300 s and
+exited — correct. The supervisor answered the stranded event, detached the mount
+with `MNT_DETACH`, and logged `mount detached — denying everything still in
+flight, then exiting non-zero` — correct, and systemd duly logged the mount unit
+as `Deactivated successfully`. Then the supervisor never exited. Eight hours
+later it was still `MainPID`, the unit was still `ActiveState=active`,
+`NRestarts=0`, and the mount was gone.
+
+**The bug is one line, and it is the exit condition.** The drain loop denied
+everything until "nothing has arrived for 10 s", and reset that window on every
+event. A sliding window makes termination a property of the rest of the machine,
+not of this process. Two KDE thumbnail workers were touching placeholders on the
+detached mount; the supervisor answered roughly 500 million denials over 23
+minutes at ~300,000/s and never once saw a quiet 10 s.
+
+**What the readers were doing matters, because it decides whether this needs a
+fix or a footnote.** They were not retrying in any loop they had written: `syscr`
+was frozen at 222 and 194 for their entire lifetimes and `minflt` never moved
+either, so they were making no read syscalls and completing no page faults.
+`SIGSTOP` on the pair took the denial rate from 295,932/s to exactly 0 and
+`SIGCONT` restored it, so the attribution is settled. The generator was a
+page-fault retry on a mapping established while hydration still worked; the exact
+kernel hook was not isolated. What matters is that it was Dolphin generating
+thumbnails — nothing unusual, nothing hostile, and nothing the framework can ask
+not to happen.
+
+**Why this is worse than the failure it replaced.** A supervisor that never exits
+is one systemd never restarts, so `Restart=always` never fired and
+`RequiresMountsFor=` never remounted (§8b). The deployment sat with no mount
+while reporting itself healthy. And the hole did not stay in the privileged half:
+the unprivileged daemon found a bare mountpoint, could not tell it from an empty
+sync root, and rebuilt its whole tree — 147,540 files — on the underlying
+subvolume, where there is no mark and nothing can ever hydrate. Fail-closed had
+become fail-down-forever plus silent pollution of the directory it was protecting.
+
+**The fix.** An absolute cap on the drain, 60 s, six times the quiet window
+(`supervisor::DENY_DRAIN_CAP`). Two smaller faults in the same loop went with it:
+it took any non-zero `poll` return as traffic, so `POLLERR`/`POLLHUP` — always
+reported whether requested or not — reset the window as effectively as a real
+event; and a wakeup that decoded to no events reset it too. Both are now
+distinguished from traffic.
+
+The cap has a real cost and it is the honest trade. Exiting closes the group, and
+a mount with no group fails open, so a reader still holding a descriptor on the
+detached mount reads zeros from the hole. That is accepted because the mount is
+already detached — nothing *new* can reach it — and the alternative is every
+reader on the machine broken indefinitely with no path back. The log names the
+pids still asking, so the next person does not have to reconstruct it from
+`/proc` during an outage.
+
+Measured by `probes/denyloop.c`, which runs the loop verbatim against a quiet
+reader and a persistent one: the quiet case closes the window after one denial,
+the persistent case never closes it and sustains ~333,000 denials/s.
+`tests/fail_closed.rs` pins termination; that test hangs forever against the old
+code, which was the bug.
+
+**The general lesson, since this is the second time.** §6a-bis's insight was that
+liveness is not health — a process can be alive and useless. This is the same
+mistake in the teardown path: the drain treated "still receiving work" as a
+reason to keep going, when the whole purpose of the phase was to *stop*. Any loop
+whose job is to reach an exit must be bounded by something it controls. Every
+deadline in this design is now absolute for that reason.
+
+---
+
+## 6a-quinquies. A client restart must not cost the mount
+
+Found in production on 2026-08-12, in the same journal as §6a-quater's incident:
+`systemctl --user restart` of the sync daemon at 05:13:56, worker gave up at
+05:18:34, mount detached, deployment down — with a healthy client listening at
+the same socket path for all but the first seconds of it. A client restart is
+not exotic: systemd does it on upgrade, on failure, and on a user's whim, and
+the unit file expressly permits it ("may come and go freely").
+
+**Why the old arrangement could not survive it.** The helper connects out once.
+When the client dies, that established socket is dead forever — the client
+coming back binds a *fresh* listener, which resurrects nothing. Every fetch on
+the dead socket failed instantly, three failures made the fetcher `wedged()`,
+and the wedge short-circuited later events *before sending anything*, so the
+code that could have noticed recovery never ran again. `WEDGED_LIMIT` later the
+worker gave up — correctly, by §6a-bis — and the helper tore down a mount whose
+peer had been back for four and a half minutes. "The pair is rebuilt by
+systemd" was the documented recovery, and it is not one: nothing restarts a
+system unit because a user unit came back.
+
+**The fix is to reconnect, and to keep the give-up clock as the bound behind
+it.** Two pieces, both in the privileged helper:
+
+- `SocketFetch` remembers the socket path and the expected uid. When an
+  exchange dies — or leaves the stream mid-frame, which the framing rules
+  already said must be dropped rather than resynchronised — it reconnects and
+  re-asks once for the same span. Within one event the knocking is bounded
+  (eight attempts, 250 ms apart — sized for a `systemctl restart`'s
+  stop-to-bind gap and kept far under the first-byte deadline); a reader that
+  arrives while the client is genuinely down gets `EIO`, which is the answer
+  the deployment always documented for that state.
+- Connection losses count toward `wedged()` through their own counter, and a
+  wedge made only of them does **not** short-circuit: unlike a deadline miss,
+  a lost connection fails in microseconds and leaves no ghost transfer whose
+  late reply could ever prove recovery — the next attempt is the *only* road
+  back, and it is where the reconnect lives. §6a-bis's bound is unchanged: a
+  client that stays gone keeps the clock running and the mount comes down at
+  `WEDGED_LIMIT`, drained and answered, exactly as before.
+
+An earlier attempt made a lost connection terminal immediately — `wedged()`
+true on the first loss, `since` backdated past the limit — and the privileged
+suite caught it leaving a reader blocked: giving up while events were still
+queued means the worker stops answering, and §6a-bis is explicit that every
+event is answered before this process goes. The give-up must only ever happen
+between events, which the worker's loop already guarantees; nothing about
+noticing the peer faster is allowed to change where the noticing takes effect.
+
+**Why reconnecting is not a new hole.** The socket lives in `/run/user/<uid>`,
+0600 in a directory only that uid traverses, and every reconnect re-runs the
+same `SO_PEERCRED` uid check as the first connect — the same function
+(`remote::connect_checked`), not a sibling of it. An impersonating listener
+with the right uid gains nothing it did not already have (§6b: it could
+already write every file it would be serving content for), and one with the
+wrong uid is refused, counted as a loss, and brings the deployment down
+through the same fail-closed road as an absent peer — where the restarted
+helper's startup connect runs the identical check and refuses to start. Two
+details keep the halves consistent across the swap: the shared writer inside
+`HelperConn` is replaced under its lock, so the change-reporting threads
+follow to the new stream instead of writing into a dead one; and the new
+peer's pid — from the same `SO_PEERCRED` read — replaces the old in the change
+watcher's ignore set, so the restarted daemon's own writes are not reported
+back to it as local edits.
+
+The client side needed nothing: its accept loop already treats every new
+connection as a resync point (§6g), which is exactly what a reconnecting
+helper looks like to it.
+
+Pinned by `tests/reconnect.rs`, which restarts a real client behind a real
+socket path under a live worker: the read after the restart must hydrate and
+the fetcher must not be counting toward giving up; and a client that stays
+gone must leave the fetcher wedged with every reader answered promptly. The
+first of those fails against the old code in exactly the incident's shape —
+`EIO` after the restart, wedge running — which is how it was reproduced before
+it was fixed.
 
 ---
 
@@ -1180,6 +1330,50 @@ The trigger lives in the running daemon, not in the tool, and that is the point:
 
 ---
 
+## 6i. A delta pass outlives the mount it started on
+
+§6.4a establishes that a sync root which is not its own mount can never be marked, and so the client refuses to start on one and re-asks every delta round. That is the right *question* asked at the wrong *granularity*, and on 2026-08-12 the difference cost 147,540 files.
+
+The sequence, from the rig's own logs:
+
+```
+05:13:56  sync daemon starts, mount up, guard satisfied
+05:18:34  hydrationd's fetcher hangs; the helper detaches the mount and exits
+05:18+    the daemon writes 147,540 placeholders, 37 MB, into the bare
+          @home directory underneath the now-detached mountpoint
+```
+
+The round's check passed and the mount vanished *during* the round. A pass applying 147,540 changes takes minutes, so the window is not an edge — it is most of the pass. Everything written in it reads back as zeros, on a filesystem nothing can ever mark, and looks exactly like a real file. The pass logged `+147540 failed 0`.
+
+**A check cannot close this, and the reason is worth stating in general terms.** Every mount check is check-then-act: it reports on a path at one instant, and the act happens afterwards. Moving the check from once per round to once per change narrows the window from minutes to microseconds, which is a real improvement and still not a fix. Measured, by running the reproduction against a build with the per-change check and nothing else:
+
+| what was in place | placeholders in the bare directory |
+|---|---|
+| nothing | 381 of 400 |
+| per-change mount check only | **1** |
+| descriptor pinning + per-change check | 0 |
+
+One, not none — the change whose check passed microseconds before the detach landed. On the rig that is one unhydratable file per detach, found later by whatever opens it.
+
+**The fix is to stop resolving the path.** `TmpfilePlacer` opens the sync root once, when it has been confirmed a mount, and holds the descriptor. `openat`, `mkdirat`, `linkat` and `renameat` relative to that descriptor land on the filesystem it was opened against, because detaching a mount does not change what an open descriptor means. The mount going away stops being a thing to detect in time and becomes a thing that cannot redirect us. `linkat` refusing to cross a filesystem is the backstop underneath it, and it holds for the boundary production actually crossed — measured in `probes/tmpfile_exdev.c`, `EXDEV` both between two filesystems and between two btrfs subvolumes of one filesystem, which is the `@onedrive` → `@home` case.
+
+**Detection is still worth having; it just has a smaller job.** A pass that carries on writing into a detached filesystem is doing work nobody can see, and `hydrationd` detaching the mount is a *deliberate* fail-closed action that the client should report rather than absorb. So `Materialise::root_still_current` is asked once per change and the pass stops cleanly, keeping its cursor where it is — `Applied::stopped`, not an `Err`, because meeting a deliberate safety action is the system working. Being a change late costs a refusal; being wrong about the destination cost the tree.
+
+**What it is asked with matters as much as when.** The unique mount id (`STATX_MNT_ID_UNIQUE`, §probes/mntid.c) rather than a `/proc/self/mountinfo` parse:
+
+```
+mountinfo read+parse:    13.38 us      "is *a* mount here"
+statx unique mnt id:      0.24 us      "is *the* mount here"    57x cheaper
+```
+
+Cost is the lesser half. Between a detach and the remount that `RequiresMountsFor=` brings up, `mountinfo` answers yes for a mount that is not the one the pass started on; the id does not. The two questions belong at different granularities and both are now asked at theirs: "is this a mount at all" once per incarnation, when a placer is opened, since a sync root that is a plain directory can never be marked; "is it still the same mount" once per change.
+
+A placer's lifetime is therefore exactly one mount incarnation. When a pass stops for this reason the daemon drops it, and the next round has to find a mount before it opens another — an identity captured against a mount that has been replaced is stale forever, and reusing it would answer "changed" for the rest of the process's life.
+
+The residual gap, stated rather than left to be discovered: a rename of the sync root within one filesystem is not a mount change, and the id correctly says so. The descriptor is what keeps the placeholders out of the new directory in that case, and the check contributes nothing — which is the division of labour, in the one situation that makes it visible.
+
+---
+
 ## 7. Cost
 
 Assuming the client (auth, Graph API, delta sync) already exists, as it does in the
@@ -1342,6 +1536,34 @@ filesystem behaviour does not get to choose which filesystems it meets.
 
 ---
 
+## 8z-bis. mtime is the whole change detector, and one filesystem cannot keep it
+
+Two things in this design decide "has anyone written to this file?" by comparing a recorded timestamp against the file now:
+
+- `hydration_protocol::stamp` records `<mtime_sec>.<mtime_nsec>:<size>`. §5.2's "the local copy is the truth" is enforced with it, and §6g says explicitly that change notifications are *not* authoritative — so this comparison is the only thing that catches a write nobody reported.
+- `partial::Witness` records `{mtime, mtime_nsec, size}`, and decides whether the worker may still believe its own record of which ranges it filled.
+
+Both inherit whatever resolution the filesystem keeps. Measured, `probes/mtimegran.c`:
+
+```text
+ext4, 128-byte inode:  nsec reads 0; mtime moves once per 1000.000 ms
+                       two back-to-back writes are INDISTINGUISHABLE
+btrfs:                 nsec stored; mtime moved after 0.623 ms
+```
+
+A 128-byte inode predates the `i_[cma]time_extra` fields that carry the sub-second part, so there is nowhere to put it. The consequence is not subtle: **on such a filesystem, a write that lands in the same second as the stamp or witness before it cannot be detected at all**, because nothing about the file has changed that either structure records — the size is the same, and the timestamp is the same.
+
+What that costs, concretely:
+
+- A user edit made within a second of the framework's own write reads as `Clean`, and a delta pass may replace it. This is §5.2's failure, reachable on one filesystem and not on the others.
+- A third party overwriting a range within a second of the worker filling it leaves the worker's record standing, so the worker keeps vouching for content it did not put there.
+
+**Not fixed, and stated rather than left to be discovered.** The obvious repairs are worse than they look: `ctime` has the same resolution on the same inode, and `i_version` is not exposed to userspace without `statx(STATX_CHANGE_COOKIE)`, which is not universally available and would need a fallback that lands back here. The honest position is that this framework's change detection is as good as the filesystem's timestamp resolution, that ext4 with 128-byte inodes is the one layout in the CI matrix where that is a whole second, and that 128-byte inodes are deprecated for unrelated reasons (`mkfs.ext4` itself warns they cannot represent dates past 2038).
+
+It was found by three tests failing on the ext4-128 leg and nowhere else. Each was written on btrfs, where the resolution is fine enough that the assumption held invisibly; each now sets the mtime it needs rather than hoping the clock advanced, so what they measure is the rule rather than the clock. That is the trap CLAUDE.md names from the other side — a test that passes while being unable to fail for the reason it claims — and it took a filesystem with a coarser clock to expose it.
+
+---
+
 ## 8a. A read past EOF triggers an event
 
 Worth writing down because the opposite assumption is the natural one, and wrong.
@@ -1471,7 +1693,251 @@ gone. §8 and PROVIDER.md are to state that number, not claim the ceiling has be
 Range-based hydration is the real solution for reads, and it is deliberately not
 bundled with this change: it introduces a third file state — partially present —
 which the store, the manifest, the delta pass, eviction and §5.8 are all two-state
-about today.
+about today. **It is now built; see §8d-bis, including what happened to that
+objection.**
+
+---
+
+## 8d-bis. The same questions on an object big enough for the answers to differ
+
+§8d was measured on a 4 MiB file, and one of its two conclusions was an artefact of
+that. On a 4 MiB file "the whole object" and "the mapped length" are the same
+number, so the mmap case could not tell them apart — and the conclusion drawn was
+the pessimistic one.
+
+A live account made the difference matter. Opening
+`Backups/FranzJeger_Arch/2026-02-22_18-41.tar.gz` (2.77 GiB) in a file manager froze
+it for a long stretch and then succeeded, having fetched the entire file: `SEEK_DATA`
+afterwards reported data at 0 and the first hole at 2.77 GiB, and the mount went from
+37 MB to 3.2 GB. A deliberate **4096-byte** read of the sibling file failed with `EIO`
+after **61.7 seconds** — the `stall` limit — having moved nothing to disk. Four
+kilobytes were asked for; 2.77 GiB were attempted.
+
+`probes/bigdemand.c`, 7.1.6, btrfs, on a 2.77 GiB sparse placeholder. The worker fills
+exactly what each event asks for and answers `FAN_ALLOW`:
+
+```
+case                                   events   first off   first count   reader
+read() 4 KiB at 1 GiB                       1  1073741824          4096   real content
+read() 8 MiB at 1 GiB                       1  1073741824       8388608   real content
+read() 8 x 128 KiB sequential               8  1073741824        131072   real content
+read() 4 KiB at 1 GiB, at 2 GiB, at 1 GiB   3  1073741824          4096   real content
+mmap() whole object, touch 1 page           1           0    2972712960   (not filled)
+mmap() 4 KiB window at 1 GiB                1  1073741824          4096   real content
+mmap() 64 MiB segment at 1 GiB              1  1073741824      67108864   real content
+```
+
+Four things follow, and the third and fourth are new.
+
+- **`count` does not grow with the object.** A 4 KiB read of a 2.77 GiB file demands
+  4096 bytes, at a page-aligned offset a gigabyte in. There is no readahead inflation
+  and no whole-file demand hiding behind a large file. §8d's first conclusion holds at
+  any size.
+- **Sequential reads tile exactly.** Eight 128 KiB reads produced eight demands,
+  abutting, no overlap, no growth. A file read straight through is therefore its own
+  size in traffic and not a byte more — which is what makes it safe to serve ranges
+  rather than objects without turning one read into many.
+- **A demand is per access, including a repeat.** Reading at 1 GiB, then at 2 GiB,
+  then at 1 GiB again fired *three* events. Filling a range and answering does not
+  stop the file generating events, because the file is still marked and the ignore
+  mark only goes on when it is complete. So ranges can accumulate across events —
+  and a re-read of a range already present costs a round trip unless the worker
+  recognises what it put there, which is what `partial::Ranges` is for.
+- **`mmap()` demands the *mapping*, not the object.** This is the correction.
+  A 4 KiB window mapped a gigabyte into a 2.77 GiB file demanded 4096 bytes; a 64 MiB
+  segment demanded 64 MiB; only mapping the whole object demanded the whole object.
+  §8d's "no streaming can decompose that" is true of a whole-object mapping and false
+  of mapping generally — and segment-mapping is what an ELF loader actually does.
+
+The ceiling is therefore **the largest single demand**, not the object. It still
+exists: `mmap(NULL, size, ...)` over a whole large file is one event held through the
+entire transfer, and that is a real thing that real programs do. What has gone is the
+much larger class where the ceiling applied for no reason at all — every ordinary
+`read()`, at any size, of any object.
+
+### What became of the third file state
+
+§8d deferred this because "partially present" is a state the store, the manifest, the
+delta pass, eviction and §5.8 are all two-state about. The objection is answered by
+**not persisting the third state**. The set of filled ranges lives in the worker's
+memory (`crates/hydrationd/src/partial.rs`) and nowhere else. Nothing on disk says a
+file is partly filled; every other component still sees a file that is either marked
+or not, and a marked file is still one nobody may be served from without asking.
+
+Two consequences, both deliberate:
+
+- **A restart forgets.** The next event punches the file and starts over. Partial
+  content is a cache, and this is the price of not having to be correct across a crash
+  *mid-write* — where a range recorded present but only half written would be served
+  as content, which is the silent corruption the framework exists to prevent.
+- **Memory is not enough on its own**, because something else may write into the
+  placeholder between two events. A record is therefore believed only while the file
+  still looks the way we left it — the same `(mtime, mtime_nsec, size)` triple the
+  stamp records. Anything else and the record is dropped and the file punched, which
+  is what the code did unconditionally before ranges existed.
+
+`crates/hydrationd/tests/ranges.rs` runs all of this against the kernel on a real
+mount. Writing that suite turned up a ninth disguise of §6a-ter, from an unexpected
+direction: **a partial-page write into a placeholder blocks on a pre-content event.**
+The page has to be brought in before part of it can be modified, that read fires
+`FAN_PRE_ACCESS`, and a process that writes into the sync root and would have to answer
+its own event deadlocks. The framework's own writes go through the event fd and are
+exempt (§8c) — this is about anything *else* that edits a placeholder in place. It also
+means the worker does see a read of the page an editor is about to overwrite; what it
+does not see is the modification, because no released kernel has a pre-modify event.
+
+### What ranges cost
+
+- **A whole-object content hash cannot verify a range.** Graph publishes QuickXorHash
+  for the object and nothing per range, so `GraphProvider` runs the check when the
+  reader demanded the whole object and skips it otherwise. A service corrupting one
+  range of a large file is no longer caught by the tag. That is stated in the code at
+  the point where the check is skipped rather than left to be discovered.
+- **A partly filled file occupies disk while marked.** §5.8 asks that `st_blocks` be
+  honest, and it still is — the file really does hold those bytes. What is no longer
+  true is the stronger reading, that a *marked* file holds nothing.
+- **Re-reading is free only up to the cap.** 512 files are remembered at once;
+  past that the oldest is forgotten and its ranges are refetched on next use.
+
+---
+
+## 8d-ter. What a fetch costs, and the amplification that was not there
+
+Ranged hydration made small reads of large files possible and made *sequential*
+reading of them unusable: Ark listing a 2.77 GiB `tar.gz` — which decompresses the
+whole stream, so it reads straight through — moved at 0.27 MB/s and needed about
+three hours. Alongside it, the sync daemon's `rchar` grew at 11.35 MB/s. The
+apparent conclusion was a 42x read amplification: bytes were being fetched and
+thrown away, presumably because `Range` did not survive Graph's `/content`
+redirect and every request was downloading from offset 0.
+
+**None of that was happening.** Measured with `probes/fetchrate.sh`, on the live
+account, 16 MiB read from a region of the object not yet present, one span size
+per row — wire from the kernel's per-socket TCP accounting for the daemon,
+landed from the file's extent map:
+
+```
+span       landed    secs    MiB/s   wire/landed
+128 KiB     23.88    29.3     0.82         1.023
+1 MiB       23.00     4.3     5.31         1.004
+2 MiB       22.00     3.0     7.36         1.003
+4 MiB       20.00     1.6    12.25         1.002
+8 MiB       16.00     0.8    19.79         1.002
+16 MiB      16.00     0.7    23.77         1.002
+32 MiB      16.00     0.6    26.37         1.002
+```
+
+Every byte that crossed the wire landed in the file, at every span size. The few
+per cent at 128 KiB is per-request overhead — TLS records, headers, the redirect
+response — spread over 191 requests; it varies with connection churn between runs
+and collapses to 0.2% once the requests are large, which is the shape overhead
+has and not the shape waste has.
+
+**Both figures behind the 42x were measurement errors, and each has bitten
+before.**
+
+- **`rchar` is not network traffic.** `tree.json` is 59,483,205 bytes and
+  `run_round` re-reads it once per round, on a 5-second round: 11.35 MiB/s, out
+  of the page cache. Sampled with nothing hydrating at all, the daemon's `rchar`
+  grew by 178,464,537 bytes in 20.00 s — exactly three times `tree.json`, to
+  within the token file. This is the second time this same number has been read
+  as a download: the first was during the initial live run, when it was reported
+  as "26 GB/hour against the tenant" and turned out to be the same file being
+  re-read. It is written down here because it was not written down then.
+- **The interface counter is not this process's traffic.** On the machine this
+  was measured on, a browser, Teams and Steam were between them pulling 674 kB/s
+  while the mount was idle — larger than the signal, and enough to produce an
+  amplification below 1.0, which is impossible and was the clue.
+
+So the fetch path was never wasteful. What it was, was **latency-bound**: about
+160 ms of fixed cost per fetch whatever its size, consistent with Graph answering
+`/content` with a redirect so that every span pays an API round trip before a
+byte of it moves — the daemon's sockets show one request to Graph and one to the
+storage host per span. At 128 KiB that fixed cost is 96% of the transfer, which
+is the whole of the 0.27 MB/s.
+
+The answer is therefore to ask for more per fetch, not to waste less, and that is
+what `daemon::READAHEAD` does. Two things follow that are worth keeping in view.
+
+- **Readahead may not decide whether a read succeeds.** Widening puts speculative
+  bytes into the same transfer as the demanded ones, so a failure in the window
+  would fail a read the service could have served — an optimisation paying for
+  itself in correctness. When a widened span fails, the demanded part is asked
+  for again on its own, and only that second answer decides the reader's outcome.
+  `ranges::a_readahead_that_fails_still_serves_what_the_reader_asked_for`.
+- **The window is also how long one `read()` blocks.** 8 MiB is the knee of the
+  table above — 24x of the 32x on offer — and the shortest span that gets most of
+  it. That reasoning is about a link delivering ~35 MB/s; on a much slower one the
+  fixed cost matters less and the blocking matters more, and the constant should
+  be revisited rather than inherited.
+
+---
+
+## 8d-quater. What an already-present read costs, and the fix that was not built
+
+The previous section left one number behind as a rumour: "a sequential read of
+content that is *already present* costs about 61 ms per read", with the implied
+fix that past some fraction held, the worker should fetch the remainder and drop
+the mark so later reads cost nothing. Measured before building anything
+(`crates/hydrationd/examples/presentcost.rs`, release build, quiet machine, own
+loop mounts, 4 KiB reads of a region `SEEK_HOLE` proves is held, every event in
+the timed phase asserted `AlreadyPresent` and the fetch count asserted
+unchanged — any fetch inside a rep is exactly the pollution the 61 ms figure
+turned out to be made of):
+
+```
+                                    btrfs        ext4
+still marked, event per read      9.2 µs/read  7.1 µs/read
+hydrated, ignore mark, no event   0.2 µs/read  0.2 µs/read
+```
+
+**The per-event cost is 7–9 µs, not 61 ms — three and a half orders of
+magnitude below the rumour.** The reader that walks a 2.77 GiB archive in
+128 KiB reads fires ~22,700 events and pays about 0.2 s for all of them
+together. The complete-early-and-unmark fix would trade the one invariant this
+whole design leans on — a marked file is never served holes, and only a file
+with every byte present may lose its mark (§8d-bis) — plus a background write
+path into the marked mount from the answering process (a candidate tenth
+disguise for §6a-ter) and a second-reader-during-completion race, to save a
+fifth of a second per archive. It is not built, on purpose. This section exists
+so the next person reaching for it starts from the number rather than from the
+rumour.
+
+**Where the 61 ms actually lived.** The same instrument walks a cold 64 MiB file
+sequentially in 128 KiB reads and records what each event was answered with:
+
+```
+                              fetches   of them stride-sized   already-present
+window anchored at demand       449       448 × 128 KiB              0
+window anchored at frontier       8         0                      441
+```
+
+The readahead window used to be anchored at the demand's offset, and the
+already-present check asked about the *widened* span. A continuous walker's
+window therefore always poked one stride past what the previous event had
+filled: never "already present", and the missing part was exactly one
+reader-stride at the frontier. After the first window, **every read of a walk
+carried its own 128 KiB fetch**, and each fetch pays the ~160 ms fixed price of
+§8d-ter — 0.8 MB/s however fast the link, ~22,700 round trips for the archive,
+and a number that averaged out to tens of milliseconds "per already-present
+read" when measured without separating the two. That is the polluted
+measurement, identified.
+
+The fix is anchoring: decide "already present" on the demand alone, and when the
+demand does need bytes, widen the fetch to reach `READAHEAD` past the *first
+missing byte* rather than past the demand's own start. A walk then costs one
+fetch per window — ~355 round trips for that archive instead of ~22,700 — and
+the reads in between are the 7–9 µs answers measured above. The over-fetch bound
+is unchanged: the window still ends at most `READAHEAD` beyond a byte the
+reader demanded, so a reader that stops walking strands at most one window.
+`ranges::a_walker_pays_one_fetch_per_window_not_per_read` pins the shape, and
+fails against the demand-anchored code.
+
+One observation recorded rather than explained: in the cold walk, 512 reads
+produced 449 events — the 63 reads that landed wholly inside the first fetched
+window produced none, on 7.1.6, while the stride-cycling timed phase produced
+exactly one event per read. One event per read is therefore the worst case, not
+the invariant. Nothing here depends on which of the two the kernel chooses.
 
 ---
 
@@ -1561,8 +2027,13 @@ overwhelming majority of them.
 
 ## 9. What I did not get verified
 
-There is no reconnection in the process. A client restart survives by the pair being
-built up again, not by the connection being repaired.
+~~There is no reconnection in the process. A client restart survives by the pair being
+built up again, not by the connection being repaired.~~ — **closed, the hard way.** The
+"pair rebuilt by systemd" story was measured failing on 2026-08-12: a routine client
+restart cost the mount, because nothing rebuilds a system unit when a user unit comes
+back. The helper now reconnects in-process and re-checks the peer's uid each time;
+§6a-quinquies has the incident, the design and the bound, and `tests/reconnect.rs`
+restarts a real client under a live worker to pin it.
 
 In the interest of honesty, since this is meant to be the basis for a decision:
 
@@ -1624,9 +2095,12 @@ In the interest of honesty, since this is meant to be the basis for a decision:
   - **The page-fault pre-content hooks were reverted in 6.14-rc7**, before 6.14 shipped:
     syzbot found they could fire while holding freeze protection and deadlock the HSM client.
     What ships generates **one event for the whole range at `mmap()` time**. This is what
-    `probes/mmapread.c` measured, so §8d's "a mapped read demands the whole object in one
-    event" is the shipped behaviour and not an accident of this kernel — but it also means
-    lazy per-page filling is not available to build on later.
+    `probes/mmapread.c` measured — but "the whole range" is the *mapping's* range and not
+    the object's, which that probe could not show because it mapped a small file whole.
+    `probes/bigdemand.c` separates them: a 4 KiB window mapped into a 2.77 GiB file demands
+    4096 bytes (§8d-bis). One event per mapping at `mmap()` time is the shipped behaviour and
+    not an accident of this kernel; it also means lazy per-page filling is not available to
+    build on later.
   - **`FAN_REPORT_FID` with a permission class returns `EINVAL`** in every released kernel:
     `fanotify_init` still rejects any fid mode outside `FAN_CLASS_NOTIF`. Pre-content events
     carry an fd and a `FAN_EVENT_INFO_TYPE_RANGE` record instead.
