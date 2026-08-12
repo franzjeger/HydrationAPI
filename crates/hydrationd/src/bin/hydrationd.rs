@@ -20,7 +20,9 @@ use hydrationd::policy::Policy;
 use hydrationd::remote::SocketFetch;
 use hydrationd::report;
 use hydrationd::selfcheck::{self, MountIdentity, Reach};
-use hydrationd::supervisor::{deny, InFlight};
+use hydrationd::supervisor::{
+    deny, drain_denying, Drained, InFlight, DENY_DRAIN_CAP, DENY_DRAIN_QUIET,
+};
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -490,32 +492,41 @@ fn main() -> io::Result<()> {
         }
     );
 
-    // Denying until the mount has gone quiet. Not forever: a process that never
-    // exits is one systemd never restarts, and the whole point of detaching
-    // above was to reach a state the unit can recover from. Quiet means nothing
-    // has arrived for long enough that nothing is left waiting on us.
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut quiet_since = Instant::now();
-    loop {
-        if quiet_since.elapsed() >= Duration::from_secs(10) {
-            eprintln!("hydrationd: nothing left in flight; exiting so the unit can restart");
-            std::process::exit(if stalled { 75 } else { 1 });
+    // Denying until the mount has gone quiet, and then leaving either way.
+    //
+    // "Not forever" was always the stated intent here — a process that never
+    // exits is one systemd never restarts, and the whole point of detaching above
+    // was to reach a state the unit can recover from. The first version expressed
+    // it with a quiet window alone, which does not achieve it: the window slides,
+    // so any reader that keeps touching the mount keeps this process alive, and
+    // on 2026-08-12 two thumbnail workers kept it alive for 23 minutes while the
+    // unit reported `active` and the mount stayed down. The cap is what makes the
+    // intent true. See `supervisor::DENY_DRAIN_CAP` and `probes/denyloop.c`.
+    match drain_denying(&group, DENY_DRAIN_QUIET, DENY_DRAIN_CAP)? {
+        Drained::Quiet { denied } => {
+            eprintln!(
+                "hydrationd: nothing left in flight after {} denial(s); exiting so the \
+                 unit can restart",
+                denied
+            );
         }
-        let mut pfd = libc::pollfd {
-            fd: group.as_raw(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut pfd, 1, 500) } <= 0 {
-            continue;
-        }
-        quiet_since = Instant::now();
-        let len = group.read_events(&mut buf)?;
-        for ev in hydrationd::fanotify::events(&buf, len) {
-            if ev.fd >= 0 {
-                let _ = deny(&group, ev.fd);
-                unsafe { libc::close(ev.fd) };
-            }
+        Drained::StillBusy {
+            denied,
+            still_hammering,
+        } => {
+            // Said at this length because the alternative is someone finding a
+            // detached mount and 500 million denials with nothing to explain
+            // either. Exiting here lets those readers see zeros; staying would
+            // keep every reader on the machine broken instead, with no recovery.
+            eprintln!(
+                "hydrationd: still being accessed after {}s and {} denial(s) — leaving anyway \
+                 so the unit can restart. Readers still holding descriptors on the detached \
+                 mount will now read zeros; nothing new can reach it. Last seen asking: {:?}",
+                DENY_DRAIN_CAP.as_secs(),
+                denied,
+                still_hammering
+            );
         }
     }
+    std::process::exit(if stalled { 75 } else { 1 });
 }
