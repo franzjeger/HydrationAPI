@@ -738,8 +738,10 @@ the mount looked healthy, `mountpoint` said yes, `touch` worked, and everything 
 - **The mount is torn down without failing open.** Exiting the process would have closed
   the group, and a mount without a group fails *open*: every placeholder becomes a
   source of zeros. So the mount is detached with `MNT_DETACH` while the process
-  stays up and denies everything already in flight, and exits only once
-  it has been quiet for 10 s. `BindsTo=` covers the same thing from systemd's side;
+  stays up and denies everything already in flight, and exits once it has been
+  quiet for 10 s **or after 60 s regardless** — see §6a-quater for why the second
+  half of that sentence is not a tidiness limit but the only reason it terminates.
+  `BindsTo=` covers the same thing from systemd's side;
   the helper does it itself as well, so the guarantee does not depend on having been
   deployed with the accompanying units.
 
@@ -790,6 +792,77 @@ it get `EIO` rather than content. That is a *degradation*, not a lockup, and tha
 the distinction §6a-bis is about: every reader is answered quickly. Removing it requires
 pipelining, which the protocol's `id` field already allows for and the transport does not yet
 implement.
+
+---
+
+## 6a-quater. A hung supervisor defeats every recovery there is
+
+Found in production on 2026-08-12, and it is §6a-bis one level up: everything
+§6a-bis built to survive a hung *worker* was defeated by a hung *supervisor* on
+its way out.
+
+The sequence, from the journal. The worker gave up on its fetcher after 300 s and
+exited — correct. The supervisor answered the stranded event, detached the mount
+with `MNT_DETACH`, and logged `mount detached — denying everything still in
+flight, then exiting non-zero` — correct, and systemd duly logged the mount unit
+as `Deactivated successfully`. Then the supervisor never exited. Eight hours
+later it was still `MainPID`, the unit was still `ActiveState=active`,
+`NRestarts=0`, and the mount was gone.
+
+**The bug is one line, and it is the exit condition.** The drain loop denied
+everything until "nothing has arrived for 10 s", and reset that window on every
+event. A sliding window makes termination a property of the rest of the machine,
+not of this process. Two KDE thumbnail workers were touching placeholders on the
+detached mount; the supervisor answered roughly 500 million denials over 23
+minutes at ~300,000/s and never once saw a quiet 10 s.
+
+**What the readers were doing matters, because it decides whether this needs a
+fix or a footnote.** They were not retrying in any loop they had written: `syscr`
+was frozen at 222 and 194 for their entire lifetimes and `minflt` never moved
+either, so they were making no read syscalls and completing no page faults.
+`SIGSTOP` on the pair took the denial rate from 295,932/s to exactly 0 and
+`SIGCONT` restored it, so the attribution is settled. The generator was a
+page-fault retry on a mapping established while hydration still worked; the exact
+kernel hook was not isolated. What matters is that it was Dolphin generating
+thumbnails — nothing unusual, nothing hostile, and nothing the framework can ask
+not to happen.
+
+**Why this is worse than the failure it replaced.** A supervisor that never exits
+is one systemd never restarts, so `Restart=always` never fired and
+`RequiresMountsFor=` never remounted (§8b). The deployment sat with no mount
+while reporting itself healthy. And the hole did not stay in the privileged half:
+the unprivileged daemon found a bare mountpoint, could not tell it from an empty
+sync root, and rebuilt its whole tree — 147,540 files — on the underlying
+subvolume, where there is no mark and nothing can ever hydrate. Fail-closed had
+become fail-down-forever plus silent pollution of the directory it was protecting.
+
+**The fix.** An absolute cap on the drain, 60 s, six times the quiet window
+(`supervisor::DENY_DRAIN_CAP`). Two smaller faults in the same loop went with it:
+it took any non-zero `poll` return as traffic, so `POLLERR`/`POLLHUP` — always
+reported whether requested or not — reset the window as effectively as a real
+event; and a wakeup that decoded to no events reset it too. Both are now
+distinguished from traffic.
+
+The cap has a real cost and it is the honest trade. Exiting closes the group, and
+a mount with no group fails open, so a reader still holding a descriptor on the
+detached mount reads zeros from the hole. That is accepted because the mount is
+already detached — nothing *new* can reach it — and the alternative is every
+reader on the machine broken indefinitely with no path back. The log names the
+pids still asking, so the next person does not have to reconstruct it from
+`/proc` during an outage.
+
+Measured by `probes/denyloop.c`, which runs the loop verbatim against a quiet
+reader and a persistent one: the quiet case closes the window after one denial,
+the persistent case never closes it and sustains ~333,000 denials/s.
+`tests/fail_closed.rs` pins termination; that test hangs forever against the old
+code, which was the bug.
+
+**The general lesson, since this is the second time.** §6a-bis's insight was that
+liveness is not health — a process can be alive and useless. This is the same
+mistake in the teardown path: the drain treated "still receiving work" as a
+reason to keep going, when the whole purpose of the phase was to *stop*. Any loop
+whose job is to reach an exit must be bounded by something it controls. Every
+deadline in this design is now absolute for that reason.
 
 ---
 

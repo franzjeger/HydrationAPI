@@ -34,6 +34,34 @@
 use crate::fanotify::{self, Group};
 use std::io;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// How long the teardown drain waits for silence before deciding nothing is left
+/// waiting on it.
+pub const DENY_DRAIN_QUIET: Duration = Duration::from_secs(10);
+
+/// The longest the teardown drain will run, however busy it is.
+///
+/// This is not a tidiness limit, it is the whole reason the drain terminates.
+/// The quiet window is a *sliding* one — every event that arrives pushes it out
+/// again — so on its own it makes termination a property of the rest of the
+/// machine rather than of this process. Measured, `probes/denyloop.c`: a reader
+/// that treats `EIO` as transient and comes straight back holds the window open
+/// at ~333,000 denials per second indefinitely.
+///
+/// That is not a hypothetical about badly written software. On 2026-08-12 this
+/// deployment sat mount-down for 23 minutes because two KDE thumbnail workers
+/// were faulting on placeholders; the supervisor answered on the order of 500
+/// million denials and never saw a quiet 10 seconds, so it never exited,
+/// `Restart=always` never fired, `RequiresMountsFor=` never remounted, and the
+/// unit stayed `active` throughout. Fail-closed had become fail-down-forever,
+/// which is worse than the failure the design was avoiding: an outage that
+/// reports itself as healthy.
+///
+/// Six times the quiet window. Long enough that a real backlog of in-flight
+/// readers is answered rather than abandoned, short enough that recovery is
+/// prompt — and recovery is the point, because a detached mount serves nobody.
+pub const DENY_DRAIN_CAP: Duration = Duration::from_secs(60);
 
 /// The two words the halves share. Laid out explicitly because it is mapped, not
 /// allocated, and both processes have to agree on where each field lives.
@@ -223,6 +251,105 @@ pub fn take_over(
 /// Deny one event with `EIO`.
 pub fn deny(group: &Group, event_fd: i32) -> io::Result<()> {
     group.respond_raw(event_fd, fanotify::deny_with(libc::EIO))
+}
+
+/// Why the teardown drain stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Drained {
+    /// Nothing arrived for the quiet window. Everything that was in flight has
+    /// been answered, and exiting now strands nobody.
+    Quiet { denied: u64 },
+    /// The cap expired with events still arriving.
+    ///
+    /// Exiting closes the group, and a mount with no group fails *open*, so the
+    /// readers still hammering will get the zeros a placeholder is made of. That
+    /// is a real cost and it is chosen deliberately: the mount is already
+    /// detached, so nothing *new* can reach it, and the alternative is a process
+    /// that never exits and a deployment that never recovers. `still_hammering`
+    /// carries the pids so the log can name them instead of leaving the next
+    /// person to work it out from `/proc` during an outage.
+    StillBusy {
+        denied: u64,
+        still_hammering: Vec<i32>,
+    },
+}
+
+/// Answer everything with `EIO` until the mount goes quiet, or until `cap`.
+///
+/// Extracted from `main` so it can be tested at all: the loop it replaces was
+/// inline in `bin/hydrationd.rs`, which meant the one property that mattered —
+/// that it terminates — had no test and turned out to be false.
+///
+/// Three things here are deliberate and were each wrong in the version this
+/// replaces:
+///
+/// * **The cap.** See [`DENY_DRAIN_CAP`]. Without it the loop does not terminate.
+/// * **`revents` is checked.** `poll` reports `POLLERR`, `POLLHUP` and `POLLNVAL`
+///   whether or not they were requested, and the old loop took any non-zero
+///   return as traffic. An error condition on the group fd therefore reset the
+///   quiet window just as effectively as a real event, so a broken group fd was
+///   indistinguishable from a busy mount.
+/// * **The window only resets for events actually answered.** A wakeup that
+///   decodes to nothing is not traffic, and treating it as such was a second way
+///   to hold the window open with no reader involved at all.
+pub fn drain_denying(group: &Group, quiet: Duration, cap: Duration) -> io::Result<Drained> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let started = Instant::now();
+    let mut quiet_since = Instant::now();
+    let mut denied = 0u64;
+    // Bounded on purpose: this runs while the machine is in trouble, and an
+    // unbounded set keyed by a pid a storm controls is a memory leak with extra
+    // steps. Eight names is plenty to point at a culprit.
+    let mut hammering: Vec<i32> = Vec::new();
+
+    loop {
+        if quiet_since.elapsed() >= quiet {
+            return Ok(Drained::Quiet { denied });
+        }
+        if started.elapsed() >= cap {
+            return Ok(Drained::StillBusy {
+                denied,
+                still_hammering: hammering,
+            });
+        }
+        let mut pfd = libc::pollfd {
+            fd: group.as_raw(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 500) } <= 0 {
+            continue;
+        }
+        if pfd.revents & libc::POLLIN == 0 {
+            // An error or hangup on the group fd. Not traffic, so the quiet
+            // window is left alone and the loop can still finish.
+            continue;
+        }
+        // A failure here is not a reason to abandon the mount mid-drain, and it
+        // must not reset the window either, or a persistently failing read would
+        // hold the loop open until the cap for no reason.
+        let len = match group.read_events(&mut buf) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let mut answered_any = false;
+        for ev in crate::fanotify::events(&buf, len) {
+            if ev.fd < 0 {
+                continue;
+            }
+            if deny(group, ev.fd).is_ok() {
+                denied += 1;
+                answered_any = true;
+            }
+            unsafe { libc::close(ev.fd) };
+            if ev.pid != 0 && hammering.len() < 8 && !hammering.contains(&ev.pid) {
+                hammering.push(ev.pid);
+            }
+        }
+        if answered_any {
+            quiet_since = Instant::now();
+        }
+    }
 }
 
 /// Allow one event: the content is in place.
