@@ -877,8 +877,46 @@ fn a_local_rename_is_a_conditional_patch_of_the_object() {
 }
 
 #[test]
-fn a_cross_folder_move_is_refused_until_folder_identity_is_in_the_contract() {
+fn a_cross_folder_move_uses_the_destination_folders_recorded_identity() {
     let rig = Rig::new("move_cross_parent");
+    let from = rig.file("one/report.txt", b"content");
+    let to = rig.root.join("two/report.txt");
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    hydration_client::store::set_xattr(
+        to.parent().unwrap(),
+        hydration_client::store::XATTR_ID,
+        cloud(MINE, "01FOLDER").as_bytes(),
+    )
+    .unwrap();
+    std::fs::rename(&from, &to).unwrap();
+    let id = cloud(MINE, "01REPORT");
+    rig.script(
+        patch(item_url(MINE, "01REPORT"))
+            .body_has("01FOLDER")
+            .with("if-match"),
+        vec![ok(drive_item("01REPORT", "report.txt", 7, "c:{G},2"))],
+    );
+
+    rig.sink()
+        .move_item(
+            &from,
+            &to,
+            Known {
+                cloud_id: &id,
+                tag: Some("ct:c:{G},1"),
+            },
+        )
+        .unwrap();
+
+    let call = only_call(&rig.journal);
+    assert_eq!(call.json()["name"], "report.txt");
+    assert_eq!(call.json()["parentReference"]["id"], "01FOLDER");
+    assert_eq!(call.header("if-match"), Some("c:{G},1"));
+}
+
+#[test]
+fn a_cross_folder_move_without_destination_identity_is_refused_before_graph() {
+    let rig = Rig::new("move_cross_parent_unknown");
     let from = rig.file("one/report.txt", b"content");
     let to = rig.root.join("two/report.txt");
     std::fs::create_dir_all(to.parent().unwrap()).unwrap();
@@ -897,8 +935,8 @@ fn a_cross_folder_move_is_refused_until_folder_identity_is_in_the_contract() {
         )
         .unwrap_err();
 
-    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-    assert!(err.to_string().contains("folder identity"));
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("destination folder"));
     assert!(rig.journal.calls().is_empty());
 }
 

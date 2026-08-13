@@ -154,6 +154,22 @@ fn paths(cs: &[Change]) -> Vec<&str> {
         .collect()
 }
 
+fn file_changes(cs: &[Change]) -> Vec<Change> {
+    cs.iter()
+        .filter(|c| matches!(c, Change::Upserted { .. } | Change::Removed { .. }))
+        .cloned()
+        .collect()
+}
+
+fn folder_paths(cs: &[Change]) -> Vec<&str> {
+    cs.iter()
+        .filter_map(|c| match c {
+            Change::FolderUpserted { path, .. } => Some(path.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 // ===========================================================================
 // DAMAGE CLASS 1 — A mis-read facet is a subtree deletion
 //
@@ -428,10 +444,8 @@ fn an_empty_folder_facet_with_an_aggregate_size_is_a_folder() {
 
     let mut ns = ns_rooted(MINE, "01ROOT");
     let changes = apply_all(&mut ns, &mp.items);
-    assert!(
-        changes.is_empty(),
-        "a folder's aggregate size must reach no Change at all: {changes:?}"
-    );
+    assert!(file_changes(&changes).is_empty(), "{changes:?}");
+    assert_eq!(folder_paths(&changes), vec!["Work"]);
 }
 
 // ===========================================================================
@@ -1553,8 +1567,9 @@ fn a_case_variant_drive_id_is_a_different_drive() {
 
     let mut ns = Namespace::new();
     let changes = apply_all(&mut ns, &mp.items);
-    assert!(changes.is_empty(), "{changes:?}");
-    assert!(ns.listing().is_empty());
+    assert!(file_changes(&changes).is_empty(), "{changes:?}");
+    assert_eq!(folder_paths(&changes), vec![""]);
+    assert!(paths(&ns.listing()).is_empty());
     assert_eq!(ns.pending(), 0);
 }
 
@@ -1599,8 +1614,10 @@ fn the_emitted_parent_is_the_parents_cloud_id_not_its_bare_item_id() {
     apply_all(&mut ns, &mp.items);
     assert_eq!(ns.pending(), 0, "pending: {:?}", ns.pending_ids());
     assert!(ns.problems().is_empty(), "{:?}", ns.problems());
+    let listing = ns.listing();
+    assert_eq!(folder_paths(&listing), vec!["", "Work"]);
     assert_eq!(
-        ns.listing(),
+        file_changes(&listing),
         vec![Change::Upserted {
             cloud_id: cloud(D1, "01BYE5RZ4A7GBFN2SFHZE2S4WGXVDQAWLR"),
             path: "Work/a.txt".into(),
@@ -1777,7 +1794,9 @@ fn a_parent_on_another_drive_is_refused_and_names_the_drive() {
             && upserted_for(&changes, &cloud(D2, "01BYE5RZ4A7GBFN2SFHZE2S4WGXVDQAWLR")).is_empty(),
         "{changes:?}"
     );
-    assert!(ns.listing().is_empty(), "only the root landed");
+    let listing = ns.listing();
+    assert!(paths(&listing).is_empty(), "only the root landed");
+    assert_eq!(folder_paths(&listing), vec![""]);
     assert_eq!(ns.pending(), 0);
 }
 
@@ -2156,8 +2175,9 @@ fn a_whole_page_in_reverse_depth_order_maps_to_full_paths() {
         "{:?}",
         done.report.pending_after_round
     );
+    assert_eq!(folder_paths(&done.changes), vec!["", "Work", "Work/Notes"]);
     assert_eq!(
-        done.changes,
+        file_changes(&done.changes),
         vec![Change::Upserted {
             cloud_id: cloud(D3, "01BYE5DEEP"),
             path: "Work/Notes/deep.txt".into(),
@@ -2553,7 +2573,9 @@ fn a_childless_file_that_becomes_a_folder_is_forwarded_and_the_stale_file_remove
         vec![gone.as_str()],
         "the old file must be removed exactly once: {changes:?}"
     );
-    assert!(ns.listing().is_empty(), "{:?}", ns.listing());
+    let listing = ns.listing();
+    assert!(paths(&listing).is_empty(), "{listing:?}");
+    assert_eq!(folder_paths(&listing), vec!["", "notes"]);
 }
 
 // ===========================================================================
@@ -2634,11 +2656,13 @@ fn every_deleted_state_graph_sends_is_a_delete() {
             vec![doomed.as_str()],
             "\"deleted\":{deleted} removed nothing: {changes:?}"
         );
+        let listing = ns.listing();
         assert!(
-            ns.listing().is_empty(),
+            paths(&listing).is_empty(),
             "\"deleted\":{deleted} left the file in the tree: {:?}",
-            ns.listing()
+            listing
         );
+        assert_eq!(folder_paths(&listing), vec![""]);
     }
 }
 
@@ -2800,8 +2824,9 @@ fn malware_and_a_pending_upload_are_deferred_and_do_not_withhold_the_token() {
         done.report.pending_after_round
     );
 
+    assert_eq!(folder_paths(&done.changes), vec![""]);
     assert_eq!(
-        done.changes,
+        file_changes(&done.changes),
         vec![Change::Upserted {
             cloud_id: cloud(MINE, "01GOOD"),
             path: "good.txt".into(),
@@ -3015,8 +3040,9 @@ fn an_object_touched_on_three_pages_of_one_round_yields_exactly_one_change() {
         .finish()
         .unwrap_or_else(|(e, r)| panic!("three ordinary pages must complete: {e:?} / {r:?}"));
 
+    assert_eq!(folder_paths(&done.changes), vec![""]);
     assert_eq!(
-        done.changes,
+        file_changes(&done.changes),
         vec![Change::Upserted {
             cloud_id: cloud(MINE, "01COAL"),
             path: "b.txt".into(),
@@ -3051,8 +3077,9 @@ fn a_tombstone_and_an_upsert_for_one_id_coalesce_in_feed_order_not_by_type() {
     let done = resurrect
         .finish()
         .unwrap_or_else(|(e, r)| panic!("delete-then-create must complete: {e:?} / {r:?}"));
+    assert_eq!(folder_paths(&done.changes), vec![""]);
     assert_eq!(
-        done.changes,
+        file_changes(&done.changes),
         vec![Change::Upserted {
             cloud_id: id.clone(),
             path: "a.txt".into(),
@@ -3067,8 +3094,9 @@ fn a_tombstone_and_an_upsert_for_one_id_coalesce_in_feed_order_not_by_type() {
     let done = retire
         .finish()
         .unwrap_or_else(|(e, r)| panic!("create-then-delete must complete: {e:?} / {r:?}"));
+    assert_eq!(folder_paths(&done.changes), vec![""]);
     assert_eq!(
-        done.changes,
+        file_changes(&done.changes),
         vec![Change::Removed {
             cloud_id: id.clone()
         }],
@@ -3139,8 +3167,9 @@ fn the_tag_source_selects_the_field_and_its_prefix() {
         &mut ns,
         &map_whole_page_with(&scope, TagSource::QuickXor, &[TAGGED_BOTH]).items,
     );
+    assert!(folder_paths(&changes).is_empty());
     assert_eq!(
-        changes,
+        file_changes(&changes),
         vec![Change::Upserted {
             cloud_id: cloud(MINE, "01TAG"),
             path: "report.pdf".into(),
@@ -3290,8 +3319,9 @@ fn a_file_with_only_an_etag_is_refused_not_mapped_with_no_content_tag() {
 
     let mut ns = Namespace::new();
     let changes = apply_all(&mut ns, &mp.items);
+    assert_eq!(folder_paths(&changes), vec![""]);
     assert_eq!(
-        changes,
+        file_changes(&changes),
         vec![Change::Upserted {
             cloud_id: cloud(MINE, "01GOOD"),
             path: "good.txt".into(),
@@ -3384,8 +3414,9 @@ fn a_file_with_no_size_is_refused_rather_than_reported_as_zero_bytes() {
 
     let mut ns = Namespace::new();
     let changes = apply_all(&mut ns, &mp.items);
+    assert_eq!(folder_paths(&changes), vec![""]);
     assert_eq!(
-        changes,
+        file_changes(&changes),
         vec![Change::Upserted {
             cloud_id: cloud(MINE, "01GOOD"),
             path: "good.txt".into(),
@@ -3497,8 +3528,9 @@ fn a_size_above_max_object_is_refused_and_exactly_max_object_is_accepted() {
 
     let mut ns = Namespace::new();
     let changes = apply_all(&mut ns, &mp.items);
+    assert_eq!(folder_paths(&changes), vec![""]);
     assert_eq!(
-        changes,
+        file_changes(&changes),
         vec![
             Change::Upserted {
                 cloud_id: cloud(MINE, "01SIZEMAX"),

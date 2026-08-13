@@ -1232,32 +1232,13 @@ pub fn map_page(
     out
 }
 
-/// One change per object across the whole round, last occurrence winning.
-///
-/// `Namespace` already does this within a single `apply`, but a round spans
-/// pages: an object touched on page one and again on page three produces two
-/// changes at two different paths, and the later one is the truth. Leaving that
-/// to the reconciler would make this layer depend on exactly what `PROVIDER.md`
-/// tells providers not to depend on.
-fn coalesce(changes: Vec<Change>) -> Vec<Change> {
-    let mut last: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (i, c) in changes.iter().enumerate() {
-        let id = match c {
-            Change::Upserted { cloud_id, .. } | Change::Removed { cloud_id } => cloud_id.clone(),
-        };
-        last.insert(id, i);
+fn change_cloud_id(change: &Change) -> &str {
+    match change {
+        Change::Upserted { cloud_id, .. }
+        | Change::FolderUpserted { cloud_id, .. }
+        | Change::Removed { cloud_id }
+        | Change::FolderRemoved { cloud_id, .. } => cloud_id,
     }
-    changes
-        .iter()
-        .enumerate()
-        .filter(|(i, c)| {
-            let id = match c {
-                Change::Upserted { cloud_id, .. } | Change::Removed { cloud_id } => cloud_id,
-            };
-            last.get(id) == Some(i)
-        })
-        .map(|(_, c)| c.clone())
-        .collect()
 }
 
 /// The inverse of [`ObjectKey::to_cloud_id`].
@@ -1336,8 +1317,8 @@ pub struct Round {
     /// How many items the feed handed this round, mapped and applied.
     ///
     /// Not the same as `changes.len()`, and the difference is the whole reason
-    /// this exists. A new empty folder produces no `Change` — changes are about
-    /// files — but it *does* change the tree, and a round that skipped the tree
+    /// this exists. A new empty folder produces a folder change and changes the
+    /// tree, and a round that skipped the tree
     /// write on an empty change list would advance the token past the folder's
     /// creation with no record of it. A delta feed never re-reports an unchanged
     /// folder, so every file that ever arrives inside it waits for a parent that
@@ -1420,7 +1401,21 @@ impl Round {
 
         for item in mapped.items {
             self.applied += 1;
-            self.changes.extend(self.namespace.apply(item));
+            let changes = self.namespace.apply(item);
+
+            // Graph may report one object more than once across the pages of a
+            // round. The later feed occurrence is authoritative, so discard
+            // changes produced by earlier occurrences before retaining the
+            // complete result of this one. Keeping the result as a group is
+            // important: one occurrence can legitimately emit both a removal
+            // and an upsert when an object's shape changes.
+            let changed_ids: std::collections::BTreeSet<&str> =
+                changes.iter().map(change_cloud_id).collect();
+            if !changed_ids.is_empty() {
+                self.changes
+                    .retain(|change| !changed_ids.contains(change_cloud_id(change)));
+            }
+            self.changes.extend(changes);
         }
 
         if let PageEnd::Done(link) = &page.end {
@@ -1480,7 +1475,7 @@ impl Round {
             ));
         };
         Ok(CompletedRound {
-            changes: coalesce(self.changes),
+            changes: self.changes,
             token,
             report: self.report,
         })
@@ -2188,7 +2183,9 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
                     .0
                     .iter()
                     .filter_map(|c| match c {
-                        Change::Removed { cloud_id } => Some(cloud_id.clone()),
+                        Change::Removed { cloud_id } | Change::FolderRemoved { cloud_id, .. } => {
+                            Some(cloud_id.clone())
+                        }
                         _ => None,
                     })
                     .collect(),
@@ -2449,7 +2446,7 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         let mut removals: Vec<Change> = completed
             .changes
             .into_iter()
-            .filter(|c| matches!(c, Change::Removed { .. }))
+            .filter(|c| matches!(c, Change::Removed { .. } | Change::FolderRemoved { .. }))
             .collect();
         for gone in diff {
             if !removals.contains(&gone) {
@@ -2701,19 +2698,23 @@ pub fn guard_blast_radius(removals: usize, known: usize) -> Result<(), Escalatio
 pub fn deletions_since(before: &[Item], after: &Namespace) -> Result<Vec<Change>, Escalation> {
     let snapshot = after.snapshot();
     let present: std::collections::BTreeSet<&str> = snapshot.iter().map(item_id).collect();
-    // Files only. A folder that vanished takes its contents with it, and every
-    // one of those files is in `before` in its own right — emitting the
-    // container as well would name something the framework has no path for.
-    let gone: Vec<Change> = before
-        .iter()
-        .filter_map(|i| match i {
-            Item::Upsert {
-                id,
-                kind: Kind::File { .. },
-                ..
-            } if !present.contains(id.as_str()) => Some(Change::Removed {
-                cloud_id: id.clone(),
-            }),
+    // Rebuild the prior namespace to recover each vanished folder's path. A
+    // raw snapshot intentionally stores parent ids rather than denormalised
+    // paths, and a folder removal now has to name the local directory whose
+    // identity is being withdrawn.
+    let prior = Namespace::restore(before.to_vec());
+    let gone: Vec<Change> = prior
+        .listing()
+        .into_iter()
+        .filter_map(|change| match change {
+            Change::Upserted { cloud_id, .. } if !present.contains(cloud_id.as_str()) => {
+                Some(Change::Removed { cloud_id })
+            }
+            Change::FolderUpserted { cloud_id, path }
+                if !path.is_empty() && !present.contains(cloud_id.as_str()) =>
+            {
+                Some(Change::FolderRemoved { cloud_id, path })
+            }
             _ => None,
         })
         .collect();
@@ -4184,18 +4185,6 @@ impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K
             .parent()
             .unwrap_or_else(|| std::path::Path::new(""));
         let to_parent = to_rel.parent().unwrap_or_else(|| std::path::Path::new(""));
-        if from_parent != to_parent {
-            // Moving to another parent needs that folder's cloud identity. The
-            // current framework deliberately tracks folders only inside the
-            // provider tree and exposes no local-folder identity to the sink;
-            // guessing by path would make a case-insensitive Graph lookup an
-            // authority over which folder the user meant. Refuse until that
-            // part of the contract is explicit.
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "moving an object between folders requires folder identity, which the sync contract does not expose yet",
-            ));
-        }
         let to_rel = to_rel
             .to_str()
             .ok_or_else(|| refused("the new path below the sync root is not UTF-8"))?;
@@ -4218,7 +4207,31 @@ impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K
         let Some(precondition) = self.precondition(existing.cloud_id) else {
             return Err(no_precondition());
         };
-        let body = serde_json::json!({"name": name}).to_string().into_bytes();
+        let mut patch = serde_json::json!({"name": name});
+        if from_parent != to_parent {
+            let parent = to.parent().ok_or_else(|| {
+                refused("the new path has no destination folder below the sync root")
+            })?;
+            let parent_id = hydration_client::store::get_xattr(
+                parent,
+                hydration_client::store::XATTR_ID,
+            )?
+            .and_then(|raw| String::from_utf8(raw).ok())
+            .ok_or_else(|| {
+                refused(
+                    "the destination folder has no recorded cloud identity; the object was not moved by path",
+                )
+            })?;
+            let parent_key = key_of_cloud_id(&parent_id)
+                .ok_or_else(|| refused("the destination folder's cloud identity is malformed"))?;
+            if parent_key.drive() != key.drive() {
+                return Err(refused(
+                    "moving an object between drives is not a same-drive folder move",
+                ));
+            }
+            patch["parentReference"] = serde_json::json!({"id": parent_key.item().as_str()});
+        }
+        let body = patch.to_string().into_bytes();
         let reply = self.call(
             &Request::new(Method::Patch, item_url(&key))
                 .with_header("if-match", &precondition)

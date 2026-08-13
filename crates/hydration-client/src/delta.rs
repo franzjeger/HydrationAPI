@@ -33,8 +33,14 @@ pub enum Change {
         size: u64,
         etag: Option<String>,
     },
+    /// A cloud folder, including an empty one. The root is represented by an
+    /// empty path so its identity can be recorded on the sync root itself.
+    FolderUpserted { cloud_id: String, path: String },
     /// Gone from the cloud.
     Removed { cloud_id: String },
+    /// A folder gone from the cloud. The path is carried because directories
+    /// are not part of the inode-oriented file store.
+    FolderRemoved { cloud_id: String, path: String },
 }
 
 /// Where a delta pass left off, so the next one does not start over.
@@ -325,6 +331,7 @@ pub fn apply<M: Materialise>(
     // Cloud id -> local file, for the removal half. Built once rather than per
     // change, because a removal names an object and not a path.
     let mut by_cloud_id = store.by_cloud_id();
+    let mut folders = folders_by_cloud_id(root)?;
 
     // At most one change per object, last one winning.
     //
@@ -371,6 +378,75 @@ pub fn apply<M: Materialise>(
         }
         let change = &change;
         match change {
+            Change::FolderUpserted { cloud_id, path } => {
+                let Some(abs) = folder_path(root, path) else {
+                    out.failed.push(Failed::new(path, Failure::PathRefused));
+                    continue;
+                };
+                if let Some(existing) = folders.get(cloud_id) {
+                    if existing != &abs && existing.exists() {
+                        if abs.exists() {
+                            out.failed
+                                .push(Failed::new(path, Failure::DestinationOccupied));
+                            out.retryable = true;
+                            continue;
+                        }
+                        if let Some(parent) = abs.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        if let Err(e) = std::fs::rename(existing, &abs) {
+                            out.failed
+                                .push(Failed::new(path, Failure::Rename(e.to_string())));
+                            out.retryable = true;
+                            continue;
+                        }
+                        out.moved += 1;
+                    }
+                }
+                match std::fs::metadata(&abs) {
+                    Ok(md) if !md.is_dir() => {
+                        out.failed
+                            .push(Failed::new(path, Failure::DestinationOccupied));
+                        out.retryable = true;
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        if let Err(e) = std::fs::create_dir_all(&abs) {
+                            out.failed
+                                .push(Failed::new(path, Failure::Place(e.to_string())));
+                            out.retryable = true;
+                            continue;
+                        }
+                        out.created += 1;
+                    }
+                    Err(e) => {
+                        out.failed
+                            .push(Failed::new(path, Failure::Place(e.to_string())));
+                        out.retryable = true;
+                        continue;
+                    }
+                }
+                let occupied = crate::store::get_xattr(&abs, crate::store::XATTR_ID)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|id| id != cloud_id.as_bytes());
+                if occupied {
+                    out.failed
+                        .push(Failed::new(path, Failure::DestinationOccupied));
+                    out.retryable = true;
+                    continue;
+                }
+                if let Err(e) =
+                    crate::store::set_xattr(&abs, crate::store::XATTR_ID, cloud_id.as_bytes())
+                {
+                    out.failed
+                        .push(Failed::new(path, Failure::Place(e.to_string())));
+                    out.retryable = true;
+                    continue;
+                }
+                folders.insert(cloud_id.clone(), abs);
+            }
             Change::Upserted {
                 cloud_id,
                 path,
@@ -598,6 +674,54 @@ pub fn apply<M: Materialise>(
                     )),
                 }
             }
+            Change::FolderRemoved { cloud_id, path } => {
+                let Some(existing) = folders.get(cloud_id) else {
+                    continue;
+                };
+                if existing == root {
+                    // The provider rejects root deletion, but this boundary is
+                    // destructive enough to defend independently.
+                    out.failed.push(Failed::new(
+                        path,
+                        Failure::Remove("the sync root cannot be removed".into()),
+                    ));
+                    continue;
+                }
+                match std::fs::remove_dir(existing) {
+                    Ok(()) => {
+                        out.removed += 1;
+                        folders.remove(cloud_id);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        folders.remove(cloud_id);
+                    }
+                    // Local content outlives a remote folder deletion. Files
+                    // beneath are reconciled independently; a non-empty folder
+                    // is not recursively erased by this operation.
+                    Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) => {
+                        // The directory has local content, so it survives as a
+                        // local-only folder. Its deleted cloud identity must
+                        // not survive with it: a later cloud folder at this
+                        // path is a different object and must not collide with
+                        // a stale claim.
+                        match crate::store::remove_xattr(existing, crate::store::XATTR_ID) {
+                            Ok(()) => {
+                                folders.remove(cloud_id);
+                            }
+                            Err(e) => {
+                                out.failed
+                                    .push(Failed::new(path, Failure::Remove(e.to_string())));
+                                out.retryable = true;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        out.failed
+                            .push(Failed::new(path, Failure::Remove(e.to_string())));
+                        out.retryable = true;
+                    }
+                }
+            }
         }
     }
     Ok(out)
@@ -650,26 +774,78 @@ pub use hydration_protocol::MAX_OBJECT;
 
 /// One change per object, last occurrence winning, order otherwise preserved.
 fn coalesce(changes: &[Change]) -> Vec<Change> {
-    let mut last: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut last: std::collections::HashMap<(&str, u8), usize> = std::collections::HashMap::new();
     for (i, c) in changes.iter().enumerate() {
         let id = match c {
-            Change::Upserted { cloud_id, .. } | Change::Removed { cloud_id } => cloud_id.as_str(),
+            Change::Upserted { cloud_id, .. }
+            | Change::FolderUpserted { cloud_id, .. }
+            | Change::Removed { cloud_id }
+            | Change::FolderRemoved { cloud_id, .. } => cloud_id.as_str(),
         };
-        last.insert(id, i);
+        last.insert((id, change_class(c)), i);
     }
     changes
         .iter()
         .enumerate()
         .filter(|(i, c)| {
             let id = match c {
-                Change::Upserted { cloud_id, .. } | Change::Removed { cloud_id } => {
-                    cloud_id.as_str()
-                }
+                Change::Upserted { cloud_id, .. }
+                | Change::FolderUpserted { cloud_id, .. }
+                | Change::Removed { cloud_id }
+                | Change::FolderRemoved { cloud_id, .. } => cloud_id.as_str(),
             };
-            last.get(id) == Some(i)
+            last.get(&(id, change_class(c))) == Some(i)
         })
         .map(|(_, c)| c.clone())
         .collect()
+}
+
+fn change_class(change: &Change) -> u8 {
+    match change {
+        Change::Removed { .. } => 0,
+        Change::FolderRemoved { .. } => 1,
+        Change::Upserted { .. } => 2,
+        Change::FolderUpserted { .. } => 3,
+    }
+}
+
+fn folder_path(root: &Path, rel: &str) -> Option<PathBuf> {
+    if rel.is_empty() {
+        Some(root.to_path_buf())
+    } else {
+        safe_join(root, rel)
+    }
+}
+
+fn folders_by_cloud_id(root: &Path) -> io::Result<std::collections::HashMap<String, PathBuf>> {
+    let mut found = std::collections::HashMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Some(raw) = crate::store::get_xattr(&dir, crate::store::XATTR_ID)? {
+            let id = String::from_utf8(raw).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("folder at {} has a non-UTF-8 cloud identity", dir.display()),
+                )
+            })?;
+            if !id.is_empty() {
+                if found.contains_key(&id) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("folder cloud identity {id:?} is claimed more than once"),
+                    ));
+                }
+                found.insert(id, dir.clone());
+            }
+        }
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn file_id(md: &std::fs::Metadata) -> FileId {

@@ -192,6 +192,8 @@ fn items_stuck_forever_do_not_slow_down_everything_else() {
 fn a_folder_move_costs_time_proportional_to_what_it_moves() {
     let (mut small, small_files) = build(6, 20);
     let (mut large, large_files) = build(12, 40);
+    let small_changes = small_files + 1 + 6 + 6 * 6;
+    let large_changes = large_files + 1 + 12 + 12 * 12;
     assert!(
         large_files > small_files * 7,
         "the sizes are too close to compare"
@@ -199,15 +201,15 @@ fn a_folder_move_costs_time_proportional_to_what_it_moves() {
 
     // Warm, then measure. Both trees are already built, so this times the
     // expansion alone.
-    assert_eq!(move_top(&mut small, "warm"), small_files);
-    assert_eq!(move_top(&mut large, "warm"), large_files);
+    assert_eq!(move_top(&mut small, "warm"), small_changes);
+    assert_eq!(move_top(&mut large, "warm"), large_changes);
 
     let t = Instant::now();
-    assert_eq!(move_top(&mut small, "A"), small_files);
+    assert_eq!(move_top(&mut small, "A"), small_changes);
     let small_time = t.elapsed().as_secs_f64().max(1e-6);
 
     let t = Instant::now();
-    assert_eq!(move_top(&mut large, "A"), large_files);
+    assert_eq!(move_top(&mut large, "A"), large_changes);
     let large_time = t.elapsed().as_secs_f64();
 
     let ratio = large_time / small_time;

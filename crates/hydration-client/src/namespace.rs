@@ -201,7 +201,7 @@ impl Namespace {
     pub fn listing(&self) -> Vec<Change> {
         let mut out = Vec::new();
         if let Some(root) = &self.root {
-            self.collect_files(root, &mut out);
+            self.collect_tree(root, &mut out);
         }
         finalise(out)
     }
@@ -306,6 +306,10 @@ impl Namespace {
                         kind: Kind::Folder,
                     },
                 );
+                out.push(Change::FolderUpserted {
+                    cloud_id: id.clone(),
+                    path: String::new(),
+                });
                 Some(id)
             }
             Item::Upsert {
@@ -417,12 +421,22 @@ impl Namespace {
                     });
                 }
             }
-            // A folder is not a change by itself — directories are implied by
-            // the paths of the files in them. But a folder that *moved* changes
-            // the path of everything beneath it, and the service will not say so
-            // again. This is the whole reason this module exists.
-            Kind::Folder if moved || reshaped => self.collect_files(&id, out),
-            Kind::Folder | Kind::Opaque => {}
+            Kind::Folder if previous.is_none() || moved || reshaped => {
+                if let Some(path) = self.path_of(&id) {
+                    out.push(Change::FolderUpserted {
+                        cloud_id: id.clone(),
+                        path,
+                    });
+                }
+                // A folder move changes every descendant path, and the service
+                // reports only the folder. Re-emit the subtree after the folder
+                // itself so reconciliation can follow the directory identity.
+                if moved || reshaped {
+                    self.collect_descendants(&id, out);
+                }
+            }
+            Kind::Folder => {}
+            Kind::Opaque => {}
         }
         Some(id)
     }
@@ -436,23 +450,41 @@ impl Namespace {
             return;
         };
 
-        // Files first, gathered before anything is unlinked — afterwards there
+        // Descendants first, gathered before anything is unlinked — afterwards there
         // is no way to walk it.
         let mut doomed = Vec::new();
         self.collect_ids(id, &mut doomed);
         for gone in &doomed {
             if let Some(n) = self.nodes.get(gone) {
-                if matches!(n.kind, Kind::File { .. }) {
-                    out.push(Change::Removed {
+                match n.kind {
+                    Kind::File { .. } => out.push(Change::Removed {
                         cloud_id: gone.clone(),
-                    });
+                    }),
+                    Kind::Folder => {
+                        if let Some(path) = self.path_of(gone) {
+                            out.push(Change::FolderRemoved {
+                                cloud_id: gone.clone(),
+                                path,
+                            });
+                        }
+                    }
+                    Kind::Opaque => {}
                 }
             }
         }
-        if matches!(node.kind, Kind::File { .. }) {
-            out.push(Change::Removed {
+        match node.kind {
+            Kind::File { .. } => out.push(Change::Removed {
                 cloud_id: id.to_string(),
-            });
+            }),
+            Kind::Folder => {
+                if let Some(path) = self.path_of(id) {
+                    out.push(Change::FolderRemoved {
+                        cloud_id: id.to_string(),
+                        path,
+                    });
+                }
+            }
+            Kind::Opaque => {}
         }
 
         for gone in doomed {
@@ -540,8 +572,8 @@ impl Namespace {
         true
     }
 
-    /// Every file at or beneath `id`, as upserts at their current paths.
-    fn collect_files(&self, id: &str, out: &mut Vec<Change>) {
+    /// Everything at or beneath `id`, as upserts at current paths.
+    fn collect_tree(&self, id: &str, out: &mut Vec<Change>) {
         let mut stack = vec![id.to_string()];
         let mut seen = BTreeSet::new();
         while let Some(cur) = stack.pop() {
@@ -564,10 +596,25 @@ impl Namespace {
                 }
                 // Never walked into. Its contents are one document.
                 Kind::Opaque => continue,
-                Kind::Folder => {}
+                Kind::Folder => {
+                    if let Some(path) = self.path_of(&cur) {
+                        out.push(Change::FolderUpserted {
+                            cloud_id: cur.clone(),
+                            path,
+                        });
+                    }
+                }
             }
             if let Some(kids) = self.children.get(&cur) {
                 stack.extend(kids.iter().cloned());
+            }
+        }
+    }
+
+    fn collect_descendants(&self, id: &str, out: &mut Vec<Change>) {
+        if let Some(kids) = self.children.get(id) {
+            for child in kids {
+                self.collect_tree(child, out);
             }
         }
     }
@@ -616,19 +663,19 @@ impl Namespace {
 /// would make this module depend on exactly what `PROVIDER.md` tells providers
 /// not to depend on.
 fn finalise(changes: Vec<Change>) -> Vec<Change> {
-    let mut last: HashMap<&str, usize> = HashMap::new();
+    let mut last: HashMap<(&str, u8), usize> = HashMap::new();
     for (i, c) in changes.iter().enumerate() {
-        last.insert(id_of(c), i);
+        last.insert((id_of(c), class_of(c)), i);
     }
     let mut kept: Vec<Change> = changes
         .iter()
         .enumerate()
-        .filter(|(i, c)| last.get(id_of(c)) == Some(i))
+        .filter(|(i, c)| last.get(&(id_of(c), class_of(c))) == Some(i))
         .map(|(_, c)| c.clone())
         .collect();
     kept.sort_by(|a, b| {
-        depth_of(a)
-            .cmp(&depth_of(b))
+        order_of(a)
+            .cmp(&order_of(b))
             .then_with(|| sort_key(a).cmp(sort_key(b)))
     });
     kept
@@ -662,22 +709,39 @@ fn bad_name(name: &str) -> Option<String> {
 
 fn id_of(c: &Change) -> &str {
     match c {
-        Change::Upserted { cloud_id, .. } | Change::Removed { cloud_id } => cloud_id,
+        Change::Upserted { cloud_id, .. }
+        | Change::FolderUpserted { cloud_id, .. }
+        | Change::Removed { cloud_id }
+        | Change::FolderRemoved { cloud_id, .. } => cloud_id,
     }
 }
 
 fn sort_key(c: &Change) -> &str {
     match c {
-        Change::Upserted { path, .. } => path,
+        Change::Upserted { path, .. }
+        | Change::FolderUpserted { path, .. }
+        | Change::FolderRemoved { path, .. } => path,
         Change::Removed { cloud_id } => cloud_id,
     }
 }
 
-fn depth_of(c: &Change) -> usize {
+fn class_of(c: &Change) -> u8 {
     match c {
-        // Removals carry no path and are not ordered against anything.
         Change::Removed { .. } => 0,
-        Change::Upserted { path, .. } => path.matches('/').count() + 1,
+        Change::FolderRemoved { .. } => 1,
+        Change::Upserted { .. } => 2,
+        Change::FolderUpserted { .. } => 3,
+    }
+}
+
+fn order_of(c: &Change) -> (u8, usize) {
+    match c {
+        // File removals were emitted before their containing folder removal.
+        Change::Removed { .. } => (0, 0),
+        Change::FolderRemoved { path, .. } => (1, usize::MAX - path.matches('/').count()),
+        Change::Upserted { path, .. } | Change::FolderUpserted { path, .. } => {
+            (2, path.matches('/').count() + usize::from(!path.is_empty()))
+        }
     }
 }
 
@@ -728,6 +792,16 @@ mod tests {
         v
     }
 
+    fn folders(changes: &[Change]) -> Vec<(String, String)> {
+        changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::FolderUpserted { cloud_id, path } => Some((cloud_id.clone(), path.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// `/Work/{a.txt, Notes/b.txt}`.
     fn tree() -> Namespace {
         let mut ns = Namespace::new();
@@ -751,10 +825,13 @@ mod tests {
     }
 
     #[test]
-    fn a_new_folder_is_not_a_change() {
+    fn a_new_folder_is_an_explicit_change_even_when_empty() {
         let mut ns = Namespace::new();
         ns.apply(Item::Root { id: "R".into() });
-        assert!(ns.apply(folder("F", "R", "Work")).is_empty());
+        assert_eq!(
+            folders(&ns.apply(folder("F", "R", "Work"))),
+            [("F".into(), "Work".into())]
+        );
     }
 
     /// The reason this module exists.
@@ -996,7 +1073,7 @@ mod tests {
 
         let out = ns.apply(folder("F", "R", "Work"));
         assert!(
-            out.is_empty(),
+            paths(&out).is_empty(),
             "a deleted item was resurrected when its parent arrived: {out:?}"
         );
     }
