@@ -739,6 +739,12 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // A failure to start watching is survivable and is not silent. What
             // it costs is that local deletions stop reaching the cloud, which is
             // a sync that is behind rather than one that destroys anything.
+            // Bridges the gap between an upload settling and the delta pass
+            // writing it down. Cleared wholesale rather than aged: every entry
+            // is superseded within a delta round, so the only thing a precise
+            // eviction policy would buy is a more interesting way to be wrong.
+            let mut recent: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             let mut removals = match crate::removals::Removals::watch(&mount) {
                 Ok(w) => {
                     eprintln!(
@@ -824,7 +830,26 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 }
                 for file in due {
                     q.lock().unwrap().begin(file);
+                    // Captured before the send, because afterwards the file may
+                    // already be gone — which is precisely the case this is for.
+                    let sent_path = store
+                        .lookup(&file)
+                        .and_then(|e| crate::lineage::relative(&mount, &e.path));
                     let outcome = run_upload(file, &mut store, &mut sink);
+                    // What this thread just created, so a file deleted before the
+                    // delta pass next scans can still be withdrawn.
+                    //
+                    // Measured 2026-08-13: a file uploaded and deleted sixteen
+                    // seconds later resolved to nothing, because the lineage
+                    // record is written by the delta scan and that runs every
+                    // thirty. The upload driver knew the object it had just made
+                    // and told nobody.
+                    if let (Outcome::Sent { cloud_id }, Some(rel)) = (&outcome, &sent_path) {
+                        if recent.len() >= RECENT_SENDS {
+                            recent.clear();
+                        }
+                        recent.insert(rel.clone(), cloud_id.clone());
+                    }
                     {
                         let mut queue = q.lock().unwrap();
                         queue.finish(file);
@@ -857,7 +882,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         );
                     }
                     if !gone.is_empty() {
-                        apply_removals(&mount, &gone, &mut sink);
+                        apply_removals(&mount, &gone, &recent, &mut sink);
                     }
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -1224,6 +1249,13 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
 /// purpose.
 const REMOVAL_BATCH_LIMIT: usize = 100;
 
+/// How many just-sent objects the upload driver remembers for the removal path.
+///
+/// Only has to outlive one delta round, after which the lineage record carries
+/// the same fact durably. Generous enough that an initial sync's worth of sends
+/// does not evict the one file the user is about to delete.
+const RECENT_SENDS: usize = 4096;
+
 /// What the framework knows about the object that used to be at a path.
 ///
 /// Two registers, because the framework keeps the two halves of its tree in
@@ -1289,10 +1321,18 @@ impl Registers {
 /// Called only with names the kernel reported as removed — never with an
 /// absence. `removals` explains at length why that distinction is the whole
 /// design and not a nicety.
-fn apply_removals<S: Sink>(root: &std::path::Path, gone: &[crate::removals::Gone], sink: &mut S) {
+fn apply_removals<S: Sink>(
+    root: &std::path::Path,
+    gone: &[crate::removals::Gone],
+    recent: &std::collections::HashMap<String, String>,
+    sink: &mut S,
+) {
     if gone.len() > REMOVAL_BATCH_LIMIT {
         eprintln!(
-            "hydration-sync: {} files were deleted here at once, which is more than              this will remove from the cloud without being asked ({REMOVAL_BATCH_LIMIT}).              Nothing was removed; the files are still in the cloud and will come back              on the next delta pass. First few: {}",
+            "hydration-sync: {} files were deleted here at once, which is more than this \
+             will remove from the cloud without being asked ({REMOVAL_BATCH_LIMIT}). \
+             Nothing was removed; the files are still in the cloud and will come back \
+             on the next delta pass. First few: {}",
             gone.len(),
             gone.iter()
                 .take(5)
@@ -1310,7 +1350,11 @@ fn apply_removals<S: Sink>(root: &std::path::Path, gone: &[crate::removals::Gone
         } else {
             "deleted from"
         };
-        let Some(cloud_id) = registers.cloud_id(root, &g.path) else {
+        let Some(cloud_id) = recent
+            .get(g.path.as_str())
+            .cloned()
+            .or_else(|| registers.cloud_id(root, &g.path))
+        else {
             // Not an error. A file created here and never uploaded has no object
             // to withdraw, and that is the ordinary case for scratch files.
             eprintln!(
