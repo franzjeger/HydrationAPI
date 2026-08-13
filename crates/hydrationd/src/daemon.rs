@@ -164,6 +164,76 @@ pub enum Handled {
     },
 }
 
+/// How much detail a [`FailureLog`] keeps before it starts counting only.
+///
+/// The counts are exact however many failures arrive; what is bounded is the
+/// per-file detail. A daemon that runs for days on a link that drops must not
+/// grow a list until it is the reason the machine is short of memory — the
+/// denial log has that shape and gets away with it because a policy refusal is
+/// rare by construction, which a network fault is not.
+const FAILURES_KEPT: usize = 64;
+
+/// Every read that was answered with `EIO` because something broke.
+///
+/// Deliberately not folded into [`DenialLog`]. That log answers §6c's question —
+/// "what is my backup being refused, and why" — and every entry in it is a
+/// decision this helper made on purpose. These are faults. Counted together,
+/// "restic was refused 412 times" and "the link dropped 412 times" become the
+/// same sentence, and the first is a setting to change while the second is a
+/// thing to fix.
+///
+/// What this exists to stop coming back: `Handled::Failed` is returned from
+/// seven places in this file and answers `FAN_DENY` at all of them, and until
+/// this was added not one of them recorded anything anywhere. A photo that would
+/// not open left the reader with `EIO` and the journal with nothing in it, which
+/// is the same failure as inventing a diagnostic — the person debugging it is
+/// told something untrue, here by silence.
+#[derive(Debug, Default)]
+pub struct FailureLog {
+    counts: std::collections::BTreeMap<String, usize>,
+    recent: std::collections::VecDeque<Failure>,
+    total: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub reason: String,
+    pub path: Option<String>,
+}
+
+impl FailureLog {
+    pub fn record(&mut self, reason: &str, path: Option<&Path>) {
+        self.total += 1;
+        *self.counts.entry(reason.to_string()).or_default() += 1;
+        if self.recent.len() == FAILURES_KEPT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(Failure {
+            reason: reason.to_string(),
+            path: path.map(|p| p.display().to_string()),
+        });
+    }
+
+    /// Exact, and not the length of [`recent`](Self::recent).
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// The last few, with their paths — which is what a person debugging one
+    /// unopenable file actually needs.
+    pub fn recent(&self) -> impl DoubleEndedIterator<Item = &Failure> {
+        self.recent.iter()
+    }
+
+    /// Grouped by reason, for the same argument [`DenialLog::summary`] groups by
+    /// rule: "412 reads failed: connection reset by peer" is the sentence, not
+    /// 412 lines. Reasons carry their specifics, so distinct causes stay
+    /// distinct rather than collapsing into one number.
+    pub fn summary(&self) -> Vec<(String, usize)> {
+        self.counts.iter().map(|(r, n)| (r.clone(), *n)).collect()
+    }
+}
+
 /// A [`Fetch`] you can give up on.
 ///
 /// §6a-bis, first requirement: **the worker must have a per-event deadline.** A
@@ -578,7 +648,11 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            first_byte: std::time::Duration::from_secs(30),
+            // Named rather than repeated: the provider has to plan inside this
+            // number, and a copy of it here would let the two drift apart
+            // silently — which is how a transport came to sleep for five
+            // minutes under a thirty-second budget.
+            first_byte: hydration_protocol::FIRST_BYTE_BUDGET,
             stall: std::time::Duration::from_secs(60),
             total: std::time::Duration::from_secs(600),
         }
@@ -630,6 +704,11 @@ pub struct Worker<F: Fetch> {
     limits: Limits,
     /// So a denial count is announced when it changes rather than every loop.
     reported_denials: usize,
+    /// Reads that were answered `EIO` because something broke rather than
+    /// because policy said so. See [`FailureLog`].
+    pub failures: FailureLog,
+    /// As `reported_denials`, for the same reason.
+    reported_failures: usize,
     _fetch: std::marker::PhantomData<F>,
 }
 
@@ -679,6 +758,8 @@ impl<F: Fetch + 'static> Worker<F> {
             partial: partial::Partial::default(),
             limits,
             reported_denials: 0,
+            failures: FailureLog::default(),
+            reported_failures: 0,
             _fetch: std::marker::PhantomData,
         }
     }
@@ -705,8 +786,10 @@ impl<F: Fetch + 'static> Worker<F> {
     pub fn handle(&mut self, ev: &fanotify::Event) -> Handled {
         let fd = ev.fd;
         if fd < 0 {
+            let reason = "event carried no fd";
+            self.failures.record(reason, None);
             return Handled::Failed {
-                reason: "event carried no fd".into(),
+                reason: reason.into(),
             };
         }
 
@@ -723,6 +806,20 @@ impl<F: Fetch + 'static> Worker<F> {
                     .unwrap_or_else(|_| format!("fd {fd}"))
             );
         }
+        // Recorded here rather than at the seven places that construct it, and
+        // while the fd is still open so the path can still be resolved — after
+        // the `close` below there is nothing left to name the file with.
+        //
+        // `Denied` and `Abandoned` record themselves where they are decided,
+        // because both carry a *reason of their own* that this site cannot see:
+        // which policy rule fired, and which limit was reached. `Failed` carries
+        // its reason in the value, so one site catches every path to it and
+        // there is no eighth one to forget.
+        if let Handled::Failed { reason } = &outcome {
+            let path = path_of(fd).ok();
+            self.failures.record(reason, path.as_deref());
+        }
+
         let r = match &outcome {
             Handled::Hydrated { .. }
             | Handled::Served { .. }
@@ -736,9 +833,12 @@ impl<F: Fetch + 'static> Worker<F> {
         unsafe { libc::close(fd) };
 
         if let Err(e) = r {
-            return Handled::Failed {
-                reason: format!("could not answer the event: {e}"),
-            };
+            // No path: the fd is closed by now, and this is the one failure that
+            // has to be recorded after the response rather than before it,
+            // because it *is* the response failing.
+            let reason = format!("could not answer the event: {e}");
+            self.failures.record(&reason, None);
+            return Handled::Failed { reason };
         }
         outcome
     }
@@ -1238,6 +1338,30 @@ impl<F: Fetch + 'static> Worker<F> {
                 eprintln!(
                     "[worker] hydration denied {denials} time(s) so far: {:?}",
                     self.log.summary()
+                );
+            }
+
+            // The same rule, applied to the outcome it was never applied to. A
+            // refusal being visible is §6c; a *fault* being visible is the same
+            // requirement reached from the reader's side, because the reader
+            // cannot tell the two apart — both arrive as `EIO`.
+            //
+            // The path of the most recent one is printed, not just the counts.
+            // Grouped reasons answer "is this happening a lot"; a person with
+            // one file that will not open needs to see that file named.
+            let failures = self.failures.total();
+            if failures != self.reported_failures {
+                self.reported_failures = failures;
+                let last = self
+                    .failures
+                    .recent()
+                    .next_back()
+                    .and_then(|f| f.path.clone())
+                    .unwrap_or_else(|| "-".into());
+                eprintln!(
+                    "[worker] hydration FAILED {failures} time(s) so far, every one of them \
+                     answering EIO to a reader; most recent: {last}: {:?}",
+                    self.failures.summary()
                 );
             }
 

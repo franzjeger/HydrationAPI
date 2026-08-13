@@ -98,6 +98,7 @@ run hydrationd placeholder_creation
 run hydrationd deadlines
 run hydrationd reconnect
 run hydrationd ranges
+run hydrationd failure_visibility
 run hydrationd pidfd
 # The client's own privileged suite: it mounts and detaches a filesystem of its
 # own underneath $MOUNT, which needs root for the same reason the helper's do.

@@ -151,87 +151,13 @@ impl Provider for GraphProvider {
         // 4 KiB read, and it is recorded here rather than left to be discovered.
         match content_tag.and_then(|tag| tag.strip_prefix("qx:")) {
             Some(expected) if span.is_whole(size) => {
-                let mut verified = QuickXorWriter::new(out);
+                let mut verified = crate::QuickXorWriter::new(out);
                 self.http.download_span(&key, span, size, &mut verified)?;
                 verified.verify(expected)
             }
             _ => self.http.download_span(&key, span, size, out),
         }
     }
-}
-
-/// Streaming implementation of Microsoft's published 160-bit QuickXorHash.
-/// The bytes are never buffered beyond the HTTP client's own read buffer.
-struct QuickXorWriter<W> {
-    inner: W,
-    digest: [u8; 20],
-    length: u64,
-}
-
-impl<W> QuickXorWriter<W> {
-    fn new(inner: W) -> Self {
-        Self {
-            inner,
-            digest: [0; 20],
-            length: 0,
-        }
-    }
-
-    fn verify(mut self, expected: &str) -> io::Result<()> {
-        for (slot, byte) in self.digest[12..].iter_mut().zip(self.length.to_le_bytes()) {
-            *slot ^= byte;
-        }
-        if base64_20(&self.digest) == expected {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Graph content did not match its QuickXorHash",
-            ))
-        }
-    }
-}
-
-impl<W: Write> Write for QuickXorWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(buf)?;
-        for &byte in &buf[..written] {
-            let shift = (self.length % 160) as usize * 11 % 160;
-            let value = (byte as u16) << (shift % 8);
-            let cell = shift / 8;
-            self.digest[cell] ^= value as u8;
-            self.digest[(cell + 1) % 20] ^= (value >> 8) as u8;
-            self.length += 1;
-        }
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-fn base64_20(bytes: &[u8; 20]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(28);
-    for chunk in bytes.chunks(3) {
-        let value = (chunk[0] as u32) << 16
-            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
-            | chunk.get(2).copied().unwrap_or(0) as u32;
-        out.push(ALPHABET[((value >> 18) & 63) as usize] as char);
-        out.push(ALPHABET[((value >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[((value >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(value & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 pub struct GraphAccess {
@@ -283,6 +209,51 @@ impl GraphAccess {
     pub fn shared_token_cache(&self) -> SharedTokenCache {
         Arc::clone(&self.cache)
     }
+
+    /// The tag source every tag on this drive was actually written with.
+    ///
+    /// The constructor takes one, and the persisted tree pins one, and until
+    /// this existed nothing made the two agree. Measured on a live account on
+    /// 2026-08-13: the tree was pinned to `CTag`, every extended attribute on
+    /// disk held a `ct:` value, and the product passed `QuickXor`. The mapper
+    /// followed the pin and the sink followed the argument, so
+    /// `GraphSink::precondition` returned `None` on its first line — a drive
+    /// whose tags are hashes has nothing Graph accepts as a precondition — and
+    /// every update to an object that already existed was refused. No amount of
+    /// carrying the right tag to the sink could have helped: it was not looking
+    /// at the tag.
+    ///
+    /// The pin wins because it is not a preference. It is the record of what the
+    /// values on disk *are*, and `delta::is_current` compares them byte for
+    /// byte. The constructor's value is what to pin when there is nothing
+    /// pinned yet, which is the first round against a new account and the only
+    /// moment the choice is still open.
+    ///
+    /// Said out loud when they disagree. The argument is a caller's belief about
+    /// this drive, and a caller that is wrong about it should hear so once
+    /// rather than have it quietly corrected forever.
+    fn tags_in_force(&self) -> TagSource {
+        let pinned = FileStateStore::new(&self.state_dir)
+            .load()
+            .ok()
+            .flatten()
+            .and_then(|state| state.tree().map(|t| t.tag_source()))
+            .and_then(Result::ok);
+        match pinned {
+            Some(pin) if pin != self.tags => {
+                eprintln!(
+                    "hydration-graph: this drive's tags are pinned to {pin:?} and the \
+                     caller asked for {:?}; using {pin:?}, which is what every tag \
+                     already written here is. An upload cannot be made conditional on \
+                     a tag of a shape the drive does not use.",
+                    self.tags
+                );
+                pin
+            }
+            Some(pin) => pin,
+            None => self.tags,
+        }
+    }
 }
 impl CloudAccess for GraphAccess {
     type Fetch = GraphProvider;
@@ -297,7 +268,7 @@ impl CloudAccess for GraphAccess {
         Ok(GraphSink::new(
             self.scope.clone(),
             &self.root,
-            self.tags,
+            self.tags_in_force(),
             GraphHttp::new(Arc::clone(&self.cache)),
             SystemSleeper,
         ))
@@ -356,6 +327,54 @@ mod tests {
             AuthConfig::public_client("client").with_scopes(["Files.ReadWrite.All"]),
             TagSource::CTag,
         )
+    }
+
+    /// A drive's tags are what is already written on it, not what a caller
+    /// believes.
+    ///
+    /// Measured on a live account on 2026-08-13. The persisted tree was pinned
+    /// to `CTag`, every `user.hydration.etag` on disk held a `ct:` value, and
+    /// the product passed `QuickXor`. The mapper followed the pin and the sink
+    /// followed the argument, so `GraphSink::precondition` refused on its first
+    /// line — a drive whose tags are hashes has nothing Graph accepts as an
+    /// `if-match` — and no update to an object that already existed had ever
+    /// succeeded. Six files sat unsent for hours with the tag they needed in
+    /// their own extended attributes.
+    ///
+    /// One value, supplied twice, with nothing checking they agreed.
+    #[test]
+    fn the_sink_follows_the_tag_source_the_drive_is_pinned_to() {
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let drive = crate::DriveId::parse("drive").unwrap();
+        FileStateStore::new(&state)
+            .save_tree(&TreeBlob::encode(&drive, TagSource::CTag, &[]))
+            .unwrap();
+
+        let access = GraphAccess::with_token_cache(
+            DriveScope::primary(drive),
+            d.path().join("mount"),
+            &state,
+            // What the product passed, and what the drive is not.
+            TagSource::QuickXor,
+            access(d.path()).shared_token_cache(),
+        );
+
+        assert_eq!(
+            access.tags_in_force(),
+            TagSource::CTag,
+            "the sink would judge this drive's cTags as though they were hashes, \
+             and refuse every update to a file that already exists"
+        );
+    }
+
+    /// And before there is a tree, the caller's value is the one that gets
+    /// pinned — which is the only moment the choice is still open.
+    #[test]
+    fn with_nothing_pinned_yet_the_callers_choice_stands() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(access(d.path()).tags_in_force(), TagSource::CTag);
     }
 
     #[test]
@@ -431,9 +450,9 @@ mod tests {
 
     fn quickxor(bytes: &[u8]) -> String {
         let mut out = Vec::new();
-        let mut writer = QuickXorWriter::new(&mut out);
+        let mut writer = crate::QuickXorWriter::new(&mut out);
         writer.write_all(bytes).unwrap();
-        let expected = base64_20(&{
+        let expected = crate::base64_20(&{
             let mut digest = writer.digest;
             for (slot, byte) in digest[12..].iter_mut().zip(writer.length.to_le_bytes()) {
                 *slot ^= byte;
@@ -460,14 +479,14 @@ mod tests {
         let bytes = (0_u8..=255).cycle().take(100_003).collect::<Vec<_>>();
         let expected = quickxor(&bytes);
         let mut out = Vec::new();
-        let mut writer = QuickXorWriter::new(&mut out);
+        let mut writer = crate::QuickXorWriter::new(&mut out);
         for chunk in bytes.chunks(7919) {
             writer.write_all(chunk).unwrap();
         }
         writer.verify(&expected).unwrap();
         assert_eq!(out, bytes);
 
-        let mut writer = QuickXorWriter::new(Vec::new());
+        let mut writer = crate::QuickXorWriter::new(Vec::new());
         writer.write_all(b"tampered").unwrap();
         let err = writer.verify("AAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

@@ -20,7 +20,7 @@
 use hydration_client::delta::{apply, safe_join, Applied, Change, Failed, Failure};
 use hydration_client::place::TmpfilePlacer;
 use hydration_client::store::{self, Store};
-use hydration_client::upload::{run_upload, Outcome, Queue, Sink, TestClock, Uploaded};
+use hydration_client::upload::{run_upload, Known, Outcome, Queue, Sink, TestClock, Uploaded};
 use hydration_protocol::{stamp, FileId};
 use std::collections::HashSet;
 use std::io;
@@ -317,7 +317,7 @@ fn a_very_deep_path_fails_cleanly_rather_than_panicking() {
 fn an_upload_that_fails_leaves_the_file_dirty_and_retryable() {
     struct FailsAfterCommit;
     impl Sink for FailsAfterCommit {
-        fn upload(&mut self, _p: &Path, _e: Option<&str>) -> io::Result<Uploaded> {
+        fn upload(&mut self, _p: &Path, _e: Option<Known<'_>>) -> io::Result<Uploaded> {
             Err(io::Error::new(io::ErrorKind::TimedOut, "gateway timeout"))
         }
         fn remove(&mut self, _id: &str) -> io::Result<()> {
@@ -347,8 +347,12 @@ fn an_upload_that_fails_leaves_the_file_dirty_and_retryable() {
 fn a_service_that_changes_the_id_on_update_is_recorded_correctly() {
     struct Renumbers;
     impl Sink for Renumbers {
-        fn upload(&mut self, _p: &Path, existing: Option<&str>) -> io::Result<Uploaded> {
-            assert_eq!(existing, Some("cloud-old"), "the old id was not offered");
+        fn upload(&mut self, _p: &Path, existing: Option<Known<'_>>) -> io::Result<Uploaded> {
+            assert_eq!(
+                existing.map(|k| k.cloud_id),
+                Some("cloud-old"),
+                "the old id was not offered"
+            );
             Ok(Uploaded {
                 cloud_id: "cloud-new".into(),
                 etag: Some("v2".into()),
@@ -381,7 +385,7 @@ fn a_throttled_upload_is_retried_rather_than_dropped() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct Throttles(AtomicUsize);
     impl Sink for Throttles {
-        fn upload(&mut self, _p: &Path, _e: Option<&str>) -> io::Result<Uploaded> {
+        fn upload(&mut self, _p: &Path, _e: Option<Known<'_>>) -> io::Result<Uploaded> {
             if self.0.fetch_add(1, Ordering::SeqCst) < 2 {
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, "429 slow down"));
             }
@@ -527,7 +531,7 @@ fn a_change_for_a_vanished_file_is_not_an_error() {
 
     struct NeverCalled;
     impl Sink for NeverCalled {
-        fn upload(&mut self, p: &Path, _e: Option<&str>) -> io::Result<Uploaded> {
+        fn upload(&mut self, p: &Path, _e: Option<Known<'_>>) -> io::Result<Uploaded> {
             panic!("uploaded a file that does not exist: {}", p.display())
         }
         fn remove(&mut self, _id: &str) -> io::Result<()> {

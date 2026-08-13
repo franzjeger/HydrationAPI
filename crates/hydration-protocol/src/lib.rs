@@ -349,12 +349,25 @@ pub mod names {
     /// Lives in the sync root. Named so it sorts early and reads as what it is.
     pub const MANIFEST: &str = ".hydration-manifest";
 
+    /// What the framework last knew about the object at each path.
+    ///
+    /// In the sync root rather than in a daemon's state directory, because it
+    /// describes *these files*: a sync root that is moved, or attached to a
+    /// rebuilt daemon, keeps the record of what its edits are based on. It is
+    /// never uploaded — `is_internal` sees to that — so it does not reach the
+    /// cloud or any other device.
+    pub const LINEAGE: &str = ".hydration-lineage";
+
     /// True for anything the framework wrote for its own purposes.
     ///
     /// Matched on the file name alone, so it holds at any depth — scratch names
     /// are created wherever a placeholder is, which is wherever the cloud says.
     pub fn is_internal(name: &str) -> bool {
-        name == MANIFEST || name == concat!(".hydration-manifest", ".tmp") || is_scratch(name)
+        name == MANIFEST
+            || name == concat!(".hydration-manifest", ".tmp")
+            || name == LINEAGE
+            || name == concat!(".hydration-lineage", ".tmp")
+            || is_scratch(name)
     }
 
     /// A half-finished placeholder rename: `.<base>.hydration-<seq>`.
@@ -563,6 +576,28 @@ pub const MAX_CHUNK: u64 = 1 << 20;
 /// process may rely on. Two checks for one rule, the same argument the length
 /// check already makes.
 pub const MAX_OBJECT: u64 = 1 << 40;
+
+/// How long a fetcher has to produce its first byte before the read it is
+/// serving is failed.
+///
+/// It lives here, in the crate both sides can see, because it is a term of the
+/// contract between them rather than a setting either one owns. The helper
+/// enforces it — `hydrationd::daemon::Limits` — and the provider has to plan
+/// inside it, and until this constant existed the provider could not read the
+/// number it was being judged against.
+///
+/// What that cost, measured on a live account on 2026-08-13: the Graph transport
+/// obeys a `Retry-After` up to five minutes, four times over, under a budget of
+/// thirty seconds. Every one of those sleeps past the first is arithmetic that
+/// cannot come out — the read is already going to be failed — and because the
+/// worker serves one event at a time, the sleeping thread takes every other
+/// queued read down with it. A single throttled file becomes a folder of
+/// unopenable ones.
+///
+/// A provider that cannot start inside this must say so and be failed *now*,
+/// with a reason. Sleeping through it converts a diagnosable throttle into an
+/// anonymous timeout.
+pub const FIRST_BYTE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Anything the daemon may send.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -218,7 +218,17 @@ impl Provider for FolderCloud {
 }
 
 impl Sink for FolderCloud {
-    fn upload(&mut self, path: &Path, existing: Option<&str>) -> io::Result<Uploaded> {
+    fn upload(
+        &mut self,
+        path: &Path,
+        existing: Option<crate::upload::Known<'_>>,
+    ) -> io::Result<Uploaded> {
+        // The demo provider has no notion of a version, so the tag it is offered
+        // is not consulted. Named rather than ignored with `..`: an implementor
+        // copying this needs to see that a real provider makes the write
+        // conditional on it, and that declining to is a choice this one can
+        // afford because nothing else writes to the folder it syncs.
+        let existing = existing.map(|k| k.cloud_id);
         // Read at send time, like the name — see upload rule 2.
         let content = std::fs::read(path)?;
         // The *root-relative* path, not the basename.

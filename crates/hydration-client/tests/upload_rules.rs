@@ -6,7 +6,7 @@
 //! time is that reproducing them by sleeping does not work.
 
 use hydration_client::store::{self, Store};
-use hydration_client::upload::{run_upload, Outcome, Queue, Sink, TestClock, Uploaded};
+use hydration_client::upload::{run_upload, Known, Outcome, Queue, Sink, TestClock, Uploaded};
 use hydration_protocol::FileId;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -48,7 +48,7 @@ impl Recorder {
 }
 
 impl Sink for Recorder {
-    fn upload(&mut self, path: &Path, _existing: Option<&str>) -> io::Result<Uploaded> {
+    fn upload(&mut self, path: &Path, _existing: Option<Known<'_>>) -> io::Result<Uploaded> {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         self.ops.lock().unwrap().push(format!("PUT {name}"));
         // The upload is in flight from here until it returns.
@@ -352,7 +352,7 @@ fn an_edit_during_the_upload_is_not_recorded_as_sent() {
     /// an impatient user amounts to.
     struct EditsMidFlight;
     impl Sink for EditsMidFlight {
-        fn upload(&mut self, path: &Path, _existing: Option<&str>) -> io::Result<Uploaded> {
+        fn upload(&mut self, path: &Path, _existing: Option<Known<'_>>) -> io::Result<Uploaded> {
             let sent = std::fs::read(path)?;
             // The user saves again before the transfer finishes.
             std::fs::write(path, b"a much later version written during the upload")?;
@@ -385,4 +385,40 @@ fn an_edit_during_the_upload_is_not_recorded_as_sent() {
         "the edit that landed during the upload was recorded as sent; it will \
          never be re-queued and the next remote change will destroy it"
     );
+}
+
+/// git creates its pack files 0444, and the kernel gates `user.*` attributes on
+/// write permission to the inode — not on ownership, and not on how it was
+/// opened. So a file its owner can chmod at will still refuses.
+///
+/// Measured on a live account on 2026-08-13. Three pack files whose identity an
+/// atomic save had destroyed were successfully matched to their cloud objects by
+/// content, and then could not be told what they were: `adopt_cloud_id` failed
+/// with `EACCES`, the upload was re-queued, and it would have repeated forever.
+/// The recovery worked and could not be written down.
+#[test]
+fn a_read_only_file_can_still_be_told_which_object_it_is() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch("read-only-adopt");
+    let p = dir.join("pack.pack");
+    std::fs::write(&p, b"as git writes them").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let mut store = Store::new();
+    store.scan(&dir).unwrap();
+    store
+        .adopt_cloud_id(&p, "cloud-1", Some("ct:1"))
+        .expect("a file git made read-only could not be told which object it is");
+
+    let md = std::fs::metadata(&p).unwrap();
+    assert_eq!(
+        md.permissions().mode() & 0o777,
+        0o444,
+        "the file was left writable; something else had deliberately protected it"
+    );
+    let id = hydration_client::store::get_xattr(&p, hydration_client::store::XATTR_ID)
+        .unwrap()
+        .expect("the id was not recorded");
+    assert_eq!(id, b"cloud-1");
 }

@@ -853,6 +853,9 @@ fn resume_copy(
 ) -> io::Result<()> {
     let mut written = 0u64;
     let mut retries = 0u32;
+    // Time spent asleep between attempts. The first-byte budget above this
+    // function is being spent on it whether or not anything arrives.
+    let mut slept = Duration::ZERO;
     loop {
         let offset = written;
         let mut sink_failed = false;
@@ -881,8 +884,37 @@ fn resume_copy(
                 "Graph content download exhausted its retry budget",
             ));
         }
+        let wait = retry_after.unwrap_or(DOWNLOAD_BACKOFF);
+        // The retry budget is a count; this is the one that decides whether any
+        // of those retries can still do something useful.
+        //
+        // A read is held open by a filesystem operation that may not be
+        // signalled away, and `FIRST_BYTE_BUDGET` is how long the helper will
+        // hold it. A sleep that ends after that has already expired is not a
+        // retry: the read has been failed, the caller is gone, and the only
+        // thing the sleep accomplishes is to occupy the fetcher — which serves
+        // one event at a time, so every read queued behind this one is failed
+        // as well. That is how one throttled file became a folder of
+        // unopenable ones on 2026-08-13.
+        //
+        // Failing here instead spends the same read but says why, which the
+        // helper's failure log then shows against the file's name.
+        if slept.saturating_add(wait) >= hydration_protocol::FIRST_BYTE_BUDGET {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "Graph is throttling this download: it asked for {}s before a retry, \
+                     {}s have already been spent waiting, and a hydration read may only be \
+                     held for {}s",
+                    wait.as_secs(),
+                    slept.as_secs(),
+                    hydration_protocol::FIRST_BYTE_BUDGET.as_secs()
+                ),
+            ));
+        }
+        slept = slept.saturating_add(wait);
         retries += 1;
-        sleep(retry_after.unwrap_or(DOWNLOAD_BACKOFF));
+        sleep(wait);
     }
 }
 
@@ -1197,6 +1229,74 @@ mod tests {
         assert_eq!(offsets, [0, 0]);
         assert_eq!(sleeps, [Duration::from_secs(7)]);
         assert_eq!(out, b"data");
+    }
+
+    /// The measured defect: a throttle longer than the read may be held for.
+    ///
+    /// Graph answers `429` with a `Retry-After` of a minute. The helper will
+    /// hold the read for thirty seconds. Sleeping is then a way of failing
+    /// slowly — and because the worker serves one event at a time, of failing
+    /// everything queued behind it as well.
+    #[test]
+    fn a_throttle_longer_than_the_read_may_be_held_for_fails_at_once() {
+        let mut sleeps = Vec::new();
+        let mut attempts = 0;
+        let error = resume_copy(
+            4,
+            &mut Vec::new(),
+            |_, _| {
+                attempts += 1;
+                Ok(DownloadAttempt::Retry(Some(Duration::from_secs(60))))
+            },
+            |delay| sleeps.push(delay),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            sleeps,
+            Vec::<Duration>::new(),
+            "slept through a budget it could not come back inside"
+        );
+        assert_eq!(attempts, 1, "asked again after being told to wait a minute");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        // The message is the product here. Before this existed the read was
+        // failed with nothing recorded anywhere, and "throttled" and "the
+        // network is down" were the same silence.
+        let said = error.to_string();
+        assert!(
+            said.contains("throttling") && said.contains("60s"),
+            "the error did not say it was a throttle or for how long: {said}"
+        );
+    }
+
+    /// And the bound is on the total, not on any single sleep.
+    ///
+    /// Four ten-second waits are individually fine and together are past the
+    /// budget. A check that only looked at one delay would pass the test above
+    /// and still spend forty seconds of a thirty-second read.
+    #[test]
+    fn short_throttles_that_add_up_past_the_budget_also_stop() {
+        let mut sleeps = Vec::new();
+        let error = resume_copy(
+            4,
+            &mut Vec::new(),
+            |_, _| Ok(DownloadAttempt::Retry(Some(Duration::from_secs(10)))),
+            |delay| sleeps.push(delay),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_secs(10), Duration::from_secs(10)],
+            "the total slept was not held under {}s",
+            hydration_protocol::FIRST_BYTE_BUDGET.as_secs()
+        );
+        let total: Duration = sleeps.iter().sum();
+        assert!(
+            total < hydration_protocol::FIRST_BYTE_BUDGET,
+            "slept {total:?}, which is not inside the budget it is spending"
+        );
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

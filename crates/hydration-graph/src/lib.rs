@@ -787,6 +787,107 @@ impl DriveItem {
     }
 }
 
+// The QuickXorHash lives here rather than beside the transport that verifies
+// downloads with it. It is an algorithm, not a socket, and the collision
+// reconciliation in `put_at_path` needs it in a build with no HTTP feature at
+// all — which is how it came to be referenced through a module that did not
+// exist there.
+/// Streaming implementation of Microsoft's published 160-bit QuickXorHash.
+/// The bytes are never buffered beyond the HTTP client's own read buffer.
+pub(crate) struct QuickXorWriter<W> {
+    inner: W,
+    digest: [u8; 20],
+    length: u64,
+}
+
+impl<W> QuickXorWriter<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self {
+            inner,
+            digest: [0; 20],
+            length: 0,
+        }
+    }
+
+    pub(crate) fn verify(mut self, expected: &str) -> io::Result<()> {
+        for (slot, byte) in self.digest[12..].iter_mut().zip(self.length.to_le_bytes()) {
+            *slot ^= byte;
+        }
+        if base64_20(&self.digest) == expected {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Graph content did not match its QuickXorHash",
+            ))
+        }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for QuickXorWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        for &byte in &buf[..written] {
+            let shift = (self.length % 160) as usize * 11 % 160;
+            let value = (byte as u16) << (shift % 8);
+            let cell = shift / 8;
+            self.digest[cell] ^= value as u8;
+            self.digest[(cell + 1) % 20] ^= (value >> 8) as u8;
+            self.length += 1;
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// QuickXorHash of a whole buffer, in the form Graph reports it.
+///
+/// Used to answer one question and only one: is the object already in the cloud
+/// at this name byte for byte the same document as the local file? A hash is
+/// exactly the right instrument for that and exactly the wrong one for a
+/// precondition, which is why `TagSource::QuickXor` is not used as an
+/// `if-match` and this is not used as a version.
+pub fn quickxor_of(bytes: &[u8]) -> String {
+    use std::io::Write as _;
+    let mut sink = std::io::sink();
+    let mut w = QuickXorWriter::new(&mut sink);
+    // Writing to a sink cannot fail, and a hash that silently gave up would
+    // answer "not the same" and turn a safe reconciliation into a conflict.
+    if w.write_all(bytes).is_err() {
+        return String::new();
+    }
+    for (slot, byte) in w.digest[12..].iter_mut().zip(w.length.to_le_bytes()) {
+        *slot ^= byte;
+    }
+    base64_20(&w.digest)
+}
+
+pub(crate) fn base64_20(bytes: &[u8; 20]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(28);
+    for chunk in bytes.chunks(3) {
+        let value = (chunk[0] as u32) << 16
+            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
+            | chunk.get(2).copied().unwrap_or(0) as u32;
+        out.push(ALPHABET[((value >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((value >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((value >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(value & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// The content version, from the source the caller pinned.
 ///
 /// Prefixed, and never silently substituted. A source that quietly falls back
@@ -1232,6 +1333,20 @@ pub struct Round {
     report: Report,
     token: Option<DeltaLink>,
     escalation: Option<Escalation>,
+    /// How many items the feed handed this round, mapped and applied.
+    ///
+    /// Not the same as `changes.len()`, and the difference is the whole reason
+    /// this exists. A new empty folder produces no `Change` — changes are about
+    /// files — but it *does* change the tree, and a round that skipped the tree
+    /// write on an empty change list would advance the token past the folder's
+    /// creation with no record of it. A delta feed never re-reports an unchanged
+    /// folder, so every file that ever arrives inside it waits for a parent that
+    /// will never come. `a_round_that_produced_no_changes_still_persists_its_
+    /// tree` is that failure, written down.
+    ///
+    /// An empty *feed*, though, is an empty round: nothing was applied, so the
+    /// tree on disk is still the tree.
+    applied: usize,
     /// Every placeholder-to-far-drive pair the round has seen.
     ///
     /// Kept here rather than dropped in `feed`, because the fan-out is decided
@@ -1253,6 +1368,7 @@ impl Round {
             report: Report::default(),
             token: None,
             escalation: None,
+            applied: 0,
             mounts: Vec::new(),
         }
     }
@@ -1303,6 +1419,7 @@ impl Round {
         }
 
         for item in mapped.items {
+            self.applied += 1;
             self.changes.extend(self.namespace.apply(item));
         }
 
@@ -1313,6 +1430,12 @@ impl Round {
 
     pub fn namespace(&self) -> &Namespace {
         &self.namespace
+    }
+
+    /// How many items the feed handed this round. Zero means the tree on disk is
+    /// still the tree.
+    pub fn applied(&self) -> usize {
+        self.applied
     }
 
     // The error side is large because a refused round carries its whole report,
@@ -1956,7 +2079,9 @@ impl StoredView {
 /// restored tree no longer holds emits no `Change` at all. The position
 /// recovers; the removal does not. So the pair moves together or not at all.
 struct Uncommitted {
-    tree: TreeBlob,
+    /// `None` when the round changed nothing and the tree on disk is still the
+    /// one this token was derived after.
+    tree: Option<TreeBlob>,
     token: TokenBlob,
 }
 
@@ -1964,6 +2089,13 @@ struct Uncommitted {
 struct Attempt {
     listing: Vec<Change>,
     removals: Vec<Change>,
+    /// Whether this round listed the drive from nothing rather than resuming a
+    /// token, which is one of the two states in which the tree must be written
+    /// whatever the feed said.
+    enumerated: bool,
+    /// How many items the feed handed this round. Zero means nothing was applied
+    /// and the tree on disk is still the tree.
+    applied: usize,
     items: Vec<Item>,
     mounts: Vec<MountPoint>,
     tokens: TokenBlob,
@@ -2083,7 +2215,9 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
-        self.store.save_tree(&pending.tree)?;
+        if let Some(tree) = &pending.tree {
+            self.store.save_tree(tree)?;
+        }
         self.store.save_token(&pending.token)
     }
 
@@ -2293,6 +2427,7 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
 
         let listing = round.namespace().listing();
         let items = round.namespace().snapshot();
+        let applied = round.applied();
         // Taken before `finish` consumes the round, and *before* the round's own
         // verdict is applied — but only unwrapped after it, so a round that was
         // going to escalate anyway is reported as what it is rather than as a
@@ -2325,6 +2460,8 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         Ok(Attempt {
             listing,
             removals,
+            enumerated: enumerate,
+            applied,
             items,
             mounts,
             tokens,
@@ -2356,14 +2493,52 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         // every ordering assertion and destroys the state a refusal was
         // protecting: the next round starts from a tree that agrees with the
         // page it refused to trust.
-        let generation = stored.generation + 1;
-        let tree = encode_tree(
-            self.scope.drive(),
-            done.tags,
-            &done.items,
-            &done.mounts,
-            generation,
-        );
+        // A round that changed nothing does not rewrite the tree.
+        //
+        // `encode_tree` serialises every object on the drive and `commit` writes
+        // the result. Measured on a live account on 2026-08-13: 167,890 objects,
+        // 67.6 MB, written every eight seconds to record that the cloud had not
+        // moved. That is where the daemon's 45% of a core went, and it grows
+        // with the user's file count, which is what made a large folder feel
+        // like the client's limit rather than the client's bug.
+        //
+        // The generation is what makes skipping it safe. A token may never be
+        // newer than the tree it was written after — that pair is unrecoverable
+        // and costs a full re-enumeration — so the token keeps the generation
+        // the tree on disk already carries. Equal is allowed; ahead is not.
+        // "Nothing was applied", not "no changes were emitted".
+        //
+        // A new empty folder emits no `Change` and still changes the tree, and
+        // `a_round_that_produced_no_changes_still_persists_its_tree` is the
+        // failure that follows from confusing the two: the token advances past
+        // the folder's creation, the feed never re-reports an unchanged folder,
+        // and every file that later arrives inside it waits forever for a parent
+        // that will never come. Sync stops permanently, on a folder.
+        //
+        // An empty feed is a different thing entirely. Nothing was applied, so
+        // the tree on disk is still the tree, and the only thing that moved is
+        // the delta link.
+        let unchanged = !done.enumerated
+            && done.applied == 0
+            && done.removals.is_empty()
+            && done.mounts == stored.mounts
+            && stored.tags == Some(done.tags);
+        let generation = if unchanged {
+            stored.generation
+        } else {
+            stored.generation + 1
+        };
+        let tree = if unchanged {
+            None
+        } else {
+            Some(encode_tree(
+                self.scope.drive(),
+                done.tags,
+                &done.items,
+                &done.mounts,
+                generation,
+            ))
+        };
 
         let mut token = done.tokens;
         token.generation = generation;
@@ -2393,6 +2568,20 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         // placeholder the user deleted locally never comes back — and the
         // restart is exactly when the framework has lost every other way to find
         // out. Removals first: they free the paths the upserts may claim.
+        // The batch is the tree plus this round's removals, never the round's
+        // own change list. After a restart the framework's `Store` knows only
+        // what is on disk, so filtering to what the service said changed means a
+        // placeholder the user deleted locally never comes back — and the
+        // restart is exactly when the framework has lost every other way to find
+        // out. Removals first: they free the paths the upserts may claim.
+        //
+        // Narrowing this to the round's own changes was tried, on the grounds
+        // that the five hundredth quiet round has nothing new to re-assert, and
+        // `a_quiet_steady_state_round_reports_the_tree_rather_than_an_empty_batch`
+        // refused it. It is right to: a quiet round would then be
+        // `(vec![], new_cursor)`, which is the shape PROVIDER.md:103 forbids and
+        // which one framework version ago consumed a refusal that had been
+        // deliberately held back.
         let mut batch = done.removals;
         batch.extend(done.listing);
         Ok((batch, cursor))
@@ -2850,6 +3039,21 @@ const WRITE_SELECT: &[&str] = &[
     "parentReference",
 ];
 
+/// The metadata of whatever object currently holds a name.
+///
+/// Path-addressed on purpose, and it is the only read in this crate that is. It
+/// answers one question — what is already sitting at the name a create just
+/// collided with — and an id cannot ask it, because not knowing the id is the
+/// whole situation.
+fn path_metadata_url(drive: &DriveId, rel: &str) -> String {
+    format!(
+        "{}/root:/{}?$select={}",
+        drive_base(drive),
+        encode_path(rel),
+        WRITE_SELECT.join(",")
+    )
+}
+
 fn item_metadata_url(key: &ObjectKey) -> String {
     format!("{}?$select={}", item_url(key), WRITE_SELECT.join(","))
 }
@@ -3165,6 +3369,30 @@ fn service_refused(what: &str, status: u16, body: &[u8]) -> io::Error {
 /// refuses every update to an object that already exists, and the framework then
 /// keeps the file visibly unsent instead of overwriting a stranger's edit with
 /// it.
+/// What was about to be written, kept only long enough to compare it.
+struct Sent {
+    len: u64,
+    hash: String,
+}
+
+/// Whether a refused write was refused because the *name* is taken.
+///
+/// By the service's own error code, never by the status alone: 409 also carries
+/// quota and locking refusals, and treating those as a name collision would send
+/// this into a content comparison that answers a question nobody asked.
+fn collided_on_name(status: u16, body: &[u8]) -> bool {
+    status == 409
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string)
+            })
+            .is_some_and(|c| c == "nameAlreadyExists")
+}
+
 fn no_precondition() -> io::Error {
     refused(
         "this drive offers no value the service accepts as a precondition, so the \
@@ -3383,9 +3611,80 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
     }
 
     /// A whole file as one `PUT`, at a name the drive may or may not hold.
+    /// Whether the object already at `rel` is byte for byte what we just tried
+    /// to send.
+    ///
+    /// `Ok(Some(u))` means it is, and `u` names it — the caller adopts that
+    /// identity and no write is made. `Ok(None)` means it is a different
+    /// document. `Err` means the question could not be answered, which is a
+    /// third thing and must not be collapsed into the second: reporting "they
+    /// differ" for a request that failed would strand a file for a reason that
+    /// was never established.
+    ///
+    /// Size first, because it is free and settles almost every case. The hash is
+    /// what makes the answer a proof rather than a guess — two files of the same
+    /// length are routine, and a length check alone would adopt a stranger's
+    /// object whenever it happened to match, which is the exact failure the
+    /// collision branch exists to prevent.
+    fn reconcile_by_content(
+        &mut self,
+        drive: &DriveId,
+        rel: &str,
+        sent: &Sent,
+    ) -> io::Result<Option<Uploaded>> {
+        let reply = self.call(&Request::new(Method::Get, path_metadata_url(drive, rel)))?;
+        if !(200..300).contains(&reply.status) {
+            return Err(service_refused(
+                "the object already at this name could not be read",
+                reply.status,
+                &reply.body,
+            ));
+        }
+        let item: DriveItem = serde_json::from_slice(&reply.body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        let body = item.body();
+        // The name has to match exactly, and this is not pedantry.
+        //
+        // Graph resolves a path case-insensitively, so `report.txt` finds an
+        // object named `Report.txt` and answers `409 nameAlreadyExists` for a
+        // create at either. If the two happen to hold the same bytes — an
+        // ordinary thing for a copy — adopting on content alone would give two
+        // distinct local files one object id. Both would read Clean, and
+        // deleting either would remove the object the other depends on. The
+        // existing `two_local_names_differing_only_in_case_stay_two_objects`
+        // caught precisely that, which is what a suite is for.
+        let ours = rel.rsplit('/').next().unwrap_or(rel);
+        if item.name.as_deref() != Some(ours) {
+            return Ok(None);
+        }
+        // `as_u64` the same way the mapper does: the service sends this as a
+        // number or as a string depending on the endpoint, and a size that will
+        // not convert is a size we do not know.
+        if body.size.and_then(|v| v.as_u64()) != Some(sent.len) {
+            return Ok(None);
+        }
+        // A drive that reports no hash cannot prove anything, and an unproven
+        // adoption is the thing this must not do.
+        let Some(theirs) = body.hashes.and_then(|h| h.quick_xor_hash.as_deref()) else {
+            return Ok(None);
+        };
+        if theirs != sent.hash || sent.hash.is_empty() {
+            return Ok(None);
+        }
+        self.settle(drive, &reply.body).map(Some)
+    }
+
     fn put_at_path(&mut self, rel: &str, body: Vec<u8>) -> io::Result<Uploaded> {
         check_relative_name(rel)?;
         let drive = self.scope.drive().clone();
+        // Hashed before the body is handed to the request, which consumes it.
+        // Only paid for when the write collides — the hash is cheap next to the
+        // transfer that just happened, and it is the only thing that can tell a
+        // stranger's file from this one.
+        let sent = Sent {
+            len: body.len() as u64,
+            hash: quickxor_of(&body),
+        };
         let request = Request::new(
             Method::Put,
             // Never `replace`, and never `rename`. A create has never seen the
@@ -3406,6 +3705,38 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
             // then evict the local file, the next read fetches their document,
             // and when the user deletes their own file the framework calls
             // `remove` on the stranger's object.
+            //
+            // Every one of those consequences rests on the object being a
+            // *stranger's*. If the bytes already at that name are the bytes we
+            // were about to send, it is not a stranger's document — it is this
+            // one, and adopting its id is not a write at all. Evicting and
+            // refetching gives back the same content; removing it removes the
+            // object the file actually is.
+            //
+            // So the collision is reconciled when, and only when, the content
+            // can be proved identical. This is what strands a file whose
+            // extended attributes were destroyed by an atomic save before
+            // anything recorded them: it has no id, the create collides, and
+            // until now the answer was to fail forever. Measured on a live
+            // account on 2026-08-13 — five files, retried in a loop for hours,
+            // three of them git pack files whose names are content-addressed
+            // and which therefore could never have differed.
+            _ if collided_on_name(reply.status, &reply.body) => {
+                match self.reconcile_by_content(&drive, rel, &sent) {
+                    Ok(Some(u)) => Ok(u),
+                    Ok(None) => Err(refused(
+                        "a different file already exists in the cloud under this name, and this \
+                         copy has no record of which version it was based on, so it \
+                         cannot be sent without overwriting that one blind",
+                    )),
+                    // Could not find out. Not the same as "they differ", and it
+                    // must not be reported as though it were.
+                    Err(e) => Err(io::Error::other(format!(
+                        "a file already exists in the cloud under this name, and whether it \
+                         holds the same content could not be established: {e}"
+                    ))),
+                }
+            }
             _ => Err(service_refused(
                 "the create was refused",
                 reply.status,
@@ -3724,7 +4055,11 @@ enum Transferred {
 }
 
 impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K> {
-    fn upload(&mut self, path: &std::path::Path, existing: Option<&str>) -> io::Result<Uploaded> {
+    fn upload(
+        &mut self,
+        path: &std::path::Path,
+        existing: Option<hydration_client::upload::Known<'_>>,
+    ) -> io::Result<Uploaded> {
         // §5.5 states the absence rule about the moment an upload *finishes*.
         // The moment it starts is the same fact: `run_upload` folds `ENOENT`
         // into `None` and calls this anyway, so the path is routinely one that
@@ -3761,7 +4096,8 @@ impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K
 
         let target = match existing {
             None => None,
-            Some(cloud_id) => {
+            Some(known) => {
+                let cloud_id = known.cloud_id;
                 let Some(key) = key_of_cloud_id(cloud_id) else {
                     // A junk id is a damaged record of *which* object this file
                     // is. Creating a second one instead would put the same
@@ -3773,6 +4109,33 @@ impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K
                          no object this write could be addressed at",
                     ));
                 };
+                // Seed this process's memory from the framework's durable
+                // record, so a conditional write has something to be conditional
+                // on.
+                //
+                // Without this, `known` is populated by `record_tag` — and
+                // `record_tag` was called from forty-three tests and from
+                // nothing else in either repository. On a live account the map
+                // was therefore always empty, `precondition` always answered
+                // `None`, and every update to an object that already existed was
+                // refused for want of a precondition. Measured 2026-08-13: six
+                // files sat unsent for hours, retried in a loop, while the tag
+                // each one was based on lay in its own `user.hydration.etag`.
+                //
+                // `or_insert`, never overwrite: what this process learned from a
+                // completed round is at least as fresh as what is on the file,
+                // and the tag an update may carry is the one it is *based on* —
+                // taking the newer of the two is how a precondition stops being
+                // able to fail.
+                //
+                // A stale tag is the safe direction to be wrong in. It fails the
+                // `if-match` and the edit stays queued and visible, which is the
+                // outcome this whole path exists to choose over a blind write.
+                if let Some(tag) = known.tag {
+                    self.known
+                        .entry(cloud_id.to_string())
+                        .or_insert_with(|| tag.to_string());
+                }
                 Some((key, cloud_id.to_string()))
             }
         };

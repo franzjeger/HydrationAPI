@@ -54,7 +54,7 @@ use std::time::Duration;
 use hydration_client::delta::Change;
 use hydration_client::namespace::Namespace;
 use hydration_client::store::{self, Store};
-use hydration_client::upload::{run_upload, Outcome as RunOutcome, Sink, Uploaded};
+use hydration_client::upload::{run_upload, Known, Outcome as RunOutcome, Sink, Uploaded};
 use hydration_graph::{
     DeltaPage, DriveId, DriveScope, GraphSink, ItemId, Method, ObjectKey, Reply, Request, Round,
     Sleeper, TagSource, Transport, UploadPolicy, FRAGMENT_QUANTUM, MAX_FRAGMENT_BYTES,
@@ -82,6 +82,20 @@ fn item_id(s: &str) -> ItemId {
     ItemId::parse(s).unwrap_or_else(|e| panic!("fixture item id {s:?} must parse: {e:?}"))
 }
 
+/// The framework's `Known`, carrying an id and no tag.
+///
+/// No tag on purpose: these tests seed the sink's own memory with `record_tag`,
+/// so they go on measuring the provider's recollection of a completed round.
+/// The path where the *framework* supplies the tag — the one that had never run
+/// outside a test — is covered separately, by the test that calls no
+/// `record_tag` at all.
+fn at(id: &str) -> Option<Known<'_>> {
+    Some(Known {
+        cloud_id: id,
+        tag: None,
+    })
+}
+
 /// The expected `cloud_id`, built the only way the crate permits one to be
 /// built. Every identity assertion in this file goes through here rather than
 /// through a hand-written `"b!mine|01X"`, so a change to the separator cannot
@@ -101,6 +115,11 @@ fn primary(drive: &str) -> DriveScope {
 /// `PUT`ting content at an object the sink knows the id of.
 fn item_content(drive: &str, item: &str) -> String {
     format!("{BASE}/drives/{drive}/items/{item}/content")
+}
+
+/// Reading the metadata of whatever object holds a drive-root-relative path.
+fn path_meta(drive: &str, rel: &str) -> String {
+    format!("{BASE}/drives/{drive}/root:/{rel}")
 }
 
 /// `PUT`ting content at a drive-root-relative path. The create form.
@@ -128,6 +147,27 @@ fn upload_url(tag: &str) -> String {
 }
 
 // --- bodies ----------------------------------------------------------------
+
+/// A drive item that also carries the QuickXorHash Graph reports for content.
+///
+/// `drive_item` deliberately has none — most of this file is about tags and
+/// names, where a hash would be noise. The collision-reconciliation path is the
+/// one place the hash is the whole answer.
+fn hashed_item(id: &str, name: &str, body: &[u8], ctag: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "name": name,
+        "size": body.len(),
+        "cTag": ctag,
+        "eTag": ctag,
+        "file": {
+            "mimeType": "application/octet-stream",
+            "hashes": {"quickXorHash": hydration_graph::quickxor_of(body)},
+        },
+        "parentReference": {"driveId": MINE, "id": ROOT},
+    })
+    .to_string()
+}
 
 fn drive_item(id: &str, name: &str, size: u64, ctag: &str) -> String {
     serde_json::json!({
@@ -814,7 +854,7 @@ fn an_update_writes_to_the_item_id_never_to_the_path() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     let call = only_call(&rig.journal);
     assert_eq!(
@@ -876,7 +916,7 @@ fn an_update_creates_an_item_addressed_session_never_a_path_addressed_one() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     let sessions: Vec<Rec> = rig
         .journal
@@ -921,7 +961,7 @@ fn content_replacement_never_deletes_first() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     assert!(
         rig.journal.deletes().is_empty(),
@@ -951,7 +991,7 @@ fn a_failed_write_never_deletes_the_destination() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     assert!(out.is_err(), "a 500 is a failure, not a success");
     assert!(
@@ -1167,7 +1207,7 @@ fn a_412_is_terminal_and_never_retries_unconditionally_creates_or_returns_ok() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     assert!(
         out.is_err(),
@@ -1203,7 +1243,7 @@ fn an_update_with_no_usable_precondition_is_refused_rather_than_written_blind() 
     let mut sink = rig.sink_with(MINE, TagSource::QuickXor, UploadPolicy::default());
     // A quickXor tree records a hash. Nothing here is a valid `if-match`.
     sink.record_tag(&cloud(MINE, "01NOTES"), "qx:BAJk9sAAAAAAAAAAAAAAAAAAAAA=");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01NOTES")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01NOTES")));
 
     // Not "every write carries some if-match": `if-match: *` and `if-match:
     // qx:BAJk9s…` are both headers, both pass such a check, and both are the
@@ -1250,7 +1290,7 @@ fn the_precondition_is_the_tag_the_upload_is_based_on_not_one_just_read_back() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     let writes = rig.journal.writes();
     match writes.first() {
@@ -1282,7 +1322,7 @@ fn a_renumbered_update_returns_the_new_composed_id_and_removes_nothing() {
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01OLD"), "ct:c:{G},1");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01OLD")))
+        .upload(&path, at(&cloud(MINE, "01OLD")))
         .expect("the write succeeded");
 
     assert_eq!(
@@ -1391,7 +1431,7 @@ fn every_create_session_states_its_conflict_behaviour_and_never_replaces_without
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let updated = sink.upload(&update, Some(&cloud(MINE, "01A")));
+    let updated = sink.upload(&update, at(&cloud(MINE, "01A")));
     let made = sink.upload(&create, None);
 
     // Both are scripted end to end. Discarding the results let a sink that
@@ -1475,7 +1515,7 @@ fn a_202_on_the_last_fragment_is_not_a_successful_upload() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01BIG"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01BIG")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01BIG")));
 
     assert!(
         out.is_err(),
@@ -1529,7 +1569,7 @@ fn a_202_on_a_fragment_is_progress_and_is_never_a_completed_upload() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     assert!(out.is_err(), "no fragment was ever answered 200 or 201");
     let frags = fragments(&rig.journal, &u);
@@ -1586,7 +1626,7 @@ fn a_file_that_changed_during_a_session_is_not_committed_as_a_splice() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01BIG"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01BIG")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01BIG")));
 
     let frags = fragments(&rig.journal, &u);
     // The `<= 1` and the loop below are both true of an empty log, and the
@@ -1656,7 +1696,7 @@ fn a_session_does_not_commit_after_the_item_changed_under_it() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01BIG"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01BIG")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01BIG")));
 
     assert!(out.is_err(), "the object moved on under the session");
     let calls = rig.journal.calls();
@@ -1799,7 +1839,7 @@ fn the_cloud_id_comes_from_the_commit_response_not_from_the_existing_id() {
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01OLD"), "ct:c:{G},1");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01OLD")))
+        .upload(&path, at(&cloud(MINE, "01OLD")))
         .expect("the session committed");
 
     assert_eq!(
@@ -1853,7 +1893,7 @@ fn a_commit_response_without_a_content_tag_never_yields_ok_with_no_etag() {
     // upload that already happened, forever, so `Err` is not an acceptable way
     // to avoid inventing a tag — reading the tag back is.
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01A")))
+        .upload(&path, at(&cloud(MINE, "01A")))
         .expect("the commit succeeded, so the call succeeded");
 
     assert_eq!(
@@ -1910,7 +1950,7 @@ fn abandoning_a_session_never_deletes_the_drive_item() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     assert!(out.is_err(), "a 400 mid-session is a failure");
     let calls = rig.journal.calls();
@@ -1961,7 +2001,7 @@ fn positive_control_an_abandoned_session_is_cancelled_at_the_upload_url() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     assert!(out.is_err(), "the call still fails");
     let cancels: Vec<Rec> = rig
@@ -2019,7 +2059,7 @@ fn a_retried_fragment_resends_the_same_bytes_from_the_same_offset() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     assert!(out.is_ok(), "a retried fragment is recoverable: {out:?}");
     let frags = fragments(&rig.journal, &u);
@@ -2081,7 +2121,7 @@ fn a_416_is_resolved_by_asking_the_server_where_it_is() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     assert_eq!(
         out.expect("the session recovered").cloud_id,
@@ -2169,7 +2209,7 @@ fn the_servers_next_expected_ranges_outrank_the_local_byte_counter() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     let frags = fragments(&rig.journal, &u);
     let backwards = frags
@@ -2231,7 +2271,7 @@ fn a_next_expected_range_is_a_starting_point_not_a_fragment_size() {
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
     // Every continuation is scripted through to a commit, so a discarded result
     // hid the case where the sink gives up after the odd range.
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
     assert!(
         out.is_ok(),
         "a `nextExpectedRanges` entry with an end is not an error: {out:?}"
@@ -2297,7 +2337,7 @@ fn every_fragment_declares_the_total_size_fixed_when_the_session_was_created() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let _ = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let _ = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     let frags = fragments(&rig.journal, &u);
     assert!(!frags.is_empty(), "at least one fragment was sent");
@@ -2357,7 +2397,7 @@ fn a_file_that_shrinks_mid_session_is_never_padded() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     let frags = fragments(&rig.journal, &u);
     for (f, body) in &frags {
@@ -2415,7 +2455,7 @@ fn the_default_fragment_size_is_a_multiple_of_320_kib_and_under_60_mib() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     assert!(
         out.is_ok(),
@@ -2487,7 +2527,7 @@ fn a_404_on_the_final_fragment_is_not_evidence_that_the_commit_happened() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     let calls = rig.journal.calls();
     assert!(
@@ -2547,7 +2587,7 @@ fn the_upload_url_never_reaches_the_framework_in_an_error_string() {
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
     let err = sink
-        .upload(&path, Some(&cloud(MINE, "01A")))
+        .upload(&path, at(&cloud(MINE, "01A")))
         .expect_err("the transport failed");
 
     // A sink that refused this upload before ever creating a session never held
@@ -2616,7 +2656,7 @@ fn a_second_upload_call_never_resumes_a_session_from_the_first() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let one = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let one = sink.upload(&path, at(&cloud(MINE, "01A")));
     assert!(one.is_err(), "the first call lost its connection");
 
     // The user saved again: different length, different content.
@@ -2627,7 +2667,7 @@ fn a_second_upload_call_never_resumes_a_session_from_the_first() {
     std::fs::write(&path, &second).expect("the second save");
     rig.journal.clear();
 
-    let two = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let two = sink.upload(&path, at(&cloud(MINE, "01A")));
     assert!(
         two.is_ok(),
         "the second call must be able to succeed: {two:?}"
@@ -2678,7 +2718,7 @@ fn a_fresh_sink_honours_an_existing_id_it_never_minted() {
     // Brand new: this instance has returned no id in its lifetime.
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01OLD"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01OLD")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01OLD")));
 
     let call = only_call(&rig.journal);
     assert_eq!(
@@ -2792,7 +2832,7 @@ fn an_update_never_returns_a_none_etag_when_the_response_carries_a_tag() {
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01OLD"), "ct:c:{G},1");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01OLD")))
+        .upload(&path, at(&cloud(MINE, "01OLD")))
         .expect("the update must succeed");
 
     assert_eq!(
@@ -2870,16 +2910,23 @@ fn two_local_names_differing_only_in_case_stay_two_objects() {
 
     let second = sink.upload(&lower, None);
     assert!(second.is_err(), "the service will not hold both names");
-    let call = only_call(&rig.journal);
+
+    // Two calls now, not one: the collision is followed by a metadata read that
+    // asks whether the object already at this name is this same document. It is
+    // not — Graph resolved the path case-insensitively and answered with
+    // `Report.txt` — so nothing is adopted and nothing is written. The count was
+    // only ever a proxy for "no second write"; that is asserted directly here,
+    // across every call rather than the one.
+    let calls = rig.journal.calls();
     assert!(
-        call.url.contains("root:/report.txt:"),
-        "the name is sent as it is on disk, case preserved: {}",
-        call.url
+        calls.iter().any(|c| c.url.contains("root:/report.txt:")),
+        "the name is sent as it is on disk, case preserved: {calls:#?}"
     );
-    assert_ne!(
-        call.path(),
-        item_content(MINE, "01A"),
-        "the second file is not written over the first"
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.method == Method::Put && c.path() == item_content(MINE, "01A")),
+        "the second file was written over the first: {calls:#?}"
     );
 }
 
@@ -2903,7 +2950,7 @@ fn an_existing_id_the_service_no_longer_has_becomes_a_create() {
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01GONE"), "ct:c:{G},1");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01GONE")))
+        .upload(&path, at(&cloud(MINE, "01GONE")))
         .expect("a stale id is recoverable");
 
     assert_eq!(out.cloud_id, cloud(MINE, "01FRESH"));
@@ -3024,7 +3071,7 @@ fn positive_control_an_ordinary_update_is_one_conditional_put_and_returns_the_ne
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01REPORT")))
+        .upload(&path, at(&cloud(MINE, "01REPORT")))
         .expect("an ordinary update must succeed");
 
     assert_eq!(
@@ -3143,7 +3190,7 @@ fn positive_control_a_large_file_commits_through_a_session_with_conforming_fragm
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01BIG"), "ct:c:{G},7");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01BIG")))
+        .upload(&path, at(&cloud(MINE, "01BIG")))
         .expect("a large file must commit");
 
     assert_eq!(
@@ -3227,7 +3274,7 @@ fn positive_control_a_three_fragment_session_completes_in_one_pass() {
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01OLD"), "ct:c:{G},1");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01OLD")))
+        .upload(&path, at(&cloud(MINE, "01OLD")))
         .expect("three fragments must commit");
 
     assert_eq!(
@@ -3324,7 +3371,7 @@ fn a_dehydrated_placeholder_is_never_uploaded_as_content() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     assert!(
         out.is_err(),
@@ -3354,7 +3401,7 @@ fn positive_control_a_file_of_real_zeros_with_no_eviction_mark_uploads() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01IMG"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01IMG")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01IMG")));
 
     assert_eq!(
         out.expect("a file of zeros is still a file").cloud_id,
@@ -3415,7 +3462,7 @@ fn an_eviction_that_lands_mid_session_never_commits_the_placeholders_zeros() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01BIG"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01BIG")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01BIG")));
 
     let frags = fragments(&rig.journal, &u);
     for (f, body) in &frags {
@@ -3467,7 +3514,7 @@ fn a_file_that_is_gone_is_never_uploaded_as_an_empty_object_or_from_a_remembered
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
     let out = sink.upload(
         &a.root.join("Work/report.docx"),
-        Some(&cloud(MINE, "01REPORT")),
+        at(&cloud(MINE, "01REPORT")),
     );
 
     assert!(
@@ -3496,12 +3543,12 @@ fn a_file_that_is_gone_is_never_uploaded_as_an_empty_object_or_from_a_remembered
 
     let mut sink = b.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    sink.upload(&path, Some(&cloud(MINE, "01REPORT")))
+    sink.upload(&path, at(&cloud(MINE, "01REPORT")))
         .expect("the first send succeeds");
     std::fs::remove_file(&path).expect("the user deletes the file");
     b.journal.clear();
 
-    let again = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let again = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
     assert!(again.is_err(), "the file is gone; there is nothing to send");
     assert!(
         b.journal.calls().is_empty(),
@@ -3522,7 +3569,7 @@ fn a_file_that_is_gone_is_never_uploaded_as_an_empty_object_or_from_a_remembered
     let mut sink = c.sink();
     sink.record_tag(&cloud(MINE, "01NOTES"), "ct:c:{G},1");
     let out = sink
-        .upload(&empty, Some(&cloud(MINE, "01NOTES")))
+        .upload(&empty, at(&cloud(MINE, "01NOTES")))
         .expect("an empty file is a file");
 
     assert_eq!(out.cloud_id, cloud(MINE, "01NOTES"));
@@ -3568,7 +3615,7 @@ fn a_throttled_write_is_retried_with_its_precondition_and_after_the_advertised_d
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     assert_eq!(
         out.expect("a 429 is the service asking for a moment, not refusing")
@@ -3645,7 +3692,7 @@ fn a_transient_failure_on_an_update_never_becomes_a_create() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     assert!(out.is_err(), "the service never accepted the write");
     let calls = rig.journal.calls();
@@ -3801,7 +3848,12 @@ impl FakeCloud {
 }
 
 impl Sink for FakeCloud {
-    fn upload(&mut self, path: &std::path::Path, existing: Option<&str>) -> io::Result<Uploaded> {
+    fn upload(
+        &mut self,
+        path: &std::path::Path,
+        existing: Option<Known<'_>>,
+    ) -> io::Result<Uploaded> {
+        let existing = existing.map(|k| k.cloud_id);
         self.calls
             .lock()
             .unwrap()
@@ -3854,7 +3906,7 @@ impl Sink for FakeCloud {
 /// §5.4's guarantee is that no upload can succeed under a name the file does not
 /// have when the bytes are sent, and the framework's own repair path is where it
 /// is lost. `run_upload` answers a rename-mid-upload by calling
-/// `sink.upload(&moved.path, Some(&uploaded.cloud_id))`, and Class A requires
+/// `sink.upload(&moved.path, at(&uploaded.cloud_id))`, and Class A requires
 /// that an update address the id. Both rules kept literally leave the object
 /// named whatever the atomic save's temp file was called — the bytes are right,
 /// the name is `report.docx.tmp.194149`, and bug #52 is back, reached through
@@ -3961,5 +4013,360 @@ fn the_stamp_written_after_a_rename_never_blesses_an_edit_that_was_not_sent() {
         "the file reads as already sent over a paragraph that never left the \
          machine: it is not re-queued, reclaim may evict it, and the next delta \
          pass replaces it with a placeholder for the version without it"
+    );
+}
+
+/// The one this suite could not see, and the reason it could not.
+///
+/// `GraphSink::precondition` reads `self.known`, and `record_tag` is the only
+/// thing that fills it. `record_tag` is called forty-three times in this file
+/// and *nowhere else in either repository* — so every test above seeds by hand
+/// a map that a running daemon never populates. On a live account `precondition`
+/// therefore always answered `None`, `put_at_item` always returned
+/// `no_precondition`, and no update to an object that already existed had ever
+/// succeeded outside this file.
+///
+/// Measured 2026-08-13: six edited files unsent for hours, retried in a loop,
+/// each one holding in its own `user.hydration.etag` the very tag the write
+/// needed. The framework read it — `Store::lookup` fills `Entry::etag` — and
+/// then dropped it at the `Sink` boundary, which carried the id and not the
+/// version.
+///
+/// So this test calls no `record_tag`. It goes the way the daemon goes:
+/// `run_upload` reads the file's extended attributes through `Store`, passes
+/// them as `Known`, and the write is conditional on what was on disk all along.
+/// The request is scripted `.with("if-match")`, so an unconditional write does
+/// not merely assert wrongly — it finds no scripted reply at all.
+#[test]
+fn an_update_is_conditional_on_the_tag_recorded_on_the_file_with_no_help_from_the_sink() {
+    use std::os::unix::fs::MetadataExt;
+
+    let rig = Rig::new("durable_tag_reaches_the_wire");
+    let path = rig.file("Work/report.docx", b"edited on this machine");
+    store::set_xattr(&path, xattr::ID, cloud(MINE, "01REPORT").as_bytes())
+        .expect("the cloud id the delta pass would have written");
+    store::set_xattr(&path, xattr::ETAG, b"ct:c:{G},1")
+        .expect("the tag of the version this edit is based on");
+
+    rig.script(
+        put(item_content(MINE, "01REPORT")).with("if-match"),
+        vec![ok(drive_item("01REPORT", "report.docx", 22, "c:{G},2"))],
+    );
+
+    let md = std::fs::metadata(&path).expect("the fixture");
+    let file = FileId {
+        fsid: md.dev(),
+        ino: md.ino(),
+    };
+    let mut store = Store::new();
+    store.scan(&rig.root).expect("a scan of the sync root");
+
+    // No `record_tag`. That is the whole point.
+    let mut sink = rig.sink();
+    let outcome = run_upload(file, &mut store, &mut sink);
+
+    let call = only_call(&rig.journal);
+    assert_eq!(
+        call.header("if-match"),
+        Some("c:{G},1"),
+        "the update went out with no precondition, or with one that is not the \
+         version the file says it is based on: {call:?}"
+    );
+    assert!(
+        matches!(outcome, RunOutcome::Sent { .. }),
+        "an edit to a file the cloud already holds was not sent: {outcome:?}"
+    );
+}
+
+/// The other half of what was measured on 2026-08-13, and the harder one.
+///
+/// Git writes its index by creating a lock file and renaming it into place.
+/// Most editors save the same way, and §5.4 is about exactly this shape. What
+/// survives the rename is a *different inode*, and extended attributes do not
+/// travel across one — so the file loses `user.hydration.id` and
+/// `user.hydration.etag` at the instant of the save.
+///
+/// Read from the file alone, it is then indistinguishable from a document the
+/// cloud has never heard of. The upload became a create, the service answered
+/// `409 nameAlreadyExists`, the failure was re-queued, and it repeated for as
+/// long as the daemon ran: six files, hours, edits that existed on one machine.
+///
+/// The lineage record is what bridges it. Nothing here calls `record_tag` and
+/// nothing re-attaches the attributes by hand — the scan wrote down what the
+/// file said while it still said it, and the save that destroyed the attributes
+/// did not destroy that.
+///
+/// Scripted `.with("if-match")` for the same reason as the test above: an
+/// unconditional write, or a create, finds no reply at all rather than failing
+/// an assertion about one.
+#[test]
+fn a_file_saved_atomically_is_still_an_update_of_the_object_it_came_from() {
+    use std::os::unix::fs::MetadataExt;
+
+    let rig = Rig::new("atomic_save_keeps_its_lineage");
+    let path = rig.file("Work/report.docx", b"the version that came down");
+    store::set_xattr(&path, xattr::ID, cloud(MINE, "01REPORT").as_bytes())
+        .expect("the cloud id the delta pass wrote");
+    store::set_xattr(&path, xattr::ETAG, b"ct:c:{G},1").expect("the tag it was placed at");
+
+    // The scan that runs before every upload batch, while the file still has
+    // something to say for itself.
+    let mut store = Store::new().remembering();
+    store
+        .scan(&rig.root)
+        .expect("the scan that records the lineage");
+
+    // The atomic save. A new inode, no extended attributes, renamed over the
+    // name the old one had — which is all git does, and all most editors do.
+    let tmp = rig.root.join("Work/.report.docx.swp");
+    std::fs::write(&tmp, b"the paragraph the user just wrote").expect("the temp file");
+    std::fs::rename(&tmp, &path).expect("the atomic save");
+    let md = std::fs::metadata(&path).expect("the saved file");
+    let file = FileId {
+        fsid: md.dev(),
+        ino: md.ino(),
+    };
+    {
+        // Asserted through the same call the daemon makes, on a store that
+        // remembers nothing: this is the file as it now is. Without it the test
+        // would pass on a filesystem where the attributes somehow survived, which
+        // is to say it would pass without testing anything.
+        let mut bare = Store::new();
+        bare.scan(&rig.root).expect("a scan with no memory");
+        assert!(
+            bare.lookup(&file).and_then(|e| e.cloud_id).is_none(),
+            "the fixture did not reproduce the failure: the save kept the file's \
+             identity, so nothing here needed recovering"
+        );
+    }
+    store.scan(&rig.root).expect("the scan after the save");
+
+    rig.script(
+        put(item_content(MINE, "01REPORT")).with("if-match"),
+        vec![ok(drive_item("01REPORT", "report.docx", 33, "c:{G},2"))],
+    );
+
+    let mut sink = rig.sink();
+    let outcome = run_upload(file, &mut store, &mut sink);
+
+    let call = only_call(&rig.journal);
+    assert_eq!(
+        call.path(),
+        item_content(MINE, "01REPORT"),
+        "the edit was sent as a create, which the service answers 409 \
+         nameAlreadyExists for as long as the daemon runs: {call:?}"
+    );
+    assert_eq!(
+        call.header("if-match"),
+        Some("c:{G},1"),
+        "the update carried no precondition, or not the version the file was \
+         placed at: {call:?}"
+    );
+    assert!(
+        matches!(outcome, RunOutcome::Sent { .. }),
+        "an edit saved the way every editor saves never left the machine: {outcome:?}"
+    );
+}
+
+/// And the record does not outlive the truth it was written from.
+///
+/// A path-keyed record is only safe while an object is at one path. If the cloud
+/// renames `01REPORT` away and something unrelated is created at the old name,
+/// a surviving record would send the new file's contents into the renamed
+/// object — past the `if-match`, which guards the version and not the identity.
+///
+/// `Lineage::absorb` evicts on the object rather than on the path, so the scan
+/// that finds `01REPORT` living somewhere else drops the stale claim in the same
+/// pass. This is the assertion that the eviction reaches all the way through
+/// `Store::lookup`.
+#[test]
+fn a_new_file_does_not_inherit_the_identity_of_an_object_renamed_away_from_its_path() {
+    use std::os::unix::fs::MetadataExt;
+
+    let rig = Rig::new("atomic_save_does_not_inherit");
+    let old = rig.file("Work/report.docx", b"the version that came down");
+    store::set_xattr(&old, xattr::ID, cloud(MINE, "01REPORT").as_bytes()).expect("id");
+    store::set_xattr(&old, xattr::ETAG, b"ct:c:{G},1").expect("tag");
+
+    let mut store = Store::new().remembering();
+    store
+        .scan(&rig.root)
+        .expect("the scan that records the lineage");
+
+    // The cloud renamed it; the delta pass renamed the file to match.
+    let moved = rig.root.join("Work/quarterly.docx");
+    std::fs::rename(&old, &moved).expect("the delta pass rename");
+    // And something entirely unrelated is created at the name it used to have.
+    std::fs::write(&old, b"a different document that happens to share a name").expect("new file");
+
+    let md = std::fs::metadata(&old).expect("the new file");
+    let file = FileId {
+        fsid: md.dev(),
+        ino: md.ino(),
+    };
+    store.scan(&rig.root).expect("the scan after the rename");
+
+    let entry = store.lookup(&file).expect("the new file is indexed");
+    assert_eq!(
+        entry.cloud_id, None,
+        "a new local file inherited the identity of an object that had been \
+         renamed away from its path; its contents would have been written into \
+         Work/quarterly.docx"
+    );
+}
+
+/// The five that were stuck, and why they were.
+///
+/// A file whose extended attributes were destroyed by an atomic save before
+/// anything recorded them has no id, so its upload is a create, and the create
+/// collides with the object already at that name. Until now the answer was to
+/// fail, and to keep failing: measured on a live account on 2026-08-13, five
+/// files retried in a loop for hours, three of them git pack files whose names
+/// are content-addressed and which therefore could not possibly have differed
+/// from what was already there.
+///
+/// Stopping was right for the reason `put_at_path` gives — adopting a
+/// stranger's object id would let reclaim evict the local file, the next read
+/// fetch their document, and a local delete remove their object. Every one of
+/// those rests on it being a *stranger's*. When the bytes already at the name
+/// are the bytes being sent, it is this document, and taking its id is not a
+/// write at all.
+#[test]
+fn a_create_that_collides_with_its_own_content_adopts_it_instead_of_failing() {
+    let rig = Rig::new("collide_same_content");
+    let body = b"the pack file, which is named after its own contents";
+    let path = rig.file("Work/pack.pack", body);
+
+    rig.script(
+        put(path_content(MINE, "Work/pack.pack")),
+        vec![reply(409, graph_error("nameAlreadyExists"))],
+    );
+    rig.script(
+        get(path_meta(MINE, "Work/pack.pack")),
+        vec![ok(hashed_item("01PACK", "pack.pack", body, "c:{G},1"))],
+    );
+
+    let mut sink = rig.sink();
+    let out = sink.upload(&path, None).expect(
+        "a create that collided with a byte-identical object left the file stranded, which \
+         is the state five files were measured in",
+    );
+
+    assert_eq!(
+        out.cloud_id,
+        cloud(MINE, "01PACK"),
+        "the identity recovered is not the object that holds the bytes"
+    );
+    let calls = rig.journal.calls().len();
+    assert_eq!(
+        calls, 2,
+        "expected the create and one metadata read, got {calls} requests — anything more \
+         means a second write was attempted"
+    );
+}
+
+/// And when it is genuinely a different document, nothing is written.
+#[test]
+fn a_create_that_collides_with_different_content_is_still_refused() {
+    let rig = Rig::new("collide_other_content");
+    let path = rig.file("Work/notes.txt", b"what this machine has");
+
+    rig.script(
+        put(path_content(MINE, "Work/notes.txt")),
+        vec![reply(409, graph_error("nameAlreadyExists"))],
+    );
+    rig.script(
+        get(path_meta(MINE, "Work/notes.txt")),
+        vec![ok(hashed_item(
+            "01NOTES",
+            "notes.txt",
+            b"what somebody else has",
+            "c:{G},1",
+        ))],
+    );
+
+    let mut sink = rig.sink();
+    let err = sink
+        .upload(&path, None)
+        .expect_err("a stranger's document was overwritten, or its id adopted");
+    let said = err.to_string();
+    assert!(
+        said.contains("overwriting that one blind"),
+        "the refusal did not say why it refused: {said}"
+    );
+}
+
+/// A 409 that is not about the name is not sent looking for content.
+///
+/// Graph answers 409 for quota and for locking too. Treating those as a name
+/// collision would spend a metadata read answering a question nobody asked, and
+/// would report the wrong reason for the failure.
+#[test]
+fn a_collision_on_something_other_than_the_name_is_not_reconciled() {
+    let rig = Rig::new("collide_not_name");
+    let path = rig.file("Work/notes.txt", b"x");
+    rig.script(
+        put(path_content(MINE, "Work/notes.txt")),
+        vec![reply(409, graph_error("quotaLimitReached"))],
+    );
+
+    let mut sink = rig.sink();
+    let err = sink
+        .upload(&path, None)
+        .expect_err("a quota refusal was accepted");
+    assert!(
+        err.to_string().contains("quotaLimitReached"),
+        "the quota refusal was reported as something else: {err}"
+    );
+    assert_eq!(
+        rig.journal.calls().len(),
+        1,
+        "a quota refusal sent the sink looking for content that was never in question"
+    );
+}
+
+/// The hazard the content check opens, and the name check closes.
+///
+/// Graph resolves a path case-insensitively, so a create at `report.txt` collides
+/// with an object named `Report.txt`. If the two hold the same bytes — an
+/// ordinary thing for a copy — then reconciling on content *alone* would give
+/// two distinct local files one object id. Both would read Clean, and deleting
+/// either would remove the object the other depends on.
+///
+/// `two_local_names_differing_only_in_case_stay_two_objects` caught this when the
+/// content check was first written, with contents that differed. This is the same
+/// trap with contents that do not, which is the version the size-and-hash test
+/// cannot see.
+#[test]
+fn a_name_that_matches_only_by_case_is_not_the_same_object_however_alike() {
+    let rig = Rig::new("case_collision_same_bytes");
+    let body = b"byte for byte the same";
+    let lower = rig.file("report.txt", body);
+
+    rig.script(
+        put(path_content(MINE, "report.txt")),
+        vec![reply(409, graph_error("nameAlreadyExists"))],
+    );
+    // What Graph answers for `root:/report.txt` on a drive holding `Report.txt`:
+    // the other object, with the other name, and identical content.
+    rig.script(
+        get(path_meta(MINE, "report.txt")),
+        vec![ok(hashed_item("01UPPER", "Report.txt", body, "c:{G},1"))],
+    );
+
+    let mut sink = rig.sink();
+    let out = sink.upload(&lower, None);
+
+    assert!(
+        out.is_err(),
+        "a file adopted the id of an object with a different name because their \
+         contents happened to match; deleting either would now remove the other"
+    );
+    let calls = rig.journal.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.method == Method::Put && c.path() == item_content(MINE, "01UPPER")),
+        "the other object was written over: {calls:#?}"
     );
 }

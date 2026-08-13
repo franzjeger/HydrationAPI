@@ -165,10 +165,11 @@ struct Resync {
 /// `Dirty` in every state that matters:
 ///
 /// - A transfer cut off mid-stream. The worker writes through the event fd and
-///   clears the mark in `finish_hydration`; killed in between — which a
-///   machine-wide `pkill hydrationd` did on a live mount on 2026-08-10 — it
-///   leaves a file that is still marked, holds part of the object, and whose
-///   `pwrite` moved the mtime out from under the placeholder's stamp.
+///   settles what it wrote — `settle_range` for one range, `finish_hydration`
+///   for the last of them; killed in between — which a machine-wide `pkill
+///   hydrationd` did on a live mount on 2026-08-10 — it leaves a file that is
+///   still marked, holds part of the object, and whose `pwrite` moved the mtime
+///   out from under the placeholder's stamp.
 /// - A transfer in progress right now, which looks identical from here.
 /// - A punch of ours whose re-stamp failed. `dehydrate`, `evict` and `abandon`
 ///   all stamp with `let _ =`.
@@ -183,12 +184,23 @@ struct Resync {
 ///
 /// # Why not send them, then, if a user's bytes might be in there
 ///
-/// Because the upload path cannot carry them. `run_upload` reads the file to
-/// send it, and *that read* is what makes the helper punch: `clear_residue` is
-/// unconditional, so whatever is in a marked file is gone before a byte of it
-/// reaches the sink, and what gets uploaded is the cloud's own content. Queueing
-/// the file does not rescue an edit — it destroys it and pays for two transfers
-/// to do so.
+/// Because the upload path cannot carry them, and ranged fills did not change
+/// that — they only changed which half of the argument does the work.
+///
+/// `run_upload` reads the file to send it, and that read is what the helper
+/// answers. It asks `partial::Standing` first, and there are exactly two
+/// answers. `Unknown` — no worker record vouches for what is on disk — punches
+/// the file via `clear_residue` before a byte of it reaches the sink, so an edit
+/// that reached a marked file unintercepted is destroyed by the read that was
+/// meant to send it. `Ours` — the worker wrote those ranges itself and the file
+/// has not moved since — keeps them, but they are the *cloud's* bytes by
+/// construction, so there is nothing of the user's in them to rescue.
+///
+/// Either way the queue gains nothing and the read hydrates the rest of the
+/// object. Note that `clear_residue` used to be unconditional and this argument
+/// used to rest on that; ranged fills made a marked file holding bytes ordinary
+/// (`daemon.rs`, the `Standing::Unknown` arm), and the conclusion survives the
+/// premise being replaced.
 ///
 /// Clearing the mark first is the one thing that would let those bytes out, and
 /// it must never be done from here. A cut-off transfer holds a *prefix* of the
@@ -199,18 +211,31 @@ struct Resync {
 /// to install an ignore mark on a sized file occupying no disk. Guessing wrong
 /// destroys the object; not guessing costs a log line.
 ///
-/// So they are skipped and *named*. A marked file holding bytes is a state that
-/// is not supposed to survive between transfers, this walk is the only thing
-/// that looks at every file, and after the next read the file is quietly the
-/// cloud's copy again with nothing left to notice.
+/// So they are skipped, and the ones holding bytes are *named* — this walk is
+/// the only thing that looks at every file, and after the next read the file is
+/// quietly the cloud's copy again with nothing left to notice.
 ///
-/// The bytes question is asked only of a placeholder whose stamp already
-/// disagrees, and it is asked with `holds_data` — `SEEK_DATA`, never
+/// # Why `Clean` is the line, now that partial fills exist
+///
+/// The bytes question is asked with `holds_data` — `SEEK_DATA`, never
 /// `st_blocks`, which reports the same count for an empty placeholder and a
-/// filled one (§8z). A `Clean` placeholder is skipped without asking: putting
-/// bytes in one moves its mtime, and nothing in the framework writes into a
-/// marked file and re-stamps it. That keeps the syscall off the overwhelming
-/// majority of placeholders, which are `Clean`.
+/// filled one (§8z) — and it is asked only of a placeholder whose stamp already
+/// disagrees. That gate began as an optimisation and is now the thing that keeps
+/// the warning true.
+///
+/// It rested on "nothing in the framework writes into a marked file and
+/// re-stamps it". `settle_range` does exactly that: it is how a ranged fill
+/// records the part it has, and it stamps precisely so a resync walk does not
+/// read the fill as the user's own edit. So a marked file that is `Clean` *and*
+/// holds bytes is no longer impossible — it is the ordinary shape of a partially
+/// hydrated file, and it is the framework's own content.
+///
+/// Warning about those would put a line in front of the user on every resync for
+/// every file the helper is part-way through, which is how the line that matters
+/// stops being read. `Clean` is what separates "the framework put these bytes
+/// here and vouches for them" from "these bytes arrived some other way", and it
+/// is the only signal on this side that does: `partial::Standing` lives in the
+/// worker's memory and nothing on this side of the socket can consult it.
 ///
 /// Measured before it was used (`probes/seekdata.c`, 7.1.6, btrfs and ext4):
 /// `open` and `lseek(SEEK_DATA)` fire no pre-content event, while a `read` on
@@ -698,7 +723,44 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     return;
                 }
             };
-            let mut store = Store::new();
+            // Reads the lineage record, never writes it. This scan runs only when
+            // something is already due, which for a file saved atomically is a
+            // debounce after its extended attributes went away — far too late to
+            // learn anything from the file. What it needs is what the delta
+            // pass's scan wrote down while they were still there.
+            let mut store = Store::new().consulting();
+
+            // Removals ride with the uploads because this thread already owns
+            // the sink, and a second thread holding it would put every deletion
+            // behind whatever transfer is running. It is also the right place in
+            // meaning: sending a change and withdrawing one are the same
+            // conversation with the service.
+            //
+            // A failure to start watching is survivable and is not silent. What
+            // it costs is that local deletions stop reaching the cloud, which is
+            // a sync that is behind rather than one that destroys anything.
+            // Bridges the gap between an upload settling and the delta pass
+            // writing it down. Cleared wholesale rather than aged: every entry
+            // is superseded within a delta round, so the only thing a precise
+            // eviction policy would buy is a more interesting way to be wrong.
+            let mut recent: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            let mut removals = match crate::removals::Removals::watch(&mount) {
+                Ok(w) => {
+                    eprintln!(
+                        "hydration-sync: watching {} directories for deletions",
+                        w.watched()
+                    );
+                    Some(w)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "hydration-sync: cannot watch for deletions ({e}); files deleted \
+                         here will stay in the cloud"
+                    );
+                    None
+                }
+            };
             while !stop.load(Ordering::SeqCst) {
                 // Close the holes in the change channel by looking, rather than
                 // by trusting that nothing was missed.
@@ -768,7 +830,26 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 }
                 for file in due {
                     q.lock().unwrap().begin(file);
+                    // Captured before the send, because afterwards the file may
+                    // already be gone — which is precisely the case this is for.
+                    let sent_path = store
+                        .lookup(&file)
+                        .and_then(|e| crate::lineage::relative(&mount, &e.path));
                     let outcome = run_upload(file, &mut store, &mut sink);
+                    // What this thread just created, so a file deleted before the
+                    // delta pass next scans can still be withdrawn.
+                    //
+                    // Measured 2026-08-13: a file uploaded and deleted sixteen
+                    // seconds later resolved to nothing, because the lineage
+                    // record is written by the delta scan and that runs every
+                    // thirty. The upload driver knew the object it had just made
+                    // and told nobody.
+                    if let (Outcome::Sent { cloud_id }, Some(rel)) = (&outcome, &sent_path) {
+                        if recent.len() >= RECENT_SENDS {
+                            recent.clear();
+                        }
+                        recent.insert(rel.clone(), cloud_id.clone());
+                    }
                     {
                         let mut queue = q.lock().unwrap();
                         queue.finish(file);
@@ -786,6 +867,23 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         }
                     }
                     eprintln!("hydration-sync: upload {file:?} -> {outcome:?}");
+                }
+
+                if let Some(w) = &mut removals {
+                    let gone = w.take();
+                    if w.lost_events() {
+                        // Missed removals leave objects in the cloud the user
+                        // deleted here. Behind, never destructive — but the user
+                        // is entitled to know their deletion did not land.
+                        eprintln!(
+                            "hydration-sync: the deletion watch overflowed; some files \
+                             deleted here will stay in the cloud until they are deleted \
+                             again"
+                        );
+                    }
+                    if !gone.is_empty() {
+                        apply_removals(&mount, &gone, &recent, &mut sink);
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -830,7 +928,14 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // reach — safe, and pointless. `None` means "no mount right now",
             // which is the same state the thread starts in.
             let mut placer: Option<TmpfilePlacer> = None;
-            let mut store = Store::new();
+            // The maintaining side. `delta::apply` scans every round, which is
+            // the only regular walk this daemon does, and it happens while files
+            // still carry their own identity — so it is the one place that can
+            // write down what an atomic save is about to destroy.
+            let mut store = Store::new().remembering();
+            // Forced on the first turn, so the record exists from startup rather
+            // than five minutes into it.
+            let mut walked = std::time::Instant::now() - WALK_EVERY;
             let mut cursor = Cursor::default();
             // Set when a pass deliberately left something for a later one.
             //
@@ -1009,7 +1114,22 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     Ok(_) => {}
                     Err(e) => eprintln!("hydration-sync: could not list the cloud: {e}"),
                 }
-                std::thread::sleep(Duration::from_secs(5));
+                // The lineage record is written by this store's scan, and
+                // `delta::apply` no longer scans on a round that has nothing to
+                // apply. So the walk gets a cadence of its own: often enough
+                // that a file's identity is written down well before an atomic
+                // save can destroy it, and rare enough that a quiet tree of
+                // 167,890 files costs nothing to keep quiet.
+                //
+                // Five seconds of polling and five minutes of walking are
+                // different jobs and were only ever the same number by accident.
+                if walked.elapsed() >= WALK_EVERY {
+                    if let Err(e) = store.scan(&mount) {
+                        eprintln!("hydration-sync: could not walk the sync root: {e}");
+                    }
+                    walked = std::time::Instant::now();
+                }
+                std::thread::sleep(POLL_EVERY);
             }
         });
     }
@@ -1056,7 +1176,27 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // thread's walk for the third puts a tray within a second of the
             // number that actually moves, for one extra wakeup a second in a
             // process whose upload driver already wakes five times a second.
-            const TICKS_PER_MANIFEST: u32 = 30;
+            // Once every five minutes, not once every thirty seconds.
+            //
+            // `manifest::refresh` walks the whole sync root reading extended
+            // attributes, then renders and writes the result. On the measured
+            // account that is 167,890 files and a 43 MB file, and at the old
+            // cadence it was the single most expensive thing this daemon did:
+            // one thread pinned at essentially a full core, permanently, on a
+            // tree where nothing was changing. Measured 2026-08-13 — 99 seconds
+            // of CPU in 120 seconds of wall clock, all of it here.
+            //
+            // The manifest exists for §6d: it tells someone restoring a backup
+            // which files were not in it. Backups run daily. Nothing about that
+            // wants a thirty-second refresh, and the count it also feeds to the
+            // tray moves when the user's files move, which is not every half
+            // minute either.
+            //
+            // The right fix is one walk shared with the delta pass's, instead of
+            // two threads walking the same tree on different clocks. That is a
+            // larger change than this, and this is the one that stops the
+            // machine getting warm.
+            const TICKS_PER_MANIFEST: u32 = 300;
             let mut tick = 0;
             while !stop.load(Ordering::SeqCst) {
                 if tick == 0 {
@@ -1130,6 +1270,189 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The most removals one batch may carry out before it stops and asks.
+///
+/// The catastrophic shape — an unmounted or rebuilt sync root read as "the user
+/// deleted everything" — cannot arise here at all, and that is the point of
+/// watching for events rather than inferring from absence: an unmounted root
+/// produces no events, because its watches went with it.
+///
+/// What is left is an ordinary `rm -rf` of a large folder, which is a real thing
+/// a user may mean. So this is a pause, not a refusal on principle: the batch is
+/// declined, it is said plainly what would have been removed, and the files stay
+/// in the cloud. The floor matters as much as any ratio would — a hundred
+/// removals is a folder, and a folder is exactly the thing somebody deletes on
+/// purpose.
+/// How often the cloud is asked whether anything changed.
+///
+/// Every round costs a reconciliation of the whole batch against the tree, and
+/// the batch is the whole listing — PROVIDER.md:103 requires a provider's quiet
+/// round to carry it rather than be `(vec![], new_cursor)`, because that shape
+/// once consumed a refusal that had been deliberately held back. So the price of
+/// a round is set by the drive's size, not by how much changed, and the only
+/// lever left is how often it is paid.
+///
+/// Five seconds was never argued for anywhere. Measured on a live account on
+/// 2026-08-13, on 167,890 files, it cost 40% of a core in perpetuity to keep
+/// asking a quiet drive the same question. Thirty seconds is what the walk
+/// beside it already used, is well inside what anyone notices for a change made
+/// on another device, and costs a sixth as much.
+///
+/// A change made *here* does not wait for this: local edits are seen by the
+/// helper's watch and uploaded on their own quiet period, and local deletions by
+/// the inotify watch in `crate::removals`. This interval only bounds how stale
+/// the *other* direction can be.
+const POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often the sync root is walked when the cloud reports nothing.
+///
+/// The walk is what keeps the lineage record current — see `crate::lineage` for
+/// what that costs to be without — and it is the most expensive thing this
+/// daemon does: a stat and two extended attributes per file, 167,890 of them on
+/// the measured account. It used to happen on every delta round, eight seconds
+/// apart, and cost 48% of a core in perpetuity.
+///
+/// Five minutes bounds that to something unmeasurable while leaving the record
+/// far fresher than the failure it guards against needs: a file has to be
+/// uploaded and then saved atomically inside one window to slip through, and
+/// even then the content reconciliation in the Graph sink recovers it.
+const WALK_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+const REMOVAL_BATCH_LIMIT: usize = 100;
+
+/// How many just-sent objects the upload driver remembers for the removal path.
+///
+/// Only has to outlive one delta round, after which the lineage record carries
+/// the same fact durably. Generous enough that an initial sync's worth of sends
+/// does not evict the one file the user is about to delete.
+const RECENT_SENDS: usize = 4096;
+
+/// What the framework knows about the object that used to be at a path.
+///
+/// Two registers, because the framework keeps the two halves of its tree in
+/// different places: `.hydration-lineage` records files that hold content, and
+/// §6d's manifest records the ones that do not. A deleted placeholder is the
+/// commonest deletion there is — it is how somebody clears out files they never
+/// opened — so covering only the first would be covering the rarer half.
+struct Registers {
+    lineage: crate::lineage::Lineage,
+    /// Parsed from the manifest on first miss and kept until it changes. It is
+    /// tens of megabytes on a large account, so it is not re-read per batch, and
+    /// it is not read at all unless a deletion actually needs it.
+    manifest: Option<(
+        std::time::SystemTime,
+        std::collections::HashMap<String, String>,
+    )>,
+}
+
+impl Registers {
+    fn load(root: &std::path::Path) -> Self {
+        Self {
+            lineage: crate::lineage::Lineage::load(root),
+            manifest: None,
+        }
+    }
+
+    fn cloud_id(&mut self, root: &std::path::Path, rel: &str) -> Option<String> {
+        if let Some(r) = self.lineage.get(rel) {
+            return Some(r.cloud_id.clone());
+        }
+        self.manifest(root)?.get(rel).cloned()
+    }
+
+    fn manifest(
+        &mut self,
+        root: &std::path::Path,
+    ) -> Option<&std::collections::HashMap<String, String>> {
+        let path = root.join(hydration_protocol::names::MANIFEST);
+        let stamp = std::fs::metadata(&path).ok()?.modified().ok()?;
+        let stale = self.manifest.as_ref().is_none_or(|(at, _)| *at != stamp);
+        if stale {
+            let raw = std::fs::read_to_string(&path).ok()?;
+            let mut by_path = std::collections::HashMap::new();
+            for line in raw.lines() {
+                if line.starts_with('#') || line.is_empty() {
+                    continue;
+                }
+                let mut f = line.split('\t');
+                if let (Some(p), Some(id)) = (f.next(), f.next()) {
+                    if !p.is_empty() && !id.is_empty() {
+                        by_path.insert(p.to_string(), id.to_string());
+                    }
+                }
+            }
+            self.manifest = Some((stamp, by_path));
+        }
+        self.manifest.as_ref().map(|(_, m)| m)
+    }
+}
+
+/// Withdraw from the cloud the files that went away here.
+///
+/// Called only with names the kernel reported as removed — never with an
+/// absence. `removals` explains at length why that distinction is the whole
+/// design and not a nicety.
+fn apply_removals<S: Sink>(
+    root: &std::path::Path,
+    gone: &[crate::removals::Gone],
+    recent: &std::collections::HashMap<String, String>,
+    sink: &mut S,
+) {
+    if gone.len() > REMOVAL_BATCH_LIMIT {
+        eprintln!(
+            "hydration-sync: {} files were deleted here at once, which is more than this \
+             will remove from the cloud without being asked ({REMOVAL_BATCH_LIMIT}). \
+             Nothing was removed; the files are still in the cloud and will come back \
+             on the next delta pass. First few: {}",
+            gone.len(),
+            gone.iter()
+                .take(5)
+                .map(|g| g.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return;
+    }
+
+    let mut registers = Registers::load(root);
+    for g in gone {
+        let how = if g.moved_out {
+            "moved out of"
+        } else {
+            "deleted from"
+        };
+        let Some(cloud_id) = recent
+            .get(g.path.as_str())
+            .cloned()
+            .or_else(|| registers.cloud_id(root, &g.path))
+        else {
+            // Not an error. A file created here and never uploaded has no object
+            // to withdraw, and that is the ordinary case for scratch files.
+            eprintln!(
+                "hydration-sync: {} was {how} the sync folder; nothing to remove, the \
+                 cloud has no record of it",
+                g.path
+            );
+            continue;
+        };
+        match sink.remove(&cloud_id) {
+            Ok(()) => eprintln!(
+                "hydration-sync: {} was {how} the sync folder; removed from the cloud",
+                g.path
+            ),
+            // Left alone rather than retried. The next delta pass will bring the
+            // object back down as a placeholder, which is visible and correct —
+            // the file is in the cloud, so it should be here. Retrying a removal
+            // in a loop is how one failure becomes a deletion nobody asked for.
+            Err(e) => eprintln!(
+                "hydration-sync: {} was {how} the sync folder, but the cloud copy could \
+                 not be removed: {e}. It will come back on the next delta pass.",
+                g.path
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1279,6 +1602,50 @@ mod tests {
 
         let found = dirty_files(&dir).unwrap();
         assert_eq!(found, Resync::default());
+    }
+
+    /// A partially hydrated file: marked, holding bytes, and `Clean`.
+    ///
+    /// This state did not exist when the walk was written — `clear_residue` was
+    /// unconditional and a marked file holding bytes could not survive between
+    /// transfers. Ranged fills made it ordinary: `settle_range` writes a range
+    /// into a still-marked file and stamps it, so the file holds the cloud's
+    /// bytes and reads `Clean`.
+    ///
+    /// It must be silent. Not because there is nothing there — there is — but
+    /// because those bytes are the framework's own and the helper is part-way
+    /// through putting them there. Warning would name every file being hydrated,
+    /// on every resync, in the same sentence used for bytes that are about to be
+    /// punched; the honest line and the routine one would be identical and the
+    /// user would learn to skip both.
+    ///
+    /// The `Clean` gate is what holds this, and it is the only signal available:
+    /// `partial::Standing` lives in the worker's memory, on the far side of the
+    /// socket. Removing the gate — or "fixing" the stale premise that once
+    /// justified it — turns the warning into noise, so it is pinned here.
+    #[test]
+    fn a_partially_hydrated_file_is_not_reported_as_holding_bytes() {
+        let dir = scratch("partial-fill");
+        let p = placeholder(&dir, "half.iso", 1 << 20);
+
+        // What `settle_range` leaves: bytes in the hole, mark untouched, and a
+        // stamp describing the file as it now stands.
+        fill_range(&p, 4096);
+        stamp::write(&p).unwrap();
+
+        assert_eq!(
+            stamp::state(&p).unwrap(),
+            State::Clean,
+            "a settled range leaves the file Clean, which is what the gate reads"
+        );
+        assert!(holds_data(&p).unwrap(), "and it really does hold bytes");
+        assert!(
+            store::get_xattr(&p, xattr::DEHYDRATED).unwrap().is_some(),
+            "and it is still a placeholder"
+        );
+
+        let found = dirty_files(&dir).unwrap();
+        assert_eq!(found, Resync::default(), "a partial fill is not news");
     }
 
     /// The reason the `Dirty` arm exists, and it still has to work: an in-place
