@@ -2752,6 +2752,7 @@ pub enum Method {
     Get,
     Put,
     Post,
+    Patch,
     Delete,
 }
 
@@ -2761,6 +2762,7 @@ impl Method {
             Method::Get => "GET",
             Method::Put => "PUT",
             Method::Post => "POST",
+            Method::Patch => "PATCH",
             Method::Delete => "DELETE",
         }
     }
@@ -4166,6 +4168,73 @@ impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K
         }
     }
 
+    fn move_item(
+        &mut self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+        existing: hydration_client::upload::Known<'_>,
+    ) -> io::Result<Uploaded> {
+        let from_rel = from
+            .strip_prefix(&self.root)
+            .map_err(|_| refused("the old path is not under this sink's sync root"))?;
+        let to_rel = to
+            .strip_prefix(&self.root)
+            .map_err(|_| refused("the new path is not under this sink's sync root"))?;
+        let from_parent = from_rel
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""));
+        let to_parent = to_rel.parent().unwrap_or_else(|| std::path::Path::new(""));
+        if from_parent != to_parent {
+            // Moving to another parent needs that folder's cloud identity. The
+            // current framework deliberately tracks folders only inside the
+            // provider tree and exposes no local-folder identity to the sink;
+            // guessing by path would make a case-insensitive Graph lookup an
+            // authority over which folder the user meant. Refuse until that
+            // part of the contract is explicit.
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "moving an object between folders requires folder identity, which the sync contract does not expose yet",
+            ));
+        }
+        let to_rel = to_rel
+            .to_str()
+            .ok_or_else(|| refused("the new path below the sync root is not UTF-8"))?;
+        check_relative_name(to_rel)?;
+        let name = to
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| refused("the new file name is not UTF-8"))?;
+
+        let Some(key) = key_of_cloud_id(existing.cloud_id) else {
+            return Err(refused(
+                "the recorded cloud id names no drive and no item, so there is no object to move",
+            ));
+        };
+        if let Some(tag) = existing.tag {
+            self.known
+                .entry(existing.cloud_id.to_string())
+                .or_insert_with(|| tag.to_string());
+        }
+        let Some(precondition) = self.precondition(existing.cloud_id) else {
+            return Err(no_precondition());
+        };
+        let body = serde_json::json!({"name": name}).to_string().into_bytes();
+        let reply = self.call(
+            &Request::new(Method::Patch, item_url(&key))
+                .with_header("if-match", &precondition)
+                .with_header("content-type", "application/json")
+                .with_body(body),
+        )?;
+        match reply.status {
+            200..=299 => self.settle(key.drive(), &reply.body),
+            _ => Err(service_refused(
+                "the object was not renamed",
+                reply.status,
+                &reply.body,
+            )),
+        }
+    }
+
     fn remove(&mut self, cloud_id: &str) -> io::Result<()> {
         // Before a request, not after a response. `rsplit('|').next()
         // .unwrap_or(cloud_id)` turns junk in an extended attribute — one
@@ -4213,6 +4282,15 @@ impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K
                 &reply.body,
             )),
         }
+    }
+
+    fn remove_known(&mut self, existing: hydration_client::upload::Known<'_>) -> io::Result<()> {
+        if let Some(tag) = existing.tag {
+            self.known
+                .entry(existing.cloud_id.to_string())
+                .or_insert_with(|| tag.to_string());
+        }
+        self.remove(existing.cloud_id)
     }
 }
 

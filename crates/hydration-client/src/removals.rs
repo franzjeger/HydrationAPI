@@ -99,6 +99,30 @@ pub struct Gone {
     pub moved_out: bool,
 }
 
+/// One object whose name changed while it stayed inside the sync root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Renamed {
+    pub from: String,
+    pub to: String,
+    pub is_dir: bool,
+}
+
+/// Local namespace changes observed in one drain.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Batch {
+    pub gone: Vec<Gone>,
+    pub renamed: Vec<Renamed>,
+    /// Directories moved out are deliberately not folded into `gone`: deleting
+    /// a cloud folder can recursively delete an account-sized subtree.
+    pub folders_moved_out: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MoveHalf {
+    path: String,
+    is_dir: bool,
+}
+
 /// Watches the sync root for names that go away.
 pub struct Removals {
     fd: OwnedFd,
@@ -108,6 +132,15 @@ pub struct Removals {
     /// Set when the kernel dropped events. Removals were missed; nothing is
     /// wrongly reported.
     lost: bool,
+    /// Rename halves which ended the previous drain without their destination.
+    ///
+    /// inotify orders `IN_MOVED_FROM` before `IN_MOVED_TO`, but does not promise
+    /// that a reader observes both halves in one non-blocking drain. Reporting
+    /// an unmatched first half immediately can therefore turn an ordinary move
+    /// inside the sync root into a cloud deletion. Hold it through one complete
+    /// later drain; a matching destination cancels it, while a second drain
+    /// without one proves the name moved out of the watched tree.
+    pending_moves: HashMap<u32, MoveHalf>,
 }
 
 impl Removals {
@@ -128,6 +161,7 @@ impl Removals {
             dirs: HashMap::new(),
             root: root.to_path_buf(),
             lost: false,
+            pending_moves: HashMap::new(),
         };
         me.add_tree(root);
         Ok(me)
@@ -198,15 +232,16 @@ impl Removals {
     ///
     /// Never blocks. An empty answer means nothing happened, which is the
     /// ordinary case.
-    pub fn take(&mut self) -> Vec<Gone> {
+    pub fn take(&mut self) -> Batch {
         self.lost = false;
-        let mut out = Vec::new();
+        let mut out = Batch::default();
         // A rename *within* the sync root is not a removal, and the kernel says
         // so by giving the two halves the same cookie. Pairing has to happen
         // across the whole drain rather than within one `read`, because a
         // sufficiently large batch can split the pair across two.
-        let mut moved_from: HashMap<u32, String> = HashMap::new();
-        let mut moved_to: Vec<u32> = Vec::new();
+        let previous_moves = std::mem::take(&mut self.pending_moves);
+        let mut moved_from: HashMap<u32, MoveHalf> = HashMap::new();
+        let mut moved_to: HashMap<u32, MoveHalf> = HashMap::new();
         let mut buf = vec![0u8; 64 * 1024];
 
         loop {
@@ -271,7 +306,13 @@ impl Removals {
                     continue;
                 }
                 if mask & IN_MOVED_TO != 0 {
-                    moved_to.push(cookie);
+                    moved_to.insert(
+                        cookie,
+                        MoveHalf {
+                            path: path.clone(),
+                            is_dir: mask & IN_ISDIR != 0,
+                        },
+                    );
                     if mask & IN_ISDIR != 0 {
                         let abs = self.root.join(&path);
                         self.add_tree(&abs);
@@ -279,11 +320,17 @@ impl Removals {
                     continue;
                 }
                 if mask & IN_MOVED_FROM != 0 {
-                    moved_from.insert(cookie, path);
+                    moved_from.insert(
+                        cookie,
+                        MoveHalf {
+                            path,
+                            is_dir: mask & IN_ISDIR != 0,
+                        },
+                    );
                     continue;
                 }
                 if mask & IN_DELETE != 0 && mask & IN_ISDIR == 0 {
-                    out.push(Gone {
+                    out.gone.push(Gone {
                         path,
                         moved_out: false,
                     });
@@ -291,18 +338,51 @@ impl Removals {
             }
         }
 
-        // Whatever was moved out and never arrived anywhere inside the root has
-        // left as surely as if it had been unlinked.
-        for (cookie, path) in moved_from {
-            if !moved_to.contains(&cookie) {
-                out.push(Gone {
-                    path,
+        let (moved_out, pending, renamed) =
+            settle_moves(previous_moves, moved_from, moved_to, self.lost);
+        self.pending_moves = pending;
+        for item in moved_out {
+            if item.is_dir {
+                out.folders_moved_out.push(item.path);
+            } else {
+                out.gone.push(Gone {
+                    path: item.path,
                     moved_out: true,
                 });
             }
         }
+        out.renamed = renamed;
         out
     }
+}
+
+/// Pair rename halves without assuming one non-blocking drain receives both.
+///
+/// New unmatched sources are retained. Sources retained by the previous drain
+/// expire only after this drain also failed to produce their destination. An
+/// overflow drops every conclusion: the missing event may have been precisely
+/// the destination which would have cancelled a destructive removal.
+fn settle_moves(
+    mut previous: HashMap<u32, MoveHalf>,
+    mut current: HashMap<u32, MoveHalf>,
+    destinations: HashMap<u32, MoveHalf>,
+    lost: bool,
+) -> (Vec<MoveHalf>, HashMap<u32, MoveHalf>, Vec<Renamed>) {
+    if lost {
+        return (Vec::new(), HashMap::new(), Vec::new());
+    }
+    let mut renamed = Vec::new();
+    for (cookie, to) in destinations {
+        if let Some(from) = previous.remove(&cookie).or_else(|| current.remove(&cookie)) {
+            renamed.push(Renamed {
+                from: from.path,
+                to: to.path,
+                is_dir: from.is_dir || to.is_dir,
+            });
+        }
+    }
+    let moved_out = previous.into_values().collect();
+    (moved_out, current, renamed)
 }
 
 #[cfg(test)]
@@ -334,7 +414,10 @@ mod tests {
         std::fs::remove_file(dir.join("gone.txt")).unwrap();
         settle();
 
-        let gone = w.take();
+        let batch = w.take();
+        assert!(batch.renamed.is_empty());
+        assert!(batch.folders_moved_out.is_empty());
+        let gone = batch.gone;
         assert_eq!(gone.len(), 1, "expected one removal, got {gone:?}");
         assert_eq!(gone[0].path, "gone.txt");
         assert!(!gone[0].moved_out);
@@ -351,11 +434,20 @@ mod tests {
         std::fs::rename(dir.join("doc.txt.tmp"), dir.join("doc.txt")).unwrap();
         settle();
 
+        let batch = w.take();
         assert_eq!(
-            w.take(),
+            batch.gone,
             vec![],
             "a save was reported as a deletion; propagating that would remove a \
              cloud object every time the user pressed save"
+        );
+        assert_eq!(
+            batch.renamed,
+            [Renamed {
+                from: "doc.txt.tmp".into(),
+                to: "doc.txt".into(),
+                is_dir: false,
+            }]
         );
     }
 
@@ -370,10 +462,19 @@ mod tests {
         std::fs::rename(dir.join("a.txt"), dir.join("sub/b.txt")).unwrap();
         settle();
 
+        let batch = w.take();
         assert_eq!(
-            w.take(),
+            batch.gone,
             vec![],
             "moving a file to another folder was read as deleting it"
+        );
+        assert_eq!(
+            batch.renamed,
+            [Renamed {
+                from: "a.txt".into(),
+                to: "sub/b.txt".into(),
+                is_dir: false,
+            }]
         );
     }
 
@@ -389,10 +490,103 @@ mod tests {
         std::fs::rename(dir.join("a.txt"), away.join("a.txt")).unwrap();
         settle();
 
-        let gone = w.take();
+        assert_eq!(
+            w.take().gone,
+            vec![],
+            "a move is held for its possible second half"
+        );
+        let gone = w.take().gone;
         assert_eq!(gone.len(), 1, "expected one removal, got {gone:?}");
         assert_eq!(gone[0].path, "a.txt");
         assert!(gone[0].moved_out, "a move out was recorded as an unlink");
+    }
+
+    #[test]
+    fn a_folder_moved_out_never_enters_the_file_delete_stream() {
+        let dir = scratch("folder-moved-out");
+        let away = scratch("folder-moved-out-target");
+        std::fs::create_dir(dir.join("album")).unwrap();
+        std::fs::write(dir.join("album/photo.jpg"), b"x").unwrap();
+        let mut w = Removals::watch(&dir).unwrap();
+
+        std::fs::rename(dir.join("album"), away.join("album")).unwrap();
+        settle();
+        assert_eq!(w.take(), Batch::default());
+        let batch = w.take();
+
+        assert!(batch.gone.is_empty(), "a folder reached file deletion");
+        assert_eq!(batch.folders_moved_out, ["album"]);
+    }
+
+    #[test]
+    fn rename_halves_split_across_drains_are_still_paired() {
+        let previous = HashMap::from([(
+            41,
+            MoveHalf {
+                path: "before.txt".into(),
+                is_dir: false,
+            },
+        )]);
+        let destinations = HashMap::from([(
+            41,
+            MoveHalf {
+                path: "after.txt".into(),
+                is_dir: false,
+            },
+        )]);
+        let (gone, pending, renamed) = settle_moves(previous, HashMap::new(), destinations, false);
+        assert!(gone.is_empty(), "the first half was misread as a move out");
+        assert!(pending.is_empty());
+        assert_eq!(
+            renamed,
+            [Renamed {
+                from: "before.txt".into(),
+                to: "after.txt".into(),
+                is_dir: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unmatched_move_expires_after_one_later_drain() {
+        let current = HashMap::from([(
+            73,
+            MoveHalf {
+                path: "gone.txt".into(),
+                is_dir: false,
+            },
+        )]);
+        let (gone, pending, renamed) = settle_moves(HashMap::new(), current, HashMap::new(), false);
+        assert!(gone.is_empty());
+        assert!(renamed.is_empty());
+        assert_eq!(pending.get(&73).map(|m| m.path.as_str()), Some("gone.txt"));
+
+        let (gone, pending, renamed) = settle_moves(pending, HashMap::new(), HashMap::new(), false);
+        assert_eq!(gone[0].path, "gone.txt");
+        assert!(pending.is_empty());
+        assert!(renamed.is_empty());
+    }
+
+    #[test]
+    fn an_overflow_discards_pending_destructive_conclusions() {
+        let previous = HashMap::from([(
+            99,
+            MoveHalf {
+                path: "unknown.txt".into(),
+                is_dir: false,
+            },
+        )]);
+        let current = HashMap::from([(
+            100,
+            MoveHalf {
+                path: "also-unknown.txt".into(),
+                is_dir: false,
+            },
+        )]);
+        let (gone, pending, renamed) = settle_moves(previous, current, HashMap::new(), true);
+        assert!(gone.is_empty());
+        assert!(pending.is_empty());
+        assert!(renamed.is_empty());
     }
 
     /// A directory made after the walk still has its contents watched.
@@ -408,7 +602,7 @@ mod tests {
         std::fs::remove_file(dir.join("fresh/x.txt")).unwrap();
         settle();
 
-        let gone = w.take();
+        let gone = w.take().gone;
         assert_eq!(gone.len(), 1, "expected one removal, got {gone:?}");
         assert_eq!(
             gone[0].path, "fresh/x.txt",
@@ -431,7 +625,7 @@ mod tests {
         std::fs::remove_file(dir.join("a/b/c/deep.txt")).unwrap();
         settle();
 
-        let gone = w.take();
+        let gone = w.take().gone;
         assert_eq!(gone.len(), 1, "expected one removal, got {gone:?}");
         assert_eq!(gone[0].path, "a/b/c/deep.txt");
     }
@@ -442,7 +636,7 @@ mod tests {
         std::fs::write(dir.join("a.txt"), b"x").unwrap();
         let mut w = Removals::watch(&dir).unwrap();
         settle();
-        assert_eq!(w.take(), vec![]);
+        assert_eq!(w.take(), Batch::default());
         assert!(!w.lost_events());
     }
 }

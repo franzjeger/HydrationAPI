@@ -40,6 +40,7 @@
 //! * update session: `POST {BASE}/drives/{d}/items/{i}/createUploadSession`
 //! * create session: `POST {BASE}/drives/{d}/root:/{rel}:/createUploadSession`
 //! * metadata: `GET {BASE}/drives/{d}/items/{i}?$select=…`
+//! * rename: `PATCH {BASE}/drives/{d}/items/{i}`
 //! * remove: `DELETE {BASE}/drives/{d}/items/{i}`
 //! * fragments, status and cancel: the `uploadUrl` verbatim, **unauthorised**
 
@@ -274,7 +275,10 @@ impl Rec {
     }
 
     fn is_write(&self) -> bool {
-        matches!(self.method, Method::Put | Method::Post | Method::Delete)
+        matches!(
+            self.method,
+            Method::Put | Method::Post | Method::Patch | Method::Delete
+        )
     }
 
     /// The request body read as JSON, for the create-session assertions.
@@ -451,6 +455,9 @@ fn put(url: impl Into<String>) -> Match {
 }
 fn post(url: impl Into<String>) -> Match {
     on(Method::Post, url)
+}
+fn patch(url: impl Into<String>) -> Match {
+    on(Method::Patch, url)
 }
 fn get(url: impl Into<String>) -> Match {
     on(Method::Get, url)
@@ -834,6 +841,67 @@ fn upserted_etag(cs: &[Change], id: &str) -> Option<String> {
 // write lands on whichever object now occupies that name.
 // ===========================================================================
 
+#[test]
+fn a_local_rename_is_a_conditional_patch_of_the_object() {
+    let rig = Rig::new("rename_same_parent");
+    let from = rig.file("before.txt", b"content");
+    let to = rig.root.join("after.txt");
+    std::fs::rename(&from, &to).unwrap();
+    let id = cloud(MINE, "01REPORT");
+    rig.script(
+        patch(item_url(MINE, "01REPORT"))
+            .body_has("after.txt")
+            .with("if-match"),
+        vec![ok(drive_item("01REPORT", "after.txt", 7, "c:{G},2"))],
+    );
+
+    let moved = rig
+        .sink()
+        .move_item(
+            &from,
+            &to,
+            Known {
+                cloud_id: &id,
+                tag: Some("ct:c:{G},1"),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(moved.cloud_id, id);
+    assert_eq!(moved.etag.as_deref(), Some("ct:c:{G},2"));
+    let calls = rig.journal.calls();
+    assert_eq!(calls.len(), 1, "rename made extra requests: {calls:#?}");
+    assert_eq!(calls[0].method, Method::Patch);
+    assert_eq!(calls[0].header("if-match"), Some("c:{G},1"));
+    assert_eq!(calls[0].json()["name"], "after.txt");
+}
+
+#[test]
+fn a_cross_folder_move_is_refused_until_folder_identity_is_in_the_contract() {
+    let rig = Rig::new("move_cross_parent");
+    let from = rig.file("one/report.txt", b"content");
+    let to = rig.root.join("two/report.txt");
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    std::fs::rename(&from, &to).unwrap();
+    let id = cloud(MINE, "01REPORT");
+
+    let err = rig
+        .sink()
+        .move_item(
+            &from,
+            &to,
+            Known {
+                cloud_id: &id,
+                tag: Some("ct:c:{G},1"),
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    assert!(err.to_string().contains("folder identity"));
+    assert!(rig.journal.calls().is_empty());
+}
+
 /// The first implementation derives the URL from the one thing it was handed —
 /// the path — and uses `existing` only to decide whether to attach `if-match`.
 /// Both branches return `200` here; only the log separates them.
@@ -1105,6 +1173,26 @@ fn remove_deletes_on_the_drive_named_in_the_id() {
         item_url(THEIRS, "01SHARED"),
         "the delete goes to the drive the id names, not the drive the sink was configured with"
     );
+}
+
+#[test]
+fn a_known_local_delete_carries_the_version_recorded_on_disk() {
+    let rig = Rig::new("known_remove_uses_recorded_version");
+    rig.script(
+        del(item_url(MINE, "01KNOWN")).with("if-match"),
+        vec![no_content()],
+    );
+
+    let id = cloud(MINE, "01KNOWN");
+    let mut sink = rig.sink();
+    sink.remove_known(Known {
+        cloud_id: &id,
+        tag: Some("ct:c:{G},7"),
+    })
+    .expect("the recorded version is a valid delete precondition");
+
+    let call = only_call(&rig.journal);
+    assert_eq!(call.header("if-match"), Some("c:{G},7"));
 }
 
 /// `rsplit('|').next().unwrap_or(cloud_id)` turns junk in an extended attribute
