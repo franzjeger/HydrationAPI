@@ -898,7 +898,9 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         // sync meeting a service that throttles would park most
                         // of its queue on the first refusal and not notice.
                         if matches!(outcome, Outcome::Failed(_)) {
-                            queue.touch(file);
+                            queue.failed(file);
+                        } else {
+                            queue.sent(file);
                         }
                     }
                     eprintln!("hydration-sync: upload {file:?} -> {outcome:?}");
