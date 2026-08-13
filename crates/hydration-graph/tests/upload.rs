@@ -3436,6 +3436,171 @@ fn positive_control_remove_deletes_once_and_an_already_gone_object_is_success() 
 }
 
 #[test]
+fn an_empty_folder_is_checked_then_deleted_with_its_metadata_version() {
+    let rig = Rig::new("remove_empty_folder");
+    rig.script(
+        get(item_children(MINE, "01EMPTY"))
+            .q("$top", "1")
+            .q("$select", "id"),
+        vec![ok(serde_json::json!({"value": []}).to_string())],
+    );
+    rig.script(
+        get(item_url(MINE, "01EMPTY")),
+        vec![ok(folder_item("01EMPTY", "Empty", "\"{FOLDER},8\"", ROOT))],
+    );
+    rig.script(
+        del(item_url(MINE, "01EMPTY")).with("if-match"),
+        vec![no_content()],
+    );
+
+    rig.sink()
+        .remove_folder(Known {
+            cloud_id: &cloud(MINE, "01EMPTY"),
+            tag: Some("et:\"{FOLDER},7\""),
+        })
+        .unwrap();
+
+    let calls = rig.journal.calls();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].method, Method::Get);
+    assert_eq!(calls[1].method, Method::Get);
+    assert!(
+        calls[1].query().contains("folder"),
+        "the metadata read must request the facet that proves this is a folder"
+    );
+    assert_eq!(calls[2].method, Method::Delete);
+    assert_eq!(
+        calls[2].header("if-match"),
+        Some("\"{FOLDER},8\""),
+        "the delete is bound to the empty-folder check, after child deletion changed the old tag"
+    );
+    assert!(!calls[2].path().ends_with("/permanentDelete"));
+}
+
+#[test]
+fn a_nonempty_folder_is_never_recursively_deleted() {
+    let rig = Rig::new("refuse_nonempty_folder");
+    rig.script(
+        get(item_children(MINE, "01FOLDER")),
+        vec![ok(
+            serde_json::json!({"value": [{"id": "01CHILD"}]}).to_string()
+        )],
+    );
+
+    let err = rig
+        .sink()
+        .remove_folder(Known {
+            cloud_id: &cloud(MINE, "01FOLDER"),
+            tag: Some("et:\"{FOLDER},7\""),
+        })
+        .unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("not empty"));
+    assert!(rig.journal.deletes().is_empty());
+}
+
+#[test]
+fn an_item_without_the_folder_facet_is_never_deleted_as_a_folder() {
+    let rig = Rig::new("refuse_file_as_folder");
+    rig.script(
+        get(item_children(MINE, "01FILE")),
+        vec![ok(serde_json::json!({"value": []}).to_string())],
+    );
+    rig.script(
+        get(item_url(MINE, "01FILE")),
+        vec![ok(drive_item("01FILE", "file.txt", 12, "c:{FILE},8"))],
+    );
+
+    let err = rig
+        .sink()
+        .remove_folder(Known {
+            cloud_id: &cloud(MINE, "01FILE"),
+            tag: Some("et:\"{FILE},7\""),
+        })
+        .unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("expected folder"));
+    assert!(rig.journal.deletes().is_empty());
+}
+
+#[test]
+fn a_folder_without_a_metadata_etag_is_refused_before_graph() {
+    let rig = Rig::new("refuse_unguarded_folder_remove");
+
+    for tag in [None, Some("ct:c:{FILE},1"), Some("qx:HASH")] {
+        assert!(rig
+            .sink()
+            .remove_folder(Known {
+                cloud_id: &cloud(MINE, "01FOLDER"),
+                tag,
+            })
+            .is_err());
+    }
+    assert!(rig.journal.calls().is_empty());
+}
+
+#[test]
+fn the_sync_root_is_never_removed_even_with_a_valid_identity_and_etag() {
+    let rig = Rig::new("refuse_root_folder_remove");
+    let root_id = cloud(MINE, ROOT);
+    store::set_xattr(&rig.root, store::XATTR_ID, root_id.as_bytes()).unwrap();
+
+    let err = rig
+        .sink()
+        .remove_folder(Known {
+            cloud_id: &root_id,
+            tag: Some("et:\"{ROOT},7\""),
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("sync root"));
+    assert!(rig.journal.calls().is_empty());
+}
+
+#[test]
+fn a_folder_that_gains_a_child_during_delete_is_kept() {
+    let rig = Rig::new("folder_delete_race");
+    rig.script(
+        get(item_children(MINE, "01FOLDER")),
+        vec![ok(serde_json::json!({"value": []}).to_string())],
+    );
+    rig.script(
+        get(item_url(MINE, "01FOLDER")),
+        vec![ok(folder_item(
+            "01FOLDER",
+            "Folder",
+            "\"{FOLDER},8\"",
+            ROOT,
+        ))],
+    );
+    rig.script(
+        del(item_url(MINE, "01FOLDER")).with("if-match"),
+        vec![reply(412, graph_error("resourceModified"))],
+    );
+    rig.script(
+        del(item_url(MINE, "01FOLDER")).without("if-match"),
+        vec![no_content()],
+    );
+
+    let err = rig
+        .sink()
+        .remove_folder(Known {
+            cloud_id: &cloud(MINE, "01FOLDER"),
+            tag: Some("et:\"{FOLDER},7\""),
+        })
+        .unwrap_err();
+
+    assert!(rendered(&err).contains("412"));
+    assert_eq!(rig.journal.deletes().len(), 1);
+    assert_eq!(
+        rig.journal.deletes()[0].header("if-match"),
+        Some("\"{FOLDER},8\"")
+    );
+}
+
+#[test]
 fn positive_control_a_large_file_commits_through_a_session_with_conforming_fragments() {
     let rig = Rig::with_cap("control_large_file", 16);
     let bytes = pattern(12_582_912);

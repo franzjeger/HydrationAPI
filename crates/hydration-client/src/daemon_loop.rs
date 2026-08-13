@@ -677,6 +677,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // until a whole delta batch has settled before deciding which directories
     // still have no cloud identity.
     let delta_busy = Arc::new(AtomicBool::new(false));
+    let folder_refresh = Arc::new(AtomicBool::new(true));
     // Reported by the helper, shown by the status thread. §6.4a.
     let exposures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     // The manifest's file count as of its last build, for `watch`. A stored
@@ -708,13 +709,14 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // The upload driver keeps its own store: a held upload must never block a
     // status query behind a shared lock.
     {
-        let (q, stop, mount, access, resync, delta_busy, folder_retry) = (
+        let (q, stop, mount, access, resync, delta_busy, folder_refresh, folder_retry) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             config.mount.clone(),
             Arc::clone(&access),
             Arc::clone(&resync),
             Arc::clone(&delta_busy),
+            Arc::clone(&folder_refresh),
             std::cmp::max(config.debounce, Duration::from_secs(1)),
         );
         std::thread::spawn(move || {
@@ -756,6 +758,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             let mut folders_pending = BTreeSet::new();
             let mut folders_committed = BTreeMap::new();
             let mut renames_pending = Vec::new();
+            let mut folders_gone_pending = Vec::new();
             let mut folders_seeded = false;
             let mut next_folder_retry = std::time::Instant::now();
             let mut removals = match crate::removals::Removals::watch(&mount) {
@@ -902,6 +905,11 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 }
 
                 if let Some(w) = &mut removals {
+                    if !delta_busy.load(Ordering::SeqCst)
+                        && folder_refresh.swap(false, Ordering::SeqCst)
+                    {
+                        w.refresh_folders();
+                    }
                     let local = w.take();
                     if w.lost_events() {
                         // Missed removals leave objects in the cloud the user
@@ -914,24 +922,9 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         );
                         resync.store(true, Ordering::SeqCst);
                     }
-                    if !local.folders_moved_out.is_empty() || !local.folders_deleted.is_empty() {
-                        let mut refused = local.folders_moved_out.clone();
-                        refused.extend(local.folders_deleted.iter().cloned());
-                        eprintln!(
-                            "hydration-sync: {} folder(s) were deleted or moved out of the sync root; \
-                             their cloud folders were left untouched because recursive folder \
-                             deletion is not yet an explicit, guarded operation. First few: {}",
-                            refused.len(),
-                            refused
-                                .iter()
-                                .take(5)
-                                .map(String::as_str)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                    }
                     folders_pending.extend(local.folders_created);
                     renames_pending.extend(local.renamed);
+                    folders_gone_pending.extend(local.folders_gone);
                     if !local.gone.is_empty() {
                         apply_removals(&mount, &local.gone, &recent, &mut sink);
                     }
@@ -941,14 +934,27 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         apply_renames(&mount, &renames_pending, &mut sink);
                         renames_pending.clear();
                     }
+                    if !folders_gone_pending.is_empty() {
+                        apply_folder_removals(&folders_gone_pending, &mut sink);
+                        folders_gone_pending.clear();
+                    }
                     if !folders_pending.is_empty() && std::time::Instant::now() >= next_folder_retry
                     {
-                        apply_folder_creates(
+                        let created = apply_folder_creates(
                             &mount,
                             &mut folders_pending,
                             &mut folders_committed,
                             &mut sink,
                         );
+                        if let Some(w) = &mut removals {
+                            for (rel, uploaded) in created {
+                                w.remember_folder(
+                                    &rel,
+                                    &uploaded.cloud_id,
+                                    uploaded.etag.as_deref(),
+                                );
+                            }
+                        }
                         next_folder_retry = std::time::Instant::now() + folder_retry;
                     }
                 }
@@ -966,12 +972,13 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // The privileged half is never sent a destination, which is what makes §6b
     // structural rather than a rule someone has to remember.
     {
-        let (q, stop, mount, access, delta_busy) = (
+        let (q, stop, mount, access, delta_busy, folder_refresh) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             config.mount.clone(),
             Arc::clone(&access),
             Arc::clone(&delta_busy),
+            Arc::clone(&folder_refresh),
         );
         std::thread::spawn(move || {
             // Leaving quietly here is indistinguishable, from outside, from a
@@ -1088,6 +1095,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         delta_busy.store(true, Ordering::SeqCst);
                         let applied =
                             delta::apply(&mount, &changes, &mut store, &waiting, placer_ref);
+                        folder_refresh.store(true, Ordering::SeqCst);
                         delta_busy.store(false, Ordering::SeqCst);
                         // The cursor moves only past a pass that finished.
                         //
@@ -1531,9 +1539,10 @@ fn apply_folder_creates<S: Sink>(
     pending: &mut BTreeSet<String>,
     committed: &mut BTreeMap<String, CommittedFolder>,
     sink: &mut S,
-) {
+) -> Vec<(String, Uploaded)> {
     use std::os::unix::fs::MetadataExt;
 
+    let mut recorded = Vec::new();
     let mut paths: Vec<_> = pending.iter().cloned().collect();
     paths.sort_by_key(|path| (path.matches('/').count(), path.clone()));
     for rel in paths {
@@ -1578,6 +1587,7 @@ fn apply_folder_creates<S: Sink>(
                 done.uploaded.etag.as_deref(),
             ) {
                 Ok(()) => {
+                    recorded.push((rel.clone(), done.uploaded.clone()));
                     pending.remove(&rel);
                     committed.remove(&rel);
                 }
@@ -1620,6 +1630,7 @@ fn apply_folder_creates<S: Sink>(
                 ) {
                     Ok(()) => {
                         eprintln!("hydration-sync: created folder {rel} in the cloud");
+                        recorded.push((rel.clone(), done.uploaded.clone()));
                         pending.remove(&rel);
                         committed.remove(&rel);
                     }
@@ -1635,6 +1646,7 @@ fn apply_folder_creates<S: Sink>(
             ),
         }
     }
+    recorded
 }
 
 /// Carry a local identity-preserving rename to the cloud.
@@ -1780,6 +1792,71 @@ fn apply_removals<S: Sink>(
                 "hydration-sync: {} was {how} the sync folder, but the cloud copy could \
                  not be removed: {e}. It will come back on the next delta pass.",
                 g.path
+            ),
+        }
+    }
+}
+
+/// Withdraw directories only through the provider's explicit empty-folder
+/// contract. A generic object delete is intentionally unavailable here.
+fn apply_folder_removals<S: Sink>(gone: &[crate::removals::FolderGone], sink: &mut S) {
+    if gone.len() > REMOVAL_BATCH_LIMIT {
+        eprintln!(
+            "hydration-sync: {} folders were deleted here at once, which is more than this \
+             will remove from the cloud without being asked ({REMOVAL_BATCH_LIMIT}). Nothing \
+             was removed; first few: {}",
+            gone.len(),
+            gone.iter()
+                .take(5)
+                .map(|folder| folder.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return;
+    }
+
+    let mut ordered: Vec<_> = gone.iter().collect();
+    ordered.sort_by_key(|folder| {
+        (
+            std::cmp::Reverse(folder.path.matches('/').count()),
+            folder.path.as_str(),
+        )
+    });
+    for folder in ordered {
+        let how = if folder.moved_out {
+            "moved out of"
+        } else {
+            "deleted from"
+        };
+        let Some(record) = &folder.record else {
+            eprintln!(
+                "hydration-sync: folder {} was {how} the sync folder without a recorded \
+                 cloud identity; no cloud object was deleted",
+                folder.path
+            );
+            continue;
+        };
+        let Some(tag) = record.etag.as_deref() else {
+            eprintln!(
+                "hydration-sync: folder {} was {how} the sync folder, but its cloud metadata \
+                 version was unknown; refusing a blind recursive delete",
+                folder.path
+            );
+            continue;
+        };
+        match sink.remove_folder(Known {
+            cloud_id: &record.cloud_id,
+            tag: Some(tag),
+        }) {
+            Ok(()) => eprintln!(
+                "hydration-sync: folder {} was {how} the sync folder; removed the proven-empty \
+                 cloud folder",
+                folder.path
+            ),
+            Err(e) => eprintln!(
+                "hydration-sync: folder {} was {how} the sync folder, but the cloud folder \
+                 was left untouched: {e}. It will come back on the next delta pass.",
+                folder.path
             ),
         }
     }
@@ -2198,6 +2275,7 @@ mod tests {
     #[derive(Default)]
     struct DeleteSink {
         known: Vec<(String, Option<String>)>,
+        folders: Vec<(String, Option<String>)>,
         plain: Vec<String>,
     }
 
@@ -2220,6 +2298,14 @@ mod tests {
 
         fn remove(&mut self, cloud_id: &str) -> io::Result<()> {
             self.plain.push(cloud_id.to_string());
+            Ok(())
+        }
+
+        fn remove_folder(&mut self, existing: Known<'_>) -> io::Result<()> {
+            self.folders.push((
+                existing.cloud_id.to_string(),
+                existing.tag.map(str::to_string),
+            ));
             Ok(())
         }
     }
@@ -2254,6 +2340,90 @@ mod tests {
             sink.known,
             [("drive|cloud-delete".into(), Some("ct:c:{G},9".into()))]
         );
+        assert!(sink.plain.is_empty());
+    }
+
+    #[test]
+    fn folder_deletes_are_versioned_and_deepest_first() {
+        let mut sink = DeleteSink::default();
+        apply_folder_removals(
+            &[
+                crate::removals::FolderGone {
+                    path: "Work".into(),
+                    moved_out: false,
+                    record: Some(crate::removals::FolderRecord {
+                        cloud_id: "drive|parent".into(),
+                        etag: Some("et:parent-1".into()),
+                    }),
+                },
+                crate::removals::FolderGone {
+                    path: "Work/Empty".into(),
+                    moved_out: false,
+                    record: Some(crate::removals::FolderRecord {
+                        cloud_id: "drive|child".into(),
+                        etag: Some("et:child-1".into()),
+                    }),
+                },
+            ],
+            &mut sink,
+        );
+
+        assert_eq!(
+            sink.folders,
+            [
+                ("drive|child".into(), Some("et:child-1".into())),
+                ("drive|parent".into(), Some("et:parent-1".into())),
+            ]
+        );
+        assert!(sink.known.is_empty());
+        assert!(sink.plain.is_empty());
+    }
+
+    #[test]
+    fn folder_delete_without_both_identity_and_version_never_reaches_the_sink() {
+        let mut sink = DeleteSink::default();
+        apply_folder_removals(
+            &[
+                crate::removals::FolderGone {
+                    path: "local-only".into(),
+                    moved_out: false,
+                    record: None,
+                },
+                crate::removals::FolderGone {
+                    path: "unversioned".into(),
+                    moved_out: false,
+                    record: Some(crate::removals::FolderRecord {
+                        cloud_id: "drive|folder".into(),
+                        etag: None,
+                    }),
+                },
+            ],
+            &mut sink,
+        );
+
+        assert!(sink.folders.is_empty());
+        assert!(sink.known.is_empty());
+        assert!(sink.plain.is_empty());
+    }
+
+    #[test]
+    fn an_oversized_folder_delete_batch_is_all_or_nothing() {
+        let gone: Vec<_> = (0..=REMOVAL_BATCH_LIMIT)
+            .map(|index| crate::removals::FolderGone {
+                path: format!("folder-{index}"),
+                moved_out: false,
+                record: Some(crate::removals::FolderRecord {
+                    cloud_id: format!("drive|folder-{index}"),
+                    etag: Some(format!("et:folder-{index}")),
+                }),
+            })
+            .collect();
+        let mut sink = DeleteSink::default();
+
+        apply_folder_removals(&gone, &mut sink);
+
+        assert!(sink.folders.is_empty());
+        assert!(sink.known.is_empty());
         assert!(sink.plain.is_empty());
     }
 

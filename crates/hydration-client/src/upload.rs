@@ -173,6 +173,21 @@ pub trait Sink: Send {
         ))
     }
 
+    /// Remove a folder after the provider has proved that doing so is not an
+    /// implicit recursive delete.
+    ///
+    /// Kept separate from [`Sink::remove_known`]: deleting a file removes one
+    /// object, while deleting a non-empty folder removes an unbounded subtree.
+    /// A provider must require the recorded identity and metadata version,
+    /// check its service-specific empty-folder condition, and bind the delete
+    /// to the version observed by that check.
+    fn remove_folder(&mut self, _existing: Known<'_>) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this cloud provider cannot safely remove folders",
+        ))
+    }
+
     /// Remove an object whose identity and base version are both known.
     ///
     /// The default preserves the older id-only contract for providers which do
@@ -517,6 +532,9 @@ impl<P: Provider + Sink> Sink for ProviderSink<P> {
     }
     fn remove_known(&mut self, existing: Known<'_>) -> io::Result<()> {
         self.0.remove_known(existing)
+    }
+    fn remove_folder(&mut self, existing: Known<'_>) -> io::Result<()> {
+        self.0.remove_folder(existing)
     }
     fn remove(&mut self, cloud_id: &str) -> io::Result<()> {
         self.0.remove(cloud_id)
