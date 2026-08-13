@@ -96,6 +96,7 @@ fn folder(path: &str, id: &str) -> Change {
     Change::FolderUpserted {
         cloud_id: id.into(),
         path: path.into(),
+        etag: Some("et:folder-1".into()),
     }
 }
 
@@ -368,6 +369,11 @@ fn a_remote_folder_delete_never_recursively_erases_local_content() {
         store::get_xattr(&dir.join("Work"), store::XATTR_ID).unwrap(),
         None,
         "the surviving local-only folder retained a deleted cloud identity"
+    );
+    assert_eq!(
+        store::get_xattr(&dir.join("Work"), store::XATTR_ETAG).unwrap(),
+        None,
+        "the surviving local-only folder retained the deleted object's version"
     );
 
     let next = run(&dir, &[folder("Work", "folder-2")], &q, &mut m);

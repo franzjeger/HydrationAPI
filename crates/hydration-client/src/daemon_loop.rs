@@ -22,10 +22,11 @@ use crate::manifest::{BackupPolicy, Manifest};
 use crate::place::TmpfilePlacer;
 use crate::reclaim;
 use crate::store::Store;
-use crate::upload::{run_upload, Known, Outcome, Queue, Sink, SystemClock};
+use crate::upload::{run_upload, Known, Outcome, Queue, Sink, SystemClock, Uploaded};
 use crate::{Changes, Daemon, Provider};
 use hydration_protocol::transport::DaemonConn;
 use hydration_protocol::FileId;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -671,6 +672,11 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // Set when the helper says its change channel has a hole in it, so the
     // upload driver walks instead of trusting what it was told.
     let resync = Arc::new(AtomicBool::new(true));
+    // Folder events produced by the delta applier are indistinguishable from
+    // local mkdir/rename events at the inotify boundary. The upload side waits
+    // until a whole delta batch has settled before deciding which directories
+    // still have no cloud identity.
+    let delta_busy = Arc::new(AtomicBool::new(false));
     // Reported by the helper, shown by the status thread. §6.4a.
     let exposures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     // The manifest's file count as of its last build, for `watch`. A stored
@@ -702,12 +708,14 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // The upload driver keeps its own store: a held upload must never block a
     // status query behind a shared lock.
     {
-        let (q, stop, mount, access, resync) = (
+        let (q, stop, mount, access, resync, delta_busy, folder_retry) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             config.mount.clone(),
             Arc::clone(&access),
             Arc::clone(&resync),
+            Arc::clone(&delta_busy),
+            std::cmp::max(config.debounce, Duration::from_secs(1)),
         );
         std::thread::spawn(move || {
             // Same reasoning as the delta thread below: a queue that grows and
@@ -745,6 +753,11 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // eviction policy would buy is a more interesting way to be wrong.
             let mut recent: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
+            let mut folders_pending = BTreeSet::new();
+            let mut folders_committed = BTreeMap::new();
+            let mut renames_pending = Vec::new();
+            let mut folders_seeded = false;
+            let mut next_folder_retry = std::time::Instant::now();
             let mut removals = match crate::removals::Removals::watch(&mount) {
                 Ok(w) => {
                     eprintln!(
@@ -822,6 +835,25 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         }
                         Err(e) => eprintln!("hydration-sync: resync walk failed: {e}"),
                     }
+                    if !delta_busy.load(Ordering::SeqCst) {
+                        match unidentified_folders(&mount) {
+                            Ok(found) => folders_pending.extend(found),
+                            Err(e) => eprintln!("hydration-sync: folder resync walk failed: {e}"),
+                        }
+                    }
+                }
+
+                if !folders_seeded
+                    && !delta_busy.load(Ordering::SeqCst)
+                    && has_cloud_identity(&mount)
+                {
+                    match unidentified_folders(&mount) {
+                        Ok(found) => {
+                            folders_pending.extend(found);
+                            folders_seeded = true;
+                        }
+                        Err(e) => eprintln!("hydration-sync: folder startup walk failed: {e}"),
+                    }
                 }
 
                 let due = q.lock().unwrap().due();
@@ -880,15 +912,17 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                              deleted here will stay in the cloud until they are deleted \
                              again"
                         );
+                        resync.store(true, Ordering::SeqCst);
                     }
-                    if !local.folders_moved_out.is_empty() {
+                    if !local.folders_moved_out.is_empty() || !local.folders_deleted.is_empty() {
+                        let mut refused = local.folders_moved_out.clone();
+                        refused.extend(local.folders_deleted.iter().cloned());
                         eprintln!(
-                            "hydration-sync: {} folder(s) were moved out of the sync root; \
+                            "hydration-sync: {} folder(s) were deleted or moved out of the sync root; \
                              their cloud folders were left untouched because recursive folder \
                              deletion is not yet an explicit, guarded operation. First few: {}",
-                            local.folders_moved_out.len(),
-                            local
-                                .folders_moved_out
+                            refused.len(),
+                            refused
                                 .iter()
                                 .take(5)
                                 .map(String::as_str)
@@ -896,11 +930,26 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                                 .join(", ")
                         );
                     }
-                    if !local.renamed.is_empty() {
-                        apply_renames(&mount, &local.renamed, &mut sink);
-                    }
+                    folders_pending.extend(local.folders_created);
+                    renames_pending.extend(local.renamed);
                     if !local.gone.is_empty() {
                         apply_removals(&mount, &local.gone, &recent, &mut sink);
+                    }
+                }
+                if !delta_busy.load(Ordering::SeqCst) {
+                    if !renames_pending.is_empty() {
+                        apply_renames(&mount, &renames_pending, &mut sink);
+                        renames_pending.clear();
+                    }
+                    if !folders_pending.is_empty() && std::time::Instant::now() >= next_folder_retry
+                    {
+                        apply_folder_creates(
+                            &mount,
+                            &mut folders_pending,
+                            &mut folders_committed,
+                            &mut sink,
+                        );
+                        next_folder_retry = std::time::Instant::now() + folder_retry;
                     }
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -917,11 +966,12 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // The privileged half is never sent a destination, which is what makes §6b
     // structural rather than a rule someone has to remember.
     {
-        let (q, stop, mount, access) = (
+        let (q, stop, mount, access, delta_busy) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             config.mount.clone(),
             Arc::clone(&access),
+            Arc::clone(&delta_busy),
         );
         std::thread::spawn(move || {
             // Leaving quietly here is indistinguishable, from outside, from a
@@ -1035,8 +1085,10 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         // unprotected. The snapshot can go stale, which is what
                         // the stamp check inside `apply` is for.
                         let waiting = q.lock().unwrap().waiting_set();
+                        delta_busy.store(true, Ordering::SeqCst);
                         let applied =
                             delta::apply(&mount, &changes, &mut store, &waiting, placer_ref);
+                        delta_busy.store(false, Ordering::SeqCst);
                         // The cursor moves only past a pass that finished.
                         //
                         // A delta service does not replay a consumed change, so
@@ -1415,6 +1467,176 @@ impl Registers {
     }
 }
 
+#[derive(Debug)]
+struct CommittedFolder {
+    uploaded: Uploaded,
+    dev: u64,
+    ino: u64,
+}
+
+fn has_cloud_identity(path: &std::path::Path) -> bool {
+    matches!(
+        crate::store::get_xattr(path, crate::store::XATTR_ID),
+        Ok(Some(raw)) if !raw.is_empty()
+    )
+}
+
+/// Find directories which are not yet attached to a cloud object.
+///
+/// This is the recovery path for daemon restarts and inotify overflow. The
+/// caller processes the returned paths shallowest-first, because a child can
+/// only be created after its parent has a stable identity.
+fn unidentified_folders(root: &std::path::Path) -> io::Result<BTreeSet<String>> {
+    let mut found = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if !kind.is_dir() {
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(hydration_protocol::names::is_internal)
+            {
+                continue;
+            }
+            stack.push(path.clone());
+            if has_cloud_identity(&path) {
+                continue;
+            }
+            if let Ok(rel) = path.strip_prefix(root) {
+                if let Some(rel) = rel.to_str() {
+                    found.insert(rel.to_string());
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Create pending local directories without ever retrying a Graph create that
+/// has already committed. If recording the returned identity fails, the
+/// committed result stays in memory and only the local xattr write is retried.
+fn apply_folder_creates<S: Sink>(
+    root: &std::path::Path,
+    pending: &mut BTreeSet<String>,
+    committed: &mut BTreeMap<String, CommittedFolder>,
+    sink: &mut S,
+) {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut paths: Vec<_> = pending.iter().cloned().collect();
+    paths.sort_by_key(|path| (path.matches('/').count(), path.clone()));
+    for rel in paths {
+        let path = root.join(&rel);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            pending.remove(&rel);
+            committed.remove(&rel);
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            pending.remove(&rel);
+            committed.remove(&rel);
+            continue;
+        }
+        if has_cloud_identity(&path) {
+            pending.remove(&rel);
+            committed.remove(&rel);
+            continue;
+        }
+
+        if let Some(done) = committed.get(&rel) {
+            if metadata.dev() != done.dev || metadata.ino() != done.ino {
+                let known = Known {
+                    cloud_id: &done.uploaded.cloud_id,
+                    tag: done.uploaded.etag.as_deref(),
+                };
+                match sink.remove_known(known) {
+                    Ok(()) => {
+                        committed.remove(&rel);
+                    }
+                    Err(e) => eprintln!(
+                        "hydration-sync: folder {rel} changed inode after its cloud create; \
+                         could not conditionally withdraw the orphaned object: {e}"
+                    ),
+                }
+                continue;
+            }
+            let mut store = Store::new();
+            match store.adopt_cloud_id(
+                &path,
+                &done.uploaded.cloud_id,
+                done.uploaded.etag.as_deref(),
+            ) {
+                Ok(()) => {
+                    pending.remove(&rel);
+                    committed.remove(&rel);
+                }
+                Err(e) => eprintln!(
+                    "hydration-sync: created folder {rel} in the cloud, but could not record \
+                     its returned identity locally; recording will be retried: {e}"
+                ),
+            }
+            continue;
+        }
+
+        let Some(parent) = path.parent() else {
+            pending.remove(&rel);
+            continue;
+        };
+        if !has_cloud_identity(parent) {
+            continue;
+        }
+        match sink.create_folder(&path) {
+            Ok(uploaded) => {
+                committed.insert(
+                    rel.clone(),
+                    CommittedFolder {
+                        uploaded,
+                        dev: metadata.dev(),
+                        ino: metadata.ino(),
+                    },
+                );
+                // Recording is intentionally a separate step through the
+                // committed arm, so a failed xattr write can never repeat the
+                // already-successful remote create.
+                let Some(done) = committed.get(&rel) else {
+                    continue;
+                };
+                let mut store = Store::new();
+                match store.adopt_cloud_id(
+                    &path,
+                    &done.uploaded.cloud_id,
+                    done.uploaded.etag.as_deref(),
+                ) {
+                    Ok(()) => {
+                        eprintln!("hydration-sync: created folder {rel} in the cloud");
+                        pending.remove(&rel);
+                        committed.remove(&rel);
+                    }
+                    Err(e) => eprintln!(
+                        "hydration-sync: created folder {rel} in the cloud, but could not record \
+                         its returned identity locally; recording will be retried: {e}"
+                    ),
+                }
+            }
+            Err(e) => eprintln!(
+                "hydration-sync: local folder {rel} could not be created in the cloud; \
+                 it remains queued: {e}"
+            ),
+        }
+    }
+}
+
 /// Carry a local identity-preserving rename to the cloud.
 ///
 /// A genuine filesystem rename keeps the inode and its cloud xattrs. An atomic
@@ -1428,14 +1650,6 @@ fn apply_renames<S: Sink>(
     sink: &mut S,
 ) {
     for item in renamed {
-        if item.is_dir {
-            eprintln!(
-                "hydration-sync: folder {} was renamed to {}; the cloud folder was left \
-                 untouched because folder identity is not yet part of the move contract",
-                item.from, item.to
-            );
-            continue;
-        }
         let internal = |path: &str| {
             std::path::Path::new(path)
                 .file_name()
@@ -1480,7 +1694,7 @@ fn apply_renames<S: Sink>(
                     ),
                     Err(e) => eprintln!(
                         "hydration-sync: renamed {} to {} in the cloud, but could not record \
-                         the returned identity on the local file: {e}",
+                         the returned identity on the local object: {e}",
                         item.from, item.to
                     ),
                 }
@@ -1804,6 +2018,62 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct FolderSink {
+        created: Vec<PathBuf>,
+    }
+
+    impl Sink for FolderSink {
+        fn upload(&mut self, _path: &Path, _existing: Option<Known<'_>>) -> io::Result<Uploaded> {
+            unreachable!("this sink only records folder creates")
+        }
+
+        fn create_folder(&mut self, path: &Path) -> io::Result<Uploaded> {
+            self.created.push(path.to_path_buf());
+            let name = path.file_name().unwrap().to_string_lossy();
+            Ok(Uploaded {
+                cloud_id: format!("cloud-{name}"),
+                etag: Some(format!("et:version-{name}")),
+            })
+        }
+
+        fn remove(&mut self, _cloud_id: &str) -> io::Result<()> {
+            unreachable!("this sink only records folder creates")
+        }
+    }
+
+    #[test]
+    fn local_folder_create_is_parent_first_and_records_returned_identity() {
+        let dir = scratch("folder-create-parent-first");
+        store::set_xattr(&dir, store::XATTR_ID, b"cloud-root").unwrap();
+        std::fs::create_dir_all(dir.join("Projects/New")).unwrap();
+        let mut pending = unidentified_folders(&dir).unwrap();
+        let mut committed = BTreeMap::new();
+        let mut sink = FolderSink::default();
+
+        apply_folder_creates(&dir, &mut pending, &mut committed, &mut sink);
+
+        assert_eq!(
+            sink.created,
+            [dir.join("Projects"), dir.join("Projects/New")],
+            "a child was sent before its parent's returned cloud identity was recorded"
+        );
+        assert!(pending.is_empty());
+        assert!(committed.is_empty());
+        assert_eq!(
+            store::get_xattr(&dir.join("Projects"), store::XATTR_ID)
+                .unwrap()
+                .unwrap(),
+            b"cloud-Projects"
+        );
+        assert_eq!(
+            store::get_xattr(&dir.join("Projects/New"), store::XATTR_ETAG)
+                .unwrap()
+                .unwrap(),
+            b"et:version-New"
+        );
+    }
+
+    #[derive(Default)]
     struct RenameSink {
         moves: Vec<(PathBuf, PathBuf, String, Option<String>)>,
     }
@@ -1873,6 +2143,36 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             b"ctag-after-rename"
+        );
+    }
+
+    #[test]
+    fn identity_preserving_folder_rename_uses_the_same_guarded_namespace_operation() {
+        let dir = scratch("rename-folder-cloud");
+        let target = dir.join("after");
+        std::fs::create_dir(&target).unwrap();
+        store::set_xattr(&target, store::XATTR_ID, b"cloud-folder").unwrap();
+        store::set_xattr(&target, store::XATTR_ETAG, b"et:folder-before").unwrap();
+        let mut sink = RenameSink::default();
+
+        apply_renames(
+            &dir,
+            &[crate::removals::Renamed {
+                from: "before".into(),
+                to: "after".into(),
+                is_dir: true,
+            }],
+            &mut sink,
+        );
+
+        assert_eq!(
+            sink.moves,
+            [(
+                dir.join("before"),
+                target,
+                "cloud-folder".into(),
+                Some("et:folder-before".into()),
+            )]
         );
     }
 

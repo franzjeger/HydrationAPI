@@ -34,7 +34,7 @@ fn build(fanout: usize, files_per_leaf: usize) -> (Namespace, usize) {
         id: "TOP".into(),
         parent: "R".into(),
         name: "Documents".into(),
-        kind: Kind::Folder,
+        kind: Kind::Folder { etag: None },
     });
 
     let mut files = 0;
@@ -44,7 +44,7 @@ fn build(fanout: usize, files_per_leaf: usize) -> (Namespace, usize) {
             id: fa.clone(),
             parent: "TOP".into(),
             name: fa.clone(),
-            kind: Kind::Folder,
+            kind: Kind::Folder { etag: None },
         });
         for b in 0..fanout {
             let fb = format!("d{a}_{b}");
@@ -52,7 +52,7 @@ fn build(fanout: usize, files_per_leaf: usize) -> (Namespace, usize) {
                 id: fb.clone(),
                 parent: fa.clone(),
                 name: fb.clone(),
-                kind: Kind::Folder,
+                kind: Kind::Folder { etag: None },
             });
             for c in 0..files_per_leaf {
                 ns.apply(Item::Upsert {
@@ -76,7 +76,7 @@ fn move_top(ns: &mut Namespace, to: &str) -> usize {
         id: "TOP".into(),
         parent: "R".into(),
         name: to.into(),
-        kind: Kind::Folder,
+        kind: Kind::Folder { etag: None },
     })
     .len()
 }
@@ -112,7 +112,7 @@ fn a_reversed_page_costs_time_proportional_to_its_length() {
                 id: format!("d{d}"),
                 parent: "R".into(),
                 name: format!("d{d}"),
-                kind: Kind::Folder,
+                kind: Kind::Folder { etag: None },
             });
         }
         ns.apply(Item::Root { id: "R".into() });
@@ -145,7 +145,7 @@ fn items_stuck_forever_do_not_slow_down_everything_else() {
             id: "D".into(),
             parent: "R".into(),
             name: "Docs".into(),
-            kind: Kind::Folder,
+            kind: Kind::Folder { etag: None },
         });
         for i in 0..stuck {
             ns.apply(Item::Upsert {

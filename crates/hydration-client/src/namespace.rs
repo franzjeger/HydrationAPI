@@ -101,7 +101,11 @@ pub enum Kind {
         /// UI would dehydrate the whole tree.
         ctag: Option<String>,
     },
-    Folder,
+    Folder {
+        /// A metadata version for conditional rename/delete operations.
+        /// Unlike a file cTag, changing this does not imply content changed.
+        etag: Option<String>,
+    },
     /// A folder-shaped thing that must not be walked into.
     ///
     /// Graph's `package` facet — a OneNote notebook is a folder whose internals
@@ -303,12 +307,13 @@ impl Namespace {
                     Node {
                         parent: None,
                         name: String::new(),
-                        kind: Kind::Folder,
+                        kind: Kind::Folder { etag: None },
                     },
                 );
                 out.push(Change::FolderUpserted {
                     cloud_id: id.clone(),
                     path: String::new(),
+                    etag: None,
                 });
                 Some(id)
             }
@@ -385,6 +390,9 @@ impl Namespace {
         let reshaped = previous.as_ref().is_some_and(|prev| {
             std::mem::discriminant(&prev.kind) != std::mem::discriminant(&kind)
         });
+        let metadata_changed = previous
+            .as_ref()
+            .is_some_and(|previous| previous.kind != kind);
         if reshaped {
             self.delete(&id, out);
         }
@@ -421,11 +429,14 @@ impl Namespace {
                     });
                 }
             }
-            Kind::Folder if previous.is_none() || moved || reshaped => {
+            Kind::Folder { etag }
+                if previous.is_none() || moved || reshaped || metadata_changed =>
+            {
                 if let Some(path) = self.path_of(&id) {
                     out.push(Change::FolderUpserted {
                         cloud_id: id.clone(),
                         path,
+                        etag: etag.clone(),
                     });
                 }
                 // A folder move changes every descendant path, and the service
@@ -435,7 +446,7 @@ impl Namespace {
                     self.collect_descendants(&id, out);
                 }
             }
-            Kind::Folder => {}
+            Kind::Folder { .. } => {}
             Kind::Opaque => {}
         }
         Some(id)
@@ -460,7 +471,7 @@ impl Namespace {
                     Kind::File { .. } => out.push(Change::Removed {
                         cloud_id: gone.clone(),
                     }),
-                    Kind::Folder => {
+                    Kind::Folder { .. } => {
                         if let Some(path) = self.path_of(gone) {
                             out.push(Change::FolderRemoved {
                                 cloud_id: gone.clone(),
@@ -476,7 +487,7 @@ impl Namespace {
             Kind::File { .. } => out.push(Change::Removed {
                 cloud_id: id.to_string(),
             }),
-            Kind::Folder => {
+            Kind::Folder { .. } => {
                 if let Some(path) = self.path_of(id) {
                     out.push(Change::FolderRemoved {
                         cloud_id: id.to_string(),
@@ -596,11 +607,12 @@ impl Namespace {
                 }
                 // Never walked into. Its contents are one document.
                 Kind::Opaque => continue,
-                Kind::Folder => {
+                Kind::Folder { etag } => {
                     if let Some(path) = self.path_of(&cur) {
                         out.push(Change::FolderUpserted {
                             cloud_id: cur.clone(),
                             path,
+                            etag: etag.clone(),
                         });
                     }
                 }
@@ -754,7 +766,7 @@ mod tests {
             id: id.into(),
             parent: parent.into(),
             name: name.into(),
-            kind: Kind::Folder,
+            kind: Kind::Folder { etag: None },
         }
     }
 
@@ -796,7 +808,9 @@ mod tests {
         changes
             .iter()
             .filter_map(|change| match change {
-                Change::FolderUpserted { cloud_id, path } => Some((cloud_id.clone(), path.clone())),
+                Change::FolderUpserted { cloud_id, path, .. } => {
+                    Some((cloud_id.clone(), path.clone()))
+                }
                 _ => None,
             })
             .collect()
@@ -1104,6 +1118,40 @@ mod tests {
         assert_eq!(restored.listing(), before);
         assert_eq!(restored.pending(), 0, "a snapshot was not parent-first");
         assert!(restored.problems().is_empty());
+    }
+
+    #[test]
+    fn a_folder_metadata_version_change_is_reported_without_rebuilding_the_tree() {
+        let mut ns = tree();
+        let changed = ns.apply(Item::Upsert {
+            id: "F".into(),
+            parent: "R".into(),
+            name: "Work".into(),
+            kind: Kind::Folder {
+                etag: Some("et:\"{F},2\"".into()),
+            },
+        });
+
+        assert_eq!(
+            changed,
+            vec![Change::FolderUpserted {
+                cloud_id: "F".into(),
+                path: "Work".into(),
+                etag: Some("et:\"{F},2\"".into()),
+            }]
+        );
+        assert!(
+            ns.apply(Item::Upsert {
+                id: "F".into(),
+                parent: "R".into(),
+                name: "Work".into(),
+                kind: Kind::Folder {
+                    etag: Some("et:\"{F},2\"".into()),
+                },
+            })
+            .is_empty(),
+            "an identical metadata version became repeated work"
+        );
     }
 
     #[test]
