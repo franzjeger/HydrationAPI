@@ -4,7 +4,81 @@ Three units and one mount, arranged so that the failure nothing inside the
 process can cover — both halves of the helper dying at once — takes the files
 out of reach instead of turning them into zeros.
 
+## What your sync root has to be
+
+Six requirements. Three are deliberate refusals at startup, one is the kernel
+simply not having the interface, one surfaces at the first placeholder written,
+and the last cannot be enforced at all — only reported. They are
+checked rather than assumed because each of them, got wrong, produces the same
+symptom: a mount full of files that read as zeros while every unit reports
+active. What that costs a deployer is finding out one restart at a time, so they
+are collected here.
+
+| # | Requirement | Checked by | If not |
+|---|---|---|---|
+| 1 | Kernel **6.14 or later** | `probes/precontent.c`, and `fanotify_init` at startup | `FAN_PRE_ACCESS` does not exist; nothing works |
+| 2 | The sync root is **its own mount** | client, every delta round | client refuses to start or apply |
+| 3 | The mount is **not a downstream copy** of another | `hydrationd`, before marking | `hydrationd` refuses to start |
+| 4 | The filesystem records **sub-second mtimes** | `hydrationd`, before marking | `hydrationd` refuses to start |
+| 5 | The filesystem supports **`O_TMPFILE`** and **`user.*` xattrs** | first placeholder written | every placeholder fails to be created |
+| 6 | **No other mount** exposes the same files | `hydrationd`, continuously | warning only — it cannot be enforced |
+
+**1. Kernel 6.14.** Where `FAN_PRE_ACCESS` shipped. There is no fallback; on an
+older kernel the framework cannot intercept a read at all.
+
+**2. Its own mount.** A directory mark is accepted by `fanotify_mark` and
+delivers nothing, so a sync root that is not its own mount can never be
+protected — and a placeholder written into one is not a file whose content lives
+elsewhere, it is a file that reads as zeros. This happened: a client started
+while its mount was down and wrote 145,711 files into the bare directory
+underneath. See "Why the sync folder needs its own volume" below.
+
+**3. Not a downstream copy.** `fanotify_mark(FAN_MARK_MOUNT)` marks the
+`vfsmount` in the *caller's* namespace. Under systemd, each of `PrivateTmp=`,
+`PrivateNetwork=`, `ProtectKernelTunables=`, `ProtectControlGroups=` and
+`ProtectKernelModules=` gives a unit its own mount namespace, and **any one of
+them alone** causes this: the helper marks its private copy, logs that it is
+watching, and every read from the user's session goes through an unmarked mount.
+Use `RestrictAddressFamilies=AF_UNIX` for network denial — it needs no
+namespace. The supplied `hydrationd.service` is written around this constraint
+and says so at length.
+
+**4. Sub-second mtimes.** The worker decides whether it may still believe its own
+record of which ranges it has filled by comparing `{mtime, mtime_nsec, size}`.
+On a filesystem that keeps mtime to the whole second there is nothing to compare,
+so a write by anything else inside that second is indistinguishable from no write
+at all — and the worker goes on to certify the file complete and stop
+intercepting it with somebody else's bytes inside. In practice this means **ext4
+with a 128-byte inode**, whose inode predates the fields that hold the
+sub-second part. `mkfs.ext4 -I 256` or larger, btrfs and xfs all record
+nanoseconds. There is no finer signal to fall back on — `STATX_CHANGE_COOKIE` is
+not in the kernel's UAPI and `ctime` shares the inode's resolution — so this is
+refused rather than worked around. DESIGN.md §8z-bis has the measurements.
+
+**5. `O_TMPFILE` and `user.*` extended attributes.** Placeholders are built on an
+anonymous inode and linked into place, and their identity is kept in `user.*`
+attributes. btrfs, ext4 and xfs all qualify — the CI matrix runs the whole suite
+on each of them, which is what that matrix is for.
+
+**6. No other mount exposes the files.** This is the one requirement that cannot
+be enforced, only detected — a bind mount of the parent, a container runtime, or
+a unit with `BindPaths=` can create a second path to the same files at any time,
+and a read through it bypasses hydration entirely. `hydrationd` scans the mount
+table and warns. It cannot see mounts in another namespace at all. See §6.4a.
+
+### The short version
+
+A separate **btrfs subvolume** mounted at the sync path satisfies 2, 4 and 5. On
+a layout where the btrfs root (`subvolid=5`) is not itself mounted it satisfies 6
+as well — verified on an Arch/CachyOS install, where `@`, `@home`, `@root`,
+`@srv`, `@cache` and `@log` are mounted individually and `subvolid=5` does not
+appear in the mount table. Check your own with `findmnt -t btrfs`. That is what
+`hydration-mount.mount` below assumes. An ext4 filesystem made with `-I 256` or
+larger, on its own partition or loop image, is equally fine.
+
 ## Why the sync folder needs its own volume
+
+The long form of rows 2 and 6 above, and the measurements behind them.
 
 Measured, in `probes/dirmark.c` and the bind-mount runs recorded in DESIGN.md
 §6.4a:
