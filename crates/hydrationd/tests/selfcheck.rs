@@ -245,3 +245,81 @@ fn a_helper_that_cannot_pair_takes_the_mount_with_it() {
         at.display()
     );
 }
+
+/// The verdict has to match what the filesystem actually does, on whichever one
+/// the suite was pointed at.
+///
+/// Asserted against an independent measurement rather than against a hard-coded
+/// expectation, because the whole point of the matrix is that the answer differs
+/// per filesystem: this test must pass on btrfs, xfs and ext4-512 by returning
+/// `Fine`, and on ext4-128 by returning `Coarse`. A test that expected one
+/// answer would either be wrong on one leg or would have to know which leg it
+/// was on, and knowing that is exactly the thing under test.
+#[test]
+fn the_timestamp_verdict_matches_what_the_filesystem_records() {
+    let Some(mount) = env() else {
+        return skip("needs root and HYDRATIOND_TEST_MOUNT");
+    };
+    let dir = mount.join("timestamp-verdict");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    // The independent measurement: write, and look at the nanoseconds directly.
+    // Sampled rather than taken once, for the reason `timestamp_resolution`
+    // documents — one sample landing on a whole second is not evidence.
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    let f = dir.join("sample.bin");
+    let mut any_nsec = false;
+    for _ in 0..8 {
+        let mut h = std::fs::File::create(&f).expect("create");
+        h.write_all(b"x").expect("write");
+        h.sync_all().expect("sync");
+        drop(h);
+        if std::fs::metadata(&f).expect("stat").mtime_nsec() != 0 {
+            any_nsec = true;
+            break;
+        }
+    }
+
+    let verdict = selfcheck::timestamp_resolution(&dir).expect("verdict");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let expected = if any_nsec {
+        selfcheck::Timestamps::Fine
+    } else {
+        selfcheck::Timestamps::Coarse
+    };
+    assert_eq!(
+        verdict,
+        expected,
+        "the filesystem {} record sub-second mtimes, and the check said {verdict:?}",
+        if any_nsec { "does" } else { "does not" }
+    );
+}
+
+/// And it leaves nothing behind, including the name it probes with.
+///
+/// The probe writes inside the sync root — the user's own folder — so a file
+/// left there is litter in the one directory this framework is most careful
+/// about. The name it uses is already `names::is_scratch`, so a crash mid-check
+/// is swept up, but the ordinary path must not need the sweep.
+#[test]
+fn the_timestamp_check_leaves_the_sync_root_as_it_found_it() {
+    let Some(mount) = env() else {
+        return skip("needs root and HYDRATIOND_TEST_MOUNT");
+    };
+    let dir = mount.join("timestamp-residue");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    selfcheck::timestamp_resolution(&dir).expect("verdict");
+
+    let left: Vec<String> = std::fs::read_dir(&dir)
+        .expect("read")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(left.is_empty(), "the check left {left:?} in the sync root");
+}

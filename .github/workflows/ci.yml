@@ -130,9 +130,17 @@ jobs:
             pkg: btrfs-progs
           # ext4 with a 128-byte inode cannot hold them there. This is the
           # configuration that found the bug.
+          #
+          # It is also the one filesystem here that records mtime only to the
+          # second — a 128-byte inode has no room for `i_[cma]time_extra` — so
+          # `hydrationd` refuses to run on it (DESIGN.md §8z-bis). The suites
+          # below still run: they drive the library directly and never start the
+          # binary. The end-to-end step is the one that does, and it asserts the
+          # refusal instead of a hydration.
           - name: ext4-128
             mkfs: mkfs.ext4 -q -F -I 128
             pkg: e2fsprogs
+            refuses_to_run: true
           # And with room to spare, so the difference is attributable to the
           # inode size rather than to ext4.
           - name: ext4-512
@@ -235,6 +243,7 @@ jobs:
       # Last, because it detaches the mount on the way out — that is one of the
       # things it asserts. Everything above has to have run already.
       - name: end to end
+        if: ${{ !matrix.fs.refuses_to_run }}
         run: |
           # smoke.sh runs the real binaries and runs as root; build them here,
           # unprivileged, so nothing root-owned lands in the target directory.
@@ -242,6 +251,47 @@ jobs:
           # An empty sync root. The steps above left theirs here.
           sudo find "$RUNNER_TEMP/mnt" -mindepth 1 -delete
           sudo -E ./deploy/smoke.sh "$RUNNER_TEMP/mnt"
+
+      # The other half of that conditional, and it is not a skip.
+      #
+      # On a filesystem this framework refuses, the thing to prove is that it
+      # refuses — for the stated reason, before marking anything, and without
+      # leaving the mount up behind it. A leg that merely did nothing here would
+      # report green for a deployment that silently corrupts files.
+      - name: end to end — the helper refuses this filesystem
+        if: ${{ matrix.fs.refuses_to_run }}
+        run: |
+          set -uo pipefail
+          cargo build --workspace --bins
+          sudo find "$RUNNER_TEMP/mnt" -mindepth 1 -delete
+          out="$(sudo timeout 30 ./target/debug/hydrationd \
+                   --mount "$RUNNER_TEMP/mnt" \
+                   --socket /run/user/0/not-there.sock --peer-uid 0 2>&1 || true)"
+          printf '%s\n' "$out"
+          if ! printf '%s\n' "$out" | grep -q "records mtime only to the"; then
+            echo "::error::hydrationd did not refuse ${{ matrix.fs.name }} for its mtime resolution; it must, or the range record can certify a file complete with somebody else's bytes in it"
+            exit 1
+          fi
+          # And it must refuse *before* marking: the message about the socket
+          # comes later in startup, so seeing it would mean the check ran too
+          # late to be a precondition.
+          if printf '%s\n' "$out" | grep -q "cannot reach the sync daemon"; then
+            echo "::error::the refusal came after the connect attempt; the filesystem check must precede it"
+            exit 1
+          fi
+          # Deliberately not checking here for the probe file the resolution
+          # check writes. Refusing detaches the mount — the helper never leaves
+          # one up with nothing answering for it — so by now this path resolves
+          # to the bare directory underneath and would report "clean" whatever
+          # the check left behind. That assertion belongs where the mount is
+          # still there: `selfcheck.rs`'s
+          # `the_timestamp_check_leaves_the_sync_root_as_it_found_it`, which runs
+          # on this same filesystem in the step above.
+          if mountpoint -q "$RUNNER_TEMP/mnt"; then
+            echo "::error::the helper refused and left the mount up; a mount full of placeholders with nothing answering for it is the failure this refusal exists to prevent"
+            exit 1
+          fi
+          echo "ok: refused, for the stated reason, before the connect, and took the mount down with it"
 
       - name: what the mount looked like when it failed
         if: failure()
