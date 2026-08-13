@@ -648,7 +648,11 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            first_byte: std::time::Duration::from_secs(30),
+            // Named rather than repeated: the provider has to plan inside this
+            // number, and a copy of it here would let the two drift apart
+            // silently — which is how a transport came to sleep for five
+            // minutes under a thirty-second budget.
+            first_byte: hydration_protocol::FIRST_BYTE_BUDGET,
             stall: std::time::Duration::from_secs(60),
             total: std::time::Duration::from_secs(600),
         }
