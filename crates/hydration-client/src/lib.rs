@@ -18,6 +18,7 @@ pub mod namespace;
 pub mod place;
 pub mod providers;
 pub mod reclaim;
+pub mod removals;
 pub mod store;
 pub mod upload;
 
