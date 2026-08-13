@@ -39,7 +39,7 @@ fn parse() -> Args {
     let mut mount = None;
     let mut cloud = None;
     let mut socket = None;
-    let mut debounce = Duration::from_secs(900);
+    let mut debounce = hydration_client::upload::QUIET_PERIOD;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {

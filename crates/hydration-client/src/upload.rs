@@ -103,6 +103,34 @@ pub struct Known<'a> {
     pub tag: Option<&'a str>,
 }
 
+/// How long a file must go untouched before it is sent.
+///
+/// Rule 1 is what this exists for: an atomic save closes a temp file it is about
+/// to rename away, a scratch file is written and deleted seconds later, and an
+/// editor saving ten times would start ten uploads that collide. Waiting removes
+/// all three at the source. Ten seconds covers a save burst — those are
+/// milliseconds apart — and covers a large file arriving by copy, because every
+/// write pushes the deadline out again and the timer only starts when the
+/// writing stops.
+///
+/// It used to be fifteen minutes, with no reasoning written down anywhere,
+/// because it was not a decision this project made: it was carried over from the
+/// FUSE client this replaces, where it was working around that design's own
+/// problems. Inheriting a number along with the code that needed it is how a
+/// constant outlives its argument.
+///
+/// What it cost is not subtle. Measured on a live account on 2026-08-13: a
+/// six-byte file created in the sync folder had not reached the cloud a quarter
+/// of an hour later, and its owner concluded uploads did not work — which was a
+/// fair reading of the evidence, and was not what was wrong.
+///
+/// The price of the shorter window is real and small: an editor that autosaves
+/// every minute now produces an upload a minute instead of one every fifteen.
+/// That is what a sync client is for. The window that is too long does not save
+/// traffic, it only delays it, and it delays the one thing the user is watching
+/// for.
+pub const QUIET_PERIOD: Duration = Duration::from_secs(10);
+
 /// Uploading and deleting, the half only the client knows how to do.
 pub trait Sink: Send {
     /// Send this file's current content. `existing` is what the framework knows
