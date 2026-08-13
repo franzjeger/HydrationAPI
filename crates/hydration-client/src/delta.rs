@@ -21,7 +21,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// What the cloud says happened.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Hash` so a batch can be recognised as the one already applied — see
+/// [`Fingerprint`]. It hashes the same fields `PartialEq` compares, which is
+/// what makes "the same batch" mean the same thing to both.
+#[derive(Debug, Clone, PartialEq, Eq, std::hash::Hash)]
 pub enum Change {
     /// Present in the cloud with this content. Covers both "new" and "changed":
     /// the framework decides which by looking at what is on disk, because the
@@ -240,6 +244,44 @@ impl Failed {
 }
 
 /// What a delta pass did, for the status a user is shown.
+/// What a pass was applied to, so a pass that would do the same thing again can
+/// be recognised and skipped.
+///
+/// Two halves, and both are needed. The batch says what the cloud is asking for;
+/// the tree says what is here. A pass repeats its work exactly when neither has
+/// moved — and the provider contract guarantees the batch will keep arriving,
+/// because PROVIDER.md:103 forbids a quiet round from being an empty one. So the
+/// framework is handed the whole listing every round by design, and this is
+/// where it stops paying to reconcile it against a tree that has not changed.
+///
+/// Measured on the live account, 167,890 objects: 3.17 seconds of reconciliation
+/// per round, almost all of it building two hash maps keyed by owned strings, to
+/// discover that every file was already where it should be.
+///
+/// Deliberately not a decision about *staleness*. Nothing here trusts a watch or
+/// a timer to have noticed a local change: the tree half is computed by the walk
+/// this pass performs anyway, so a file deleted, moved, resized or re-tagged
+/// behind the framework's back changes the number and the pass runs in full. The
+/// only thing being skipped is work whose input is provably identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fingerprint {
+    batch: u64,
+    tree: u64,
+}
+
+fn fingerprint_of(changes: &[Change]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // Ordered, unlike the tree's: the batch is a sequence the provider chose and
+    // two orderings of the same changes can apply differently — removals first
+    // is load-bearing, because they free the paths the upserts claim.
+    changes.len().hash(&mut h);
+    for c in changes {
+        c.hash(&mut h);
+    }
+    h.finish()
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Applied {
     pub created: usize,
@@ -316,6 +358,22 @@ pub fn apply<M: Materialise>(
     waiting: &std::collections::HashSet<FileId>,
     mat: &mut M,
 ) -> io::Result<Applied> {
+    apply_remembering(root, changes, store, waiting, mat, &mut None)
+}
+
+/// As [`apply`], remembering what it was applied to.
+///
+/// A caller that passes the same `seen` back on the next round gets the pass
+/// skipped when neither the batch nor the tree has moved. Passing `&mut None`
+/// every time is the old behaviour exactly, which is what [`apply`] does.
+pub fn apply_remembering<M: Materialise>(
+    root: &Path,
+    changes: &[Change],
+    store: &mut Store,
+    waiting: &std::collections::HashSet<FileId>,
+    mat: &mut M,
+    seen: &mut Option<Fingerprint>,
+) -> io::Result<Applied> {
     let mut out = Applied::default();
     // Nothing to apply means nothing to look at.
     //
@@ -333,6 +391,16 @@ pub fn apply<M: Materialise>(
         return Ok(out);
     }
     store.scan(root)?;
+
+    // The walk above is what makes this honest: the tree half of the fingerprint
+    // is what this pass just looked at, not what something else believes.
+    let now = Fingerprint {
+        batch: fingerprint_of(changes),
+        tree: store.fingerprint(),
+    };
+    if seen.as_ref() == Some(&now) {
+        return Ok(out);
+    }
 
     // Cloud id -> local file, for the removal half. Built once rather than per
     // change, because a removal names an object and not a path.
@@ -750,6 +818,34 @@ pub fn apply<M: Materialise>(
                 }
             }
         }
+    }
+
+    // Remembered only by a pass that did nothing.
+    //
+    // The tree half was measured by the walk at the top of this function, before
+    // any of the work below ran — so it describes the state the pass *started*
+    // in, and a pass that changed something has left a tree the fingerprint does
+    // not describe. Recording it then is worse than not recording at all:
+    // `a_tree_that_changed_under_an_identical_batch_is_applied_again` caught it
+    // doing exactly the damage this whole mechanism must not do, which is to
+    // leave a locally deleted file deleted because the batch had not changed and
+    // nothing else was looking.
+    //
+    // So the condition is the strict one: this pass created, updated, removed
+    // and moved nothing, stopped for nothing, failed at nothing. Then the tree
+    // it walked is the tree it left, and a later pass finding both halves equal
+    // would be doing this same nothing again.
+    //
+    // The cost is one full pass after every change, to establish the new
+    // nothing. A drive that is changing has work to do anyway.
+    //
+    // `kept_local` is not a reason to withhold it. Those are changes the
+    // framework decided against on purpose, and it will decide the same way for
+    // as long as the local edit is unsent — which changes the tree the moment it
+    // is sent, and the fingerprint with it.
+    let did_nothing = out.created == 0 && out.updated == 0 && out.removed == 0 && out.moved == 0;
+    if did_nothing && out.stopped.is_none() && !out.retryable && out.failed.is_empty() {
+        *seen = Some(now);
     }
     Ok(out)
 }

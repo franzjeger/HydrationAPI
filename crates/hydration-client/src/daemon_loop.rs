@@ -1003,6 +1003,11 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // reach — safe, and pointless. `None` means "no mount right now",
             // which is the same state the thread starts in.
             let mut placer: Option<TmpfilePlacer> = None;
+            // What the last completed pass was applied to. A round whose batch
+            // and whose tree are both unchanged would do exactly nothing, and
+            // this is how it finds that out for the price of the walk it was
+            // going to do anyway.
+            let mut applied_to: Option<delta::Fingerprint> = None;
             // The maintaining side. `delta::apply` scans every round, which is
             // the only regular walk this daemon does, and it happens while files
             // still carry their own identity — so it is the one place that can
@@ -1093,8 +1098,14 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         // the stamp check inside `apply` is for.
                         let waiting = q.lock().unwrap().waiting_set();
                         delta_busy.store(true, Ordering::SeqCst);
-                        let applied =
-                            delta::apply(&mount, &changes, &mut store, &waiting, placer_ref);
+                        let applied = delta::apply_remembering(
+                            &mount,
+                            &changes,
+                            &mut store,
+                            &waiting,
+                            placer_ref,
+                            &mut applied_to,
+                        );
                         folder_refresh.store(true, Ordering::SeqCst);
                         delta_busy.store(false, Ordering::SeqCst);
                         // The cursor moves only past a pass that finished.
