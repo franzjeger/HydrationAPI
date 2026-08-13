@@ -193,6 +193,46 @@ fn main() -> io::Result<()> {
         Err(e) => eprintln!("hydrationd: could not check for exposures: {e}"),
     }
 
+    // Before the mark, and it has to be: this writes inside the sync root, and a
+    // write inside a marked mount by the process that answers its events is
+    // §6a-ter's deadlock.
+    //
+    // A filesystem that keeps mtime to the whole second cannot tell a foreign
+    // write inside the current second from no write at all, and the worker's
+    // range record is built on exactly that comparison. The consequence is not a
+    // slow path or a missed optimisation: the worker certifies the file complete,
+    // clears its mark, and removes interception, with somebody else's bytes
+    // inside it. Refused rather than run with a guarantee that does not hold —
+    // §6.4a already refuses a sync root that is not its own mount, for the same
+    // reason and in the same place.
+    match selfcheck::timestamp_resolution(&args.mount) {
+        Ok(selfcheck::Timestamps::Fine) => {}
+        Ok(selfcheck::Timestamps::Coarse) => {
+            eprintln!(
+                "hydrationd: {} is on a filesystem that records mtime only to the \
+                 second, so a write by anything else inside that second is \
+                 indistinguishable from none — and the worker would certify a file \
+                 complete, and stop intercepting it, with those bytes inside. \
+                 Refusing to start. This is ext4 with a 128-byte inode; `mkfs.ext4 \
+                 -I 256` or larger, btrfs and xfs all record nanoseconds. See \
+                 DESIGN.md §8z-bis.",
+                args.mount.display()
+            );
+            detach_or_say_why(&args.mount);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!(
+                "hydrationd: could not find out whether {} records sub-second mtimes \
+                 ({e}); refusing rather than assuming it does, because the worker's \
+                 record of what it has already written rests on that",
+                args.mount.display()
+            );
+            detach_or_say_why(&args.mount);
+            std::process::exit(1);
+        }
+    }
+
     let stream = match remote::connect_checked(&args.socket, args.peer_uid) {
         Ok(s) => s,
         Err(e) => {

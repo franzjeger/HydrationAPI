@@ -180,3 +180,101 @@ mod tests {
         }
     }
 }
+
+/// What this filesystem's mtime can and cannot tell apart.
+///
+/// `partial::Witness` decides whether the worker may still believe its own
+/// record of which ranges it filled, and it decides it by comparing
+/// `{mtime, mtime_nsec, size}` against the file now. That is the only signal
+/// available: there is no pre-modify event in any released kernel (§5), so a
+/// write by somebody else is never announced, and `STATX_CHANGE_COOKIE` — the
+/// inode change counter that would answer this exactly — is not in this kernel's
+/// UAPI at all. Measured across the whole CI matrix, `probes/changecookie.c`:
+///
+/// ```text
+///   btrfs     change cookie: NOT FILLED    mtime after an immediate 2nd write: moved
+///   ext4-128  change cookie: NOT FILLED                                        did NOT move
+///   ext4-512  change cookie: NOT FILLED                                        moved
+///   xfs       change cookie: NOT FILLED                                        moved
+/// ```
+///
+/// So on a filesystem that keeps mtime to the whole second, a foreign write
+/// landing in the same second as the worker's own is indistinguishable from no
+/// write at all — and the worker goes on to certify the file complete, clear its
+/// mark and remove interception, with somebody else's bytes inside it. That is
+/// permanent, silent, and exactly what this framework exists to prevent.
+///
+/// It cannot be detected after the fact and it cannot be narrowed: the exposure
+/// is fixed by the tick, not by when the check happens. So it is refused up
+/// front, in the same spirit as §6.4a's "the sync root must be its own mount" —
+/// a deployment requirement, checked once, failing loudly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Timestamps {
+    /// Sub-second mtime is recorded, so two writes are distinguishable however
+    /// close together they land.
+    Fine,
+    /// mtime is whole seconds. Nothing can tell a write inside the current
+    /// second from no write at all.
+    Coarse,
+}
+
+/// How many samples decide it. See [`timestamp_resolution`].
+const TIMESTAMP_SAMPLES: usize = 4;
+
+/// Ask the filesystem under `dir` whether it records sub-second mtimes.
+///
+/// # Why this asks for the nanoseconds rather than timing two writes
+///
+/// The tempting test is to write twice in quick succession and see whether mtime
+/// moved. It gives the wrong answer on a good filesystem: the kernel's inode
+/// clock has a granularity of its own — measured at 0.623 ms on btrfs — and two
+/// writes that land inside one of *those* ticks legitimately share an mtime.
+/// That reads as "coarse" and would refuse a filesystem that is perfectly
+/// capable, which is a worse failure than the one being prevented.
+///
+/// A filesystem with no sub-second field reports `mtime_nsec` as exactly zero,
+/// always, because there is nowhere to put it — ext4's 128-byte inode predates
+/// the `i_[cma]time_extra` fields. One with the field reports zero only for the
+/// one nanosecond in a billion that genuinely lands there. Four samples make a
+/// false "coarse" verdict impossible in practice and a true one certain.
+///
+/// The probe file is named the way the placer names its own scratch, so it is
+/// already covered by `names::is_scratch`: the delta pass refuses to sync it and
+/// `sweep_scratch` removes it if this process dies mid-check.
+///
+/// Must run *before* the mount is marked. It writes inside the sync root, and a
+/// write inside a marked mount by the process that answers its events is
+/// §6a-ter's deadlock.
+pub fn timestamp_resolution(dir: &Path) -> io::Result<Timestamps> {
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+
+    let probe = dir.join(".timestamps.hydration-0");
+    let _ = std::fs::remove_file(&probe);
+    let mut coarse = true;
+    let result = (|| -> io::Result<()> {
+        for i in 0..TIMESTAMP_SAMPLES {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(i == 0)
+                .write(true)
+                .open(&probe)?;
+            f.write_all(b"x")?;
+            f.sync_all()?;
+            drop(f);
+            if std::fs::metadata(&probe)?.mtime_nsec() != 0 {
+                coarse = false;
+                // One non-zero is proof; the rest would tell us nothing more.
+                break;
+            }
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&probe);
+    result?;
+    Ok(if coarse {
+        Timestamps::Coarse
+    } else {
+        Timestamps::Fine
+    })
+}

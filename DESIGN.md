@@ -1558,7 +1558,23 @@ What that costs, concretely:
 - A user edit made within a second of the framework's own write reads as `Clean`, and a delta pass may replace it. This is §5.2's failure, reachable on one filesystem and not on the others.
 - A third party overwriting a range within a second of the worker filling it leaves the worker's record standing, so the worker keeps vouching for content it did not put there.
 
-**Not fixed, and stated rather than left to be discovered.** The obvious repairs are worse than they look: `ctime` has the same resolution on the same inode, and `i_version` is not exposed to userspace without `statx(STATX_CHANGE_COOKIE)`, which is not universally available and would need a fallback that lands back here. The honest position is that this framework's change detection is as good as the filesystem's timestamp resolution, that ext4 with 128-byte inodes is the one layout in the CI matrix where that is a whole second, and that 128-byte inodes are deprecated for unrelated reasons (`mkfs.ext4` itself warns they cannot represent dates past 2038).
+**There is nothing finer to look at.** The first version of this section guessed that `statx(STATX_CHANGE_COOKIE)` — the inode change counter — was available but not universal. It is not available at all: the flag is absent from this kernel's UAPI, and no filesystem here fills it. Measured across the whole matrix, `probes/changecookie.c`:
+
+```text
+             change cookie   mtime after an immediate second write
+btrfs        NOT FILLED      moved
+ext4-128     NOT FILLED      did NOT move
+ext4-512     NOT FILLED      moved
+xfs          NOT FILLED      moved
+```
+
+`ctime` is no help either — same inode, same resolution. So the gap cannot be closed by observing more carefully, and it cannot be narrowed: the exposure is fixed by the length of the tick, not by when the check happens. A write inside the tick is invisible at the moment it happens and stays invisible forever after.
+
+**So it is refused instead.** `hydrationd` measures the sync filesystem's resolution at startup — before marking anything, because the measurement writes inside the sync root and §6a-ter makes that a deadlock afterwards — and refuses to run where mtime has no sub-second field. That is §6.4a's shape exactly: a deployment requirement, checked once, failing loudly rather than running with a guarantee that does not hold. The refusal takes the mount down with it, because a mount full of placeholders with no helper answering for them is the failure the refusal exists to prevent.
+
+The check asks for `mtime_nsec` rather than timing two writes, and the difference matters. The kernel's inode clock has a granularity of its own — 0.623 ms on btrfs — so two writes can legitimately share an mtime on a filesystem that is perfectly capable, and a timing test would refuse it. A filesystem with no sub-second field reports exactly zero, always; one with the field reports zero for one nanosecond in a billion. Four samples make a false refusal impossible in practice and a true one certain.
+
+What this costs: ext4 with 128-byte inodes will not run this framework. `mkfs.ext4 -I 256` or larger, btrfs and xfs all record nanoseconds, and 128-byte inodes are deprecated for unrelated reasons — `mkfs.ext4` itself warns they cannot represent dates past 2038. The CI matrix still runs that leg: the suites there drive the library directly and never start the binary, and the end-to-end step asserts the refusal rather than skipping, because a leg that quietly did nothing would report green for a deployment that silently corrupts files.
 
 It was found by three tests failing on the ext4-128 leg and nowhere else. Each was written on btrfs, where the resolution is fine enough that the assumption held invisibly; each now sets the mtime it needs rather than hoping the clock advanced, so what they measure is the rule rather than the clock. That is the trap CLAUDE.md names from the other side — a test that passes while being unable to fail for the reason it claims — and it took a filesystem with a coarser clock to expose it.
 
@@ -1961,10 +1977,21 @@ cycle for a multi-gigabyte file, and a version bump every other device applies.
 
 **The obvious repair — send them anyway, in case the bytes are the user's — does not
 work, and it is worth being exact about why.** The upload path cannot carry those bytes:
-`run_upload` reads the file in order to send it, and *that read* is what makes the helper
-punch. `clear_residue` is unconditional, so whatever was in the file is gone before a byte
-of it reaches the sink, and what goes up is the cloud's own content. Queueing does not
-rescue an edit; it destroys it and pays for two transfers to do so.
+`run_upload` reads the file in order to send it, and that read is what the helper answers.
+It asks `partial::Standing` first, and there are two answers. `Unknown` — nothing vouches
+for what is on disk — punches the file via `clear_residue` before a byte reaches the sink,
+so an edit that arrived unintercepted is destroyed by the read meant to send it. `Ours` —
+the worker wrote those ranges and the file has not moved since — keeps them, but they are
+the cloud's bytes by construction and hold nothing of the user's to rescue. Either way the
+queue gains nothing and the read hydrates the rest.
+
+*This paragraph originally rested on `clear_residue` being unconditional, which it was
+when this section was written.* Ranged fills made a marked file holding bytes ordinary
+(§8d-bis, "What became of the third file state", and the `Standing::Unknown` arm in
+`daemon.rs`), and the punch became conditional on the worker having no record. The
+conclusion is unchanged and the reason is not, which is worth saying plainly rather than
+quietly rewriting: the argument now turns on *whose* bytes they are rather than on their
+being destroyed either way.
 
 Clearing the mark first is the one thing that would let those bytes out, and it must
 never be done from the client. A cut-off transfer holds a *prefix* of the object with
@@ -2018,10 +2045,25 @@ The mechanism is `rw_verify_area()`, which `lseek` does not go through, so the a
 not expected to be filesystem-specific — but that is the argument, and the two rows above
 are the measurement.)
 
-The syscall is still asked only of a placeholder whose stamp already disagrees. Putting
-bytes in one moves its mtime, and nothing in the framework writes into a marked file and
-re-stamps it, so a `Clean` placeholder is skipped without asking — which keeps it off the
-overwhelming majority of them.
+The syscall is asked only of a placeholder whose stamp already disagrees, and that gate
+began as an optimisation and is now what keeps the warning true.
+
+It rested on "nothing in the framework writes into a marked file and re-stamps it".
+`settle_range` does exactly that: it is how a ranged fill records the part it has, and it
+stamps precisely so a resync walk does not read the fill as the user's own edit. A marked
+file that is `Clean` *and* holds bytes is therefore no longer impossible — it is the
+ordinary shape of a partially hydrated file, and the bytes are the framework's own.
+
+Warning about those would name every file the helper is part-way through, on every
+resync, in the same sentence used for bytes that are about to be punched — the honest line
+and the routine one would be identical, and a user learns to skip both. `Clean` is what
+separates "the framework put these here and vouches for them" from "these arrived some
+other way", and it is the only signal the unprivileged side has: `partial::Standing` lives
+in the worker's memory, on the far side of the socket.
+
+That is pinned by `a_partially_hydrated_file_is_not_reported_as_holding_bytes`, which
+fails if the gate is removed — and the gate is exactly the kind of thing a later reader
+deletes, because the premise originally written next to it is no longer true.
 
 ---
 
