@@ -525,10 +525,32 @@ pub fn apply<M: Materialise>(
                         //
                         // So the file is asked directly whether it still looks
                         // the way the framework left it. Silence is not evidence.
-                        if matches!(
-                            hydration_protocol::stamp::state(&abs),
-                            Ok(hydration_protocol::stamp::State::Dirty)
-                        ) {
+                        //
+                        // `Unstamped` with content is refused alongside `Dirty`,
+                        // and the reasoning starts from what can produce that
+                        // state at all. Everything the framework places,
+                        // hydrates or uploads is stamped; a `cp` copies no
+                        // xattrs, so it has no id and was caught above; a
+                        // `cp -a` copies the stamp along with everything else
+                        // and reads as its own state. What remains is a crash
+                        // inside `run_upload`, between `adopt_cloud_id` and the
+                        // stamp write — a file carrying an id and bytes with no
+                        // stamp to vouch for them. The resync walk deliberately
+                        // does not queue that shape, and no echo re-stamps a
+                        // file nobody touches, so it stays unstamped — and an
+                        // edit made to it later is exactly as invisible as the
+                        // lost-notification case this guard exists for. Placing
+                        // over it would count destroying that edit as a
+                        // successful update. An *empty* unstamped file is let
+                        // through — there are no bytes to lose — but an empty
+                        // `Dirty` file is still an edit: a truncation the user
+                        // made, refused exactly as it always was.
+                        let state = hydration_protocol::stamp::state(&abs);
+                        let unsendable_bytes = md.len() > 0
+                            && matches!(state, Ok(hydration_protocol::stamp::State::Unstamped));
+                        if unsendable_bytes
+                            || matches!(state, Ok(hydration_protocol::stamp::State::Dirty))
+                        {
                             out.kept_local.push(Kept::new(path, Why::ChangedUnderneath));
                             continue;
                         }
@@ -564,11 +586,18 @@ pub fn apply<M: Materialise>(
                 }
                 // Same check as the upsert side, for the same reason: a delete
                 // is the more destructive of the two, and a lost notification
-                // must not be what decides it.
-                if matches!(
-                    hydration_protocol::stamp::state(&entry.path),
-                    Ok(hydration_protocol::stamp::State::Dirty)
-                ) {
+                // must not be what decides it. `Unstamped` holding bytes is
+                // refused here too — a file in that state carries an id, so it
+                // is in `by_cloud_id` and a remote delete reaches it, and its
+                // bytes are exactly as unvouched-for as on the upsert side.
+                let state = hydration_protocol::stamp::state(&entry.path);
+                let holds_unvouched_bytes = std::fs::metadata(&entry.path)
+                    .map(|md| md.len() > 0)
+                    .unwrap_or(false)
+                    && matches!(state, Ok(hydration_protocol::stamp::State::Unstamped));
+                if holds_unvouched_bytes
+                    || matches!(state, Ok(hydration_protocol::stamp::State::Dirty))
+                {
                     out.kept_local.push(Kept::new(
                         &entry.path.display().to_string(),
                         Why::ChangedUnderneath,
