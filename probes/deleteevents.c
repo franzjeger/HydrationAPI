@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/fanotify.h>
+#include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -264,6 +265,61 @@ int main(int argc, char **argv) {
                nested ? "recursive — one mark covers the tree"
                       : "NOT recursive — one mark per directory would be needed");
         rmdir(subdir);
+    }
+
+    // Question 6: can the *unprivileged* half do this instead?
+    //
+    // Everything above needs CAP_SYS_ADMIN, which means the privileged helper,
+    // which means a protocol message and a new responsibility for the process
+    // §6b wants to keep small. A deletion is a cloud operation and the helper
+    // never speaks to a network, so the decision belongs to the client — if the
+    // client can see it. inotify is unprivileged and its watch budget here is
+    // 524288 against the 21395 directories this tree has.
+    //
+    // The question is the same one that mattered for fanotify, and getting it
+    // wrong is the same disaster: does `rename(tmp, name)` report `name` as
+    // deleted? If it does, every atomic save deletes a cloud object.
+    {
+        int in = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (in < 0) {
+            printf("\ninotify: init failed (%s)\n", strerror(errno));
+        } else if (inotify_add_watch(in, mount, IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO) < 0) {
+            printf("\ninotify: watch failed (%s)\n", strerror(errno));
+        } else {
+            char a[4096], b2[4096];
+            snprintf(a, sizeof a, "%s/inprobe-victim", mount);
+            snprintf(b2, sizeof b2, "%s/inprobe-tmp", mount);
+            int f1 = open(a, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (f1 >= 0) close(f1);
+            unlink(a);
+            f1 = open(a, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (f1 >= 0) close(f1);
+            int f2 = open(b2, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (f2 >= 0) close(f2);
+            if (rename(b2, a) < 0) printf("  rename failed: %s\n", strerror(errno));
+            unlink(a);
+
+            printf("\ninotify, unprivileged, one watch on the directory:\n");
+            char buf[8192];
+            ssize_t n = read(in, buf, sizeof buf);
+            int deletes = 0, moves = 0;
+            for (char *cur = buf; n > 0 && cur < buf + n;) {
+                struct inotify_event *e = (struct inotify_event *)cur;
+                const char *what = (e->mask & IN_DELETE)       ? "DELETE"
+                                   : (e->mask & IN_MOVED_FROM) ? "MOVED_FROM"
+                                   : (e->mask & IN_MOVED_TO)   ? "MOVED_TO"
+                                                               : "other";
+                if (e->mask & IN_DELETE) deletes++;
+                if (e->mask & (IN_MOVED_FROM | IN_MOVED_TO)) moves++;
+                printf("  %-11s name=%s\n", what, e->len ? e->name : "(none)");
+                cur += sizeof(struct inotify_event) + e->len;
+            }
+            printf("  deletes=%d moves=%d\n", deletes, moves);
+            printf("  a save is distinguishable: %s\n",
+                   deletes == 2 && moves == 2 ? "yes — the overwritten name is never a DELETE"
+                                              : "CHECK THIS, the counts are not what was expected");
+            close(in);
+        }
     }
 
     printf("\nVERDICT\n");
