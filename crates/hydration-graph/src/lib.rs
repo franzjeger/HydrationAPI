@@ -3019,6 +3019,10 @@ fn item_children_url(key: &ObjectKey) -> String {
     )
 }
 
+fn item_children_probe_url(key: &ObjectKey) -> String {
+    format!("{}?$top=1&$select=id", item_children_url(key))
+}
+
 /// An upload session against an object that already exists.
 fn item_session_url(key: &ObjectKey) -> String {
     format!(
@@ -3060,6 +3064,7 @@ const WRITE_SELECT: &[&str] = &[
     "eTag",
     "cTag",
     "file",
+    "folder",
     "parentReference",
 ];
 
@@ -4452,6 +4457,105 @@ impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K
                 .or_insert_with(|| tag.to_string());
         }
         self.remove(existing.cloud_id)
+    }
+
+    fn remove_folder(&mut self, existing: hydration_client::upload::Known<'_>) -> io::Result<()> {
+        let Some(key) = key_of_cloud_id(existing.cloud_id) else {
+            return Err(refused(
+                "the folder cloud id names no drive and no item, so nothing was removed",
+            ));
+        };
+        if hydration_client::store::get_xattr(&self.root, hydration_client::store::XATTR_ID)?
+            .as_deref()
+            == Some(existing.cloud_id.as_bytes())
+        {
+            return Err(refused("the sync root can never be removed"));
+        }
+        let _recorded_tag = existing
+            .tag
+            .and_then(|tag| tag.strip_prefix("et:"))
+            .filter(|tag| !tag.is_empty())
+            .ok_or_else(|| {
+                refused("the folder has no recorded metadata eTag; a recursive delete was refused")
+            })?;
+
+        // A folder DELETE is recursive. Prove it is empty immediately before
+        // the write. `$top=1` asks only the yes/no question and cannot silently
+        // truncate a non-empty answer into an empty one.
+        let children = self.call(&Request::new(Method::Get, item_children_probe_url(&key)))?;
+        match children.status {
+            404 => return Ok(()),
+            200..=299 => {}
+            _ => {
+                return Err(service_refused(
+                    "the folder's children could not be checked",
+                    children.status,
+                    &children.body,
+                ));
+            }
+        }
+        let body: serde_json::Value = serde_json::from_slice(&children.body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        let values = body
+            .get("value")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the service did not return a children collection; the folder was not deleted",
+                )
+            })?;
+        if !values.is_empty() {
+            return Err(refused(
+                "the cloud folder is not empty; recursive deletion was refused",
+            ));
+        }
+
+        // Removing local children intentionally changes the folder's derived
+        // childCount/lastModifiedDateTime and therefore its eTag. The captured
+        // tag proves this path used to be this object; after proving the object
+        // is empty, read the new tag and bind DELETE to that observation. A
+        // child arriving in the gap changes the tag and makes DELETE return
+        // 412 instead of recursively erasing it.
+        let metadata = self.call(&Request::new(Method::Get, item_metadata_url(&key)))?;
+        match metadata.status {
+            404 => return Ok(()),
+            200..=299 => {}
+            _ => {
+                return Err(service_refused(
+                    "the empty folder's metadata could not be checked",
+                    metadata.status,
+                    &metadata.body,
+                ));
+            }
+        }
+        let item: DriveItem = serde_json::from_slice(&metadata.body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        if item.id.as_deref() != Some(key.item().as_str())
+            || !matches!(shape_of(&item), Shape::Folder)
+        {
+            return Err(refused(
+                "the object checked before deletion is no longer the expected folder",
+            ));
+        }
+        let current_tag = item
+            .e_tag
+            .as_deref()
+            .filter(|tag| !tag.is_empty())
+            .ok_or_else(|| {
+                refused("the empty folder has no current metadata eTag; deletion was refused")
+            })?;
+        let reply = self.call(
+            &Request::new(Method::Delete, item_url(&key)).with_header("if-match", current_tag),
+        )?;
+        match reply.status {
+            200..=299 | 404 => Ok(()),
+            _ => Err(service_refused(
+                "the empty folder was not removed",
+                reply.status,
+                &reply.body,
+            )),
+        }
     }
 }
 

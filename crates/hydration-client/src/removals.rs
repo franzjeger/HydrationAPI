@@ -107,6 +107,24 @@ pub struct Renamed {
     pub is_dir: bool,
 }
 
+/// The identity a directory carried before its name disappeared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderRecord {
+    pub cloud_id: String,
+    pub etag: Option<String>,
+}
+
+/// A directory explicitly removed or moved out of the sync root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderGone {
+    pub path: String,
+    pub moved_out: bool,
+    /// `None` means the directory was local-only or its identity could not be
+    /// proven before it disappeared. That is never permission to delete by
+    /// path.
+    pub record: Option<FolderRecord>,
+}
+
 /// Local namespace changes observed in one drain.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Batch {
@@ -114,12 +132,9 @@ pub struct Batch {
     pub renamed: Vec<Renamed>,
     /// Directories newly created or moved into the watched tree.
     pub folders_created: Vec<String>,
-    /// Directories unlinked in place. Kept separate from file deletion because
-    /// a cloud folder removal is recursive even when the local event is not.
-    pub folders_deleted: Vec<String>,
-    /// Directories moved out are deliberately not folded into `gone`: deleting
-    /// a cloud folder can recursively delete an account-sized subtree.
-    pub folders_moved_out: Vec<String>,
+    /// Directories are deliberately not folded into `gone`: deleting a cloud
+    /// folder can recursively delete an account-sized subtree.
+    pub folders_gone: Vec<FolderGone>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +161,9 @@ pub struct Removals {
     /// later drain; a matching destination cancels it, while a second drain
     /// without one proves the name moved out of the watched tree.
     pending_moves: HashMap<u32, MoveHalf>,
+    /// Captured while the directory still exists. An `IN_DELETE` event arrives
+    /// after the name is gone, when its xattrs can no longer be read.
+    folder_records: HashMap<String, FolderRecord>,
 }
 
 impl Removals {
@@ -167,6 +185,7 @@ impl Removals {
             root: root.to_path_buf(),
             lost: false,
             pending_moves: HashMap::new(),
+            folder_records: HashMap::new(),
         };
         me.add_tree(root);
         Ok(me)
@@ -182,10 +201,75 @@ impl Removals {
         self.lost
     }
 
+    /// Refresh identities after a cloud delta pass changed folder metadata.
+    /// Missing paths are retained until their explicit event is consumed; a
+    /// concurrent deletion must not erase the only proof of what disappeared.
+    pub fn refresh_folders(&mut self) {
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    let path = entry.path();
+                    self.record_folder(&path);
+                    stack.push(path);
+                }
+            }
+        }
+    }
+
+    /// Record a create result immediately, closing the window before the next
+    /// filesystem refresh in which the user can delete the new directory.
+    pub fn remember_folder(&mut self, rel: &str, cloud_id: &str, etag: Option<&str>) {
+        if rel.is_empty() || cloud_id.is_empty() {
+            return;
+        }
+        self.folder_records
+            .retain(|path, record| path == rel || record.cloud_id != cloud_id);
+        self.folder_records.insert(
+            rel.to_string(),
+            FolderRecord {
+                cloud_id: cloud_id.to_string(),
+                etag: etag.map(str::to_string),
+            },
+        );
+    }
+
+    fn record_folder(&mut self, path: &Path) {
+        let Some(rel) = self.relative(path).filter(|rel| !rel.is_empty()) else {
+            return;
+        };
+        let id = crate::store::get_xattr(path, crate::store::XATTR_ID)
+            .ok()
+            .flatten()
+            .and_then(|raw| String::from_utf8(raw).ok())
+            .filter(|id| !id.is_empty());
+        let Some(cloud_id) = id else {
+            self.folder_records.remove(&rel);
+            return;
+        };
+        let etag = crate::store::get_xattr(path, crate::store::XATTR_ETAG)
+            .ok()
+            .flatten()
+            .and_then(|raw| String::from_utf8(raw).ok());
+        self.remember_folder(&rel, &cloud_id, etag.as_deref());
+    }
+
+    fn folder_gone(&mut self, path: String, moved_out: bool) -> FolderGone {
+        FolderGone {
+            record: self.folder_records.remove(&path),
+            path,
+            moved_out,
+        }
+    }
+
     fn add_tree(&mut self, dir: &Path) {
         let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
             self.add_one(&d);
+            self.record_folder(&d);
             let Ok(entries) = std::fs::read_dir(&d) else {
                 continue;
             };
@@ -337,7 +421,7 @@ impl Removals {
                 }
                 if mask & IN_DELETE != 0 {
                     if mask & IN_ISDIR != 0 {
-                        out.folders_deleted.push(path);
+                        out.folders_gone.push(self.folder_gone(path, false));
                     } else {
                         out.gone.push(Gone {
                             path,
@@ -350,10 +434,19 @@ impl Removals {
 
         let (moved_out, moved_in, pending, renamed) =
             settle_moves(previous_moves, moved_from, moved_to, self.lost);
+        if self.lost {
+            for folder in out.folders_gone {
+                if let Some(record) = folder.record {
+                    self.remember_folder(&folder.path, &record.cloud_id, record.etag.as_deref());
+                }
+            }
+            self.pending_moves.clear();
+            return Batch::default();
+        }
         self.pending_moves = pending;
         for item in moved_out {
             if item.is_dir {
-                out.folders_moved_out.push(item.path);
+                out.folders_gone.push(self.folder_gone(item.path, true));
             } else {
                 out.gone.push(Gone {
                     path: item.path,
@@ -367,6 +460,13 @@ impl Removals {
                 .filter(|item| item.is_dir)
                 .map(|item| item.path),
         );
+        for item in &renamed {
+            if item.is_dir {
+                if let Some(record) = self.folder_records.remove(&item.from) {
+                    self.remember_folder(&item.to, &record.cloud_id, record.etag.as_deref());
+                }
+            }
+        }
         out.renamed = renamed;
         out
     }
@@ -440,7 +540,7 @@ mod tests {
 
         let batch = w.take();
         assert!(batch.renamed.is_empty());
-        assert!(batch.folders_moved_out.is_empty());
+        assert!(batch.folders_gone.is_empty());
         let gone = batch.gone;
         assert_eq!(gone.len(), 1, "expected one removal, got {gone:?}");
         assert_eq!(gone[0].path, "gone.txt");
@@ -539,7 +639,14 @@ mod tests {
         let batch = w.take();
 
         assert!(batch.gone.is_empty(), "a folder reached file deletion");
-        assert_eq!(batch.folders_moved_out, ["album"]);
+        assert_eq!(
+            batch.folders_gone,
+            [FolderGone {
+                path: "album".into(),
+                moved_out: true,
+                record: None,
+            }]
+        );
     }
 
     #[test]
@@ -654,7 +761,88 @@ mod tests {
 
         let batch = w.take();
         assert!(batch.gone.is_empty());
-        assert_eq!(batch.folders_deleted, ["empty"]);
+        assert_eq!(
+            batch.folders_gone,
+            [FolderGone {
+                path: "empty".into(),
+                moved_out: false,
+                record: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_deleted_folder_carries_the_identity_captured_while_it_existed() {
+        let dir = scratch("folder-delete-identity");
+        let folder = dir.join("empty");
+        std::fs::create_dir(&folder).unwrap();
+        crate::store::set_xattr(&folder, crate::store::XATTR_ID, b"drive|folder").unwrap();
+        crate::store::set_xattr(&folder, crate::store::XATTR_ETAG, b"et:folder-7").unwrap();
+        let mut w = Removals::watch(&dir).unwrap();
+
+        std::fs::remove_dir(&folder).unwrap();
+        settle();
+
+        assert_eq!(
+            w.take().folders_gone,
+            [FolderGone {
+                path: "empty".into(),
+                moved_out: false,
+                record: Some(FolderRecord {
+                    cloud_id: "drive|folder".into(),
+                    etag: Some("et:folder-7".into()),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_folder_rename_moves_the_captured_identity_to_its_new_path() {
+        let dir = scratch("folder-rename-identity");
+        let before = dir.join("before");
+        let after = dir.join("after");
+        std::fs::create_dir(&before).unwrap();
+        crate::store::set_xattr(&before, crate::store::XATTR_ID, b"drive|folder").unwrap();
+        crate::store::set_xattr(&before, crate::store::XATTR_ETAG, b"et:folder-7").unwrap();
+        let mut w = Removals::watch(&dir).unwrap();
+
+        std::fs::rename(&before, &after).unwrap();
+        settle();
+        assert_eq!(w.take().renamed[0].to, "after");
+        std::fs::remove_dir(&after).unwrap();
+        settle();
+
+        assert_eq!(
+            w.take().folders_gone[0].record,
+            Some(FolderRecord {
+                cloud_id: "drive|folder".into(),
+                etag: Some("et:folder-7".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn refresh_captures_folder_metadata_written_after_the_create_event() {
+        let dir = scratch("folder-refresh-identity");
+        let mut w = Removals::watch(&dir).unwrap();
+        let folder = dir.join("later");
+
+        std::fs::create_dir(&folder).unwrap();
+        settle();
+        let _ = w.take();
+        crate::store::set_xattr(&folder, crate::store::XATTR_ID, b"drive|later").unwrap();
+        crate::store::set_xattr(&folder, crate::store::XATTR_ETAG, b"et:later-1").unwrap();
+        w.refresh_folders();
+        std::fs::remove_dir(&folder).unwrap();
+        settle();
+
+        assert_eq!(
+            w.take().folders_gone[0].record,
+            Some(FolderRecord {
+                cloud_id: "drive|later".into(),
+                etag: Some("et:later-1".into()),
+            })
+        );
     }
 
     #[test]
