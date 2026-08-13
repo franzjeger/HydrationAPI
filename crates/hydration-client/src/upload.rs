@@ -164,9 +164,8 @@ pub trait Sink: Send {
 
     /// Create a cloud folder for a directory created locally.
     ///
-    /// Declared now even though the daemon does not call it yet: without this
-    /// operation an empty directory can never sync, so a sink with only file
-    /// upload and delete is not a complete two-way contract.
+    /// Without this operation an empty directory can never sync, so a sink
+    /// with only file upload and delete is not a complete two-way contract.
     fn create_folder(&mut self, _path: &std::path::Path) -> io::Result<Uploaded> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -504,6 +503,20 @@ impl<P: Provider + Sink> Sink for ProviderSink<P> {
         existing: Option<Known<'_>>,
     ) -> io::Result<Uploaded> {
         self.0.upload(path, existing)
+    }
+    fn move_item(
+        &mut self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+        existing: Known<'_>,
+    ) -> io::Result<Uploaded> {
+        self.0.move_item(from, to, existing)
+    }
+    fn create_folder(&mut self, path: &std::path::Path) -> io::Result<Uploaded> {
+        self.0.create_folder(path)
+    }
+    fn remove_known(&mut self, existing: Known<'_>) -> io::Result<()> {
+        self.0.remove_known(existing)
     }
     fn remove(&mut self, cloud_id: &str) -> io::Result<()> {
         self.0.remove(cloud_id)

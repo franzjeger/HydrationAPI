@@ -167,6 +167,13 @@ fn folder_json(drive: &str, id: &str, name: &str, parent: &str) -> String {
     )
 }
 
+fn versioned_folder_json(drive: &str, id: &str, name: &str, parent: &str, etag: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","name":"{name}","size":4096,"eTag":"{etag}","folder":{{"childCount":0}},
+            "parentReference":{{"driveId":"{drive}","id":"{parent}"}}}}"#
+    )
+}
+
 fn package_json(drive: &str, id: &str, name: &str, parent: &str) -> String {
     format!(
         r#"{{"id":"{id}","name":"{name}","size":4096,"folder":{{"childCount":3}},
@@ -243,7 +250,7 @@ fn folder_item(drive: &str, id: &str, parent: &str, name: &str) -> Item {
         id: cloud(drive, id),
         parent: cloud(drive, parent),
         name: name.into(),
-        kind: Kind::Folder,
+        kind: Kind::Folder { etag: None },
     }
 }
 
@@ -945,6 +952,13 @@ fn path_of<'a>(cs: &'a [Change], id: &str) -> Option<&'a str> {
 fn etag_of<'a>(cs: &'a [Change], id: &str) -> Option<&'a str> {
     cs.iter().find_map(|c| match c {
         Change::Upserted { cloud_id, etag, .. } if cloud_id == id => etag.as_deref(),
+        _ => None,
+    })
+}
+
+fn folder_etag_of<'a>(cs: &'a [Change], id: &str) -> Option<&'a str> {
+    cs.iter().find_map(|c| match c {
+        Change::FolderUpserted { cloud_id, etag, .. } if cloud_id == id => etag.as_deref(),
         _ => None,
     })
 }
@@ -2511,7 +2525,7 @@ fn a_round_that_produced_only_folder_changes_still_persists_its_tree() {
     );
     let tree = rig.store.stored_tree().unwrap();
     match tree_entry(&tree, &cloud(MINE, "01W")) {
-        Some(Item::Upsert { kind, .. }) => assert_eq!(kind, Kind::Folder),
+        Some(Item::Upsert { kind, .. }) => assert!(matches!(kind, Kind::Folder { .. })),
         other => panic!("the folder must be in the tree: {other:?}"),
     }
 }
@@ -3998,6 +4012,44 @@ fn the_content_tag_survives_the_tree_round_trip() {
         "the tag must survive the tree, byte for byte"
     );
     assert_eq!(etag_of(&b2, &cloud(MINE, "01B")), Some("ct:c:{G2},7"));
+}
+
+#[test]
+fn the_folder_metadata_version_survives_the_tree_round_trip() {
+    let rig = Rig::new();
+    rig.script(
+        first_req(MINE),
+        vec![Reply::ok(body_delta(
+            &[
+                root_json(MINE, ROOT),
+                versioned_folder_json(MINE, "01F", "Work", ROOT, "{FOLDER},7"),
+            ],
+            &lnk("DELTA-1"),
+        ))],
+    );
+    let mut one = rig.provider();
+    let (b1, c1) = one.changes(&Cursor::default()).expect("round one");
+    assert_eq!(
+        folder_etag_of(&b1, &cloud(MINE, "01F")),
+        Some("et:{FOLDER},7")
+    );
+    ack(&mut one, &c1);
+
+    rig.script(
+        resume_req("DELTA-1"),
+        vec![Reply::ok(body_delta(
+            &[root_json(MINE, ROOT)],
+            &lnk("DELTA-2"),
+        ))],
+    );
+    let mut two = rig.provider();
+    let (b2, _) = two.changes(&Cursor::default()).expect("round two");
+
+    assert_eq!(
+        folder_etag_of(&b2, &cloud(MINE, "01F")),
+        Some("et:{FOLDER},7"),
+        "the folder metadata version must survive the persisted tree byte for byte"
+    );
 }
 
 /// A OneNote notebook synced as an ordinary folder is corrupted piecemeal — its

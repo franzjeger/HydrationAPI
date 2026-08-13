@@ -35,7 +35,13 @@ pub enum Change {
     },
     /// A cloud folder, including an empty one. The root is represented by an
     /// empty path so its identity can be recorded on the sync root itself.
-    FolderUpserted { cloud_id: String, path: String },
+    FolderUpserted {
+        cloud_id: String,
+        path: String,
+        /// A metadata version suitable for conditional namespace writes.
+        /// This is deliberately separate from a file's content version.
+        etag: Option<String>,
+    },
     /// Gone from the cloud.
     Removed { cloud_id: String },
     /// A folder gone from the cloud. The path is carried because directories
@@ -378,7 +384,11 @@ pub fn apply<M: Materialise>(
         }
         let change = &change;
         match change {
-            Change::FolderUpserted { cloud_id, path } => {
+            Change::FolderUpserted {
+                cloud_id,
+                path,
+                etag,
+            } => {
                 let Some(abs) = folder_path(root, path) else {
                     out.failed.push(Failed::new(path, Failure::PathRefused));
                     continue;
@@ -440,6 +450,18 @@ pub fn apply<M: Materialise>(
                 if let Err(e) =
                     crate::store::set_xattr(&abs, crate::store::XATTR_ID, cloud_id.as_bytes())
                 {
+                    out.failed
+                        .push(Failed::new(path, Failure::Place(e.to_string())));
+                    out.retryable = true;
+                    continue;
+                }
+                let tag_result = match etag {
+                    Some(etag) => {
+                        crate::store::set_xattr(&abs, crate::store::XATTR_ETAG, etag.as_bytes())
+                    }
+                    None => crate::store::remove_xattr(&abs, crate::store::XATTR_ETAG),
+                };
+                if let Err(e) = tag_result {
                     out.failed
                         .push(Failed::new(path, Failure::Place(e.to_string())));
                     out.retryable = true;
@@ -704,7 +726,12 @@ pub fn apply<M: Materialise>(
                         // not survive with it: a later cloud folder at this
                         // path is a different object and must not collide with
                         // a stale claim.
-                        match crate::store::remove_xattr(existing, crate::store::XATTR_ID) {
+                        let detached =
+                            crate::store::remove_xattr(existing, crate::store::XATTR_ETAG)
+                                .and_then(|()| {
+                                    crate::store::remove_xattr(existing, crate::store::XATTR_ID)
+                                });
+                        match detached {
                             Ok(()) => {
                                 folders.remove(cloud_id);
                             }

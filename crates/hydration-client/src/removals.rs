@@ -112,6 +112,11 @@ pub struct Renamed {
 pub struct Batch {
     pub gone: Vec<Gone>,
     pub renamed: Vec<Renamed>,
+    /// Directories newly created or moved into the watched tree.
+    pub folders_created: Vec<String>,
+    /// Directories unlinked in place. Kept separate from file deletion because
+    /// a cloud folder removal is recursive even when the local event is not.
+    pub folders_deleted: Vec<String>,
     /// Directories moved out are deliberately not folded into `gone`: deleting
     /// a cloud folder can recursively delete an account-sized subtree.
     pub folders_moved_out: Vec<String>,
@@ -302,6 +307,7 @@ impl Removals {
                         // `mkdir` and this event, anything could already have been
                         // created inside it.
                         self.add_tree(&abs);
+                        out.folders_created.push(path);
                     }
                     continue;
                 }
@@ -329,16 +335,20 @@ impl Removals {
                     );
                     continue;
                 }
-                if mask & IN_DELETE != 0 && mask & IN_ISDIR == 0 {
-                    out.gone.push(Gone {
-                        path,
-                        moved_out: false,
-                    });
+                if mask & IN_DELETE != 0 {
+                    if mask & IN_ISDIR != 0 {
+                        out.folders_deleted.push(path);
+                    } else {
+                        out.gone.push(Gone {
+                            path,
+                            moved_out: false,
+                        });
+                    }
                 }
             }
         }
 
-        let (moved_out, pending, renamed) =
+        let (moved_out, moved_in, pending, renamed) =
             settle_moves(previous_moves, moved_from, moved_to, self.lost);
         self.pending_moves = pending;
         for item in moved_out {
@@ -351,6 +361,12 @@ impl Removals {
                 });
             }
         }
+        out.folders_created.extend(
+            moved_in
+                .into_iter()
+                .filter(|item| item.is_dir)
+                .map(|item| item.path),
+        );
         out.renamed = renamed;
         out
     }
@@ -367,11 +383,17 @@ fn settle_moves(
     mut current: HashMap<u32, MoveHalf>,
     destinations: HashMap<u32, MoveHalf>,
     lost: bool,
-) -> (Vec<MoveHalf>, HashMap<u32, MoveHalf>, Vec<Renamed>) {
+) -> (
+    Vec<MoveHalf>,
+    Vec<MoveHalf>,
+    HashMap<u32, MoveHalf>,
+    Vec<Renamed>,
+) {
     if lost {
-        return (Vec::new(), HashMap::new(), Vec::new());
+        return (Vec::new(), Vec::new(), HashMap::new(), Vec::new());
     }
     let mut renamed = Vec::new();
+    let mut moved_in = Vec::new();
     for (cookie, to) in destinations {
         if let Some(from) = previous.remove(&cookie).or_else(|| current.remove(&cookie)) {
             renamed.push(Renamed {
@@ -379,10 +401,12 @@ fn settle_moves(
                 to: to.path,
                 is_dir: from.is_dir || to.is_dir,
             });
+        } else {
+            moved_in.push(to);
         }
     }
     let moved_out = previous.into_values().collect();
-    (moved_out, current, renamed)
+    (moved_out, moved_in, current, renamed)
 }
 
 #[cfg(test)]
@@ -534,8 +558,10 @@ mod tests {
                 is_dir: false,
             },
         )]);
-        let (gone, pending, renamed) = settle_moves(previous, HashMap::new(), destinations, false);
+        let (gone, moved_in, pending, renamed) =
+            settle_moves(previous, HashMap::new(), destinations, false);
         assert!(gone.is_empty(), "the first half was misread as a move out");
+        assert!(moved_in.is_empty());
         assert!(pending.is_empty());
         assert_eq!(
             renamed,
@@ -556,13 +582,17 @@ mod tests {
                 is_dir: false,
             },
         )]);
-        let (gone, pending, renamed) = settle_moves(HashMap::new(), current, HashMap::new(), false);
+        let (gone, moved_in, pending, renamed) =
+            settle_moves(HashMap::new(), current, HashMap::new(), false);
         assert!(gone.is_empty());
+        assert!(moved_in.is_empty());
         assert!(renamed.is_empty());
         assert_eq!(pending.get(&73).map(|m| m.path.as_str()), Some("gone.txt"));
 
-        let (gone, pending, renamed) = settle_moves(pending, HashMap::new(), HashMap::new(), false);
+        let (gone, moved_in, pending, renamed) =
+            settle_moves(pending, HashMap::new(), HashMap::new(), false);
         assert_eq!(gone[0].path, "gone.txt");
+        assert!(moved_in.is_empty());
         assert!(pending.is_empty());
         assert!(renamed.is_empty());
     }
@@ -583,8 +613,10 @@ mod tests {
                 is_dir: false,
             },
         )]);
-        let (gone, pending, renamed) = settle_moves(previous, current, HashMap::new(), true);
+        let (gone, moved_in, pending, renamed) =
+            settle_moves(previous, current, HashMap::new(), true);
         assert!(gone.is_empty());
+        assert!(moved_in.is_empty());
         assert!(pending.is_empty());
         assert!(renamed.is_empty());
     }
@@ -598,7 +630,8 @@ mod tests {
         std::fs::create_dir(dir.join("fresh")).unwrap();
         std::fs::write(dir.join("fresh/x.txt"), b"x").unwrap();
         settle();
-        let _ = w.take(); // the create, which is not a removal
+        let created = w.take();
+        assert_eq!(created.folders_created, ["fresh"]);
         std::fs::remove_file(dir.join("fresh/x.txt")).unwrap();
         settle();
 
@@ -608,6 +641,40 @@ mod tests {
             gone[0].path, "fresh/x.txt",
             "a deletion inside a directory created after the walk was invisible"
         );
+    }
+
+    #[test]
+    fn deleting_a_folder_is_visible_but_never_reported_as_a_file_delete() {
+        let dir = scratch("folder-delete-visible");
+        std::fs::create_dir(dir.join("empty")).unwrap();
+        let mut w = Removals::watch(&dir).unwrap();
+
+        std::fs::remove_dir(dir.join("empty")).unwrap();
+        settle();
+
+        let batch = w.take();
+        assert!(batch.gone.is_empty());
+        assert_eq!(batch.folders_deleted, ["empty"]);
+    }
+
+    #[test]
+    fn an_unmatched_folder_move_to_is_a_local_folder_create() {
+        let destinations = HashMap::from([(
+            51,
+            MoveHalf {
+                path: "imported".into(),
+                is_dir: true,
+            },
+        )]);
+
+        let (gone, moved_in, pending, renamed) =
+            settle_moves(HashMap::new(), HashMap::new(), destinations, false);
+
+        assert!(gone.is_empty());
+        assert!(pending.is_empty());
+        assert!(renamed.is_empty());
+        assert_eq!(moved_in[0].path, "imported");
+        assert!(moved_in[0].is_dir);
     }
 
     #[test]

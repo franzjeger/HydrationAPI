@@ -141,6 +141,11 @@ fn item_url(drive: &str, item: &str) -> String {
     format!("{BASE}/drives/{drive}/items/{item}")
 }
 
+/// Creating a child beneath a folder addressed by its stable identity.
+fn item_children(drive: &str, item: &str) -> String {
+    format!("{BASE}/drives/{drive}/items/{item}/children")
+}
+
 /// An upload session URL. A different host, which is the whole point: it is
 /// named by a response body and must never receive the Graph credential.
 fn upload_url(tag: &str) -> String {
@@ -179,6 +184,18 @@ fn drive_item(id: &str, name: &str, size: u64, ctag: &str) -> String {
         "eTag": ctag,
         "file": {"mimeType": "application/octet-stream"},
         "parentReference": {"driveId": MINE, "id": ROOT},
+    })
+    .to_string()
+}
+
+fn folder_item(id: &str, name: &str, etag: &str, parent: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "name": name,
+        "size": 0,
+        "eTag": etag,
+        "folder": {"childCount": 0},
+        "parentReference": {"driveId": MINE, "id": parent},
     })
     .to_string()
 }
@@ -840,6 +857,134 @@ fn upserted_etag(cs: &[Change], id: &str) -> Option<String> {
 // routinely stops naming the object that inode claims. A path-addressed content
 // write lands on whichever object now occupies that name.
 // ===========================================================================
+
+#[test]
+fn a_local_folder_create_is_addressed_to_the_parent_identity() {
+    let rig = Rig::new("create_folder_parent_identity");
+    let parent = rig.root.join("Projects");
+    let folder = parent.join("New");
+    std::fs::create_dir_all(&folder).unwrap();
+    store::set_xattr(&parent, store::XATTR_ID, cloud(MINE, "01PARENT").as_bytes()).unwrap();
+    rig.script(
+        post(item_children(MINE, "01PARENT")).body_has("conflictBehavior"),
+        vec![ok(folder_item(
+            "01NEW",
+            "New",
+            "\"{FOLDER},1\"",
+            "01PARENT",
+        ))],
+    );
+
+    let created = rig.sink().create_folder(&folder).unwrap();
+
+    assert_eq!(created.cloud_id, cloud(MINE, "01NEW"));
+    assert_eq!(created.etag.as_deref(), Some("et:\"{FOLDER},1\""));
+    let call = only_call(&rig.journal);
+    assert_eq!(call.path(), item_children(MINE, "01PARENT"));
+    assert_eq!(call.json()["name"], "New");
+    assert!(call.json()["folder"].is_object());
+    assert_eq!(call.json()["@microsoft.graph.conflictBehavior"], "fail");
+}
+
+#[test]
+fn a_local_folder_create_without_parent_identity_is_refused_before_graph() {
+    let rig = Rig::new("create_folder_unknown_parent");
+    let folder = rig.root.join("Projects/New");
+    std::fs::create_dir_all(&folder).unwrap();
+
+    let err = rig.sink().create_folder(&folder).unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("parent folder"));
+    assert!(rig.journal.calls().is_empty());
+}
+
+#[test]
+fn a_retried_folder_create_adopts_the_exact_existing_folder() {
+    let rig = Rig::new("create_folder_reconcile");
+    let parent = rig.root.join("Projects");
+    let folder = parent.join("New");
+    std::fs::create_dir_all(&folder).unwrap();
+    store::set_xattr(&parent, store::XATTR_ID, cloud(MINE, "01PARENT").as_bytes()).unwrap();
+    rig.script(
+        post(item_children(MINE, "01PARENT")),
+        vec![reply(409, graph_error("nameAlreadyExists"))],
+    );
+    rig.script(
+        get(path_meta(MINE, "Projects/New")),
+        vec![ok(folder_item(
+            "01EXISTING",
+            "New",
+            "\"{FOLDER},4\"",
+            "01PARENT",
+        ))],
+    );
+
+    let created = rig.sink().create_folder(&folder).unwrap();
+
+    assert_eq!(created.cloud_id, cloud(MINE, "01EXISTING"));
+    assert_eq!(created.etag.as_deref(), Some("et:\"{FOLDER},4\""));
+    let calls = rig.journal.calls();
+    assert_eq!(calls.len(), 2, "collision reconciliation made extra calls");
+    assert_eq!(calls[0].method, Method::Post);
+    assert_eq!(calls[1].method, Method::Get);
+}
+
+#[test]
+fn a_folder_create_never_adopts_a_file_that_occupies_the_name() {
+    let rig = Rig::new("create_folder_file_collision");
+    let parent = rig.root.join("Projects");
+    let folder = parent.join("New");
+    std::fs::create_dir_all(&folder).unwrap();
+    store::set_xattr(&parent, store::XATTR_ID, cloud(MINE, "01PARENT").as_bytes()).unwrap();
+    rig.script(
+        post(item_children(MINE, "01PARENT")),
+        vec![reply(409, graph_error("nameAlreadyExists"))],
+    );
+    rig.script(
+        get(path_meta(MINE, "Projects/New")),
+        vec![ok(drive_item("01FILE", "New", 3, "c:{FILE},1"))],
+    );
+
+    let err = rig.sink().create_folder(&folder).unwrap_err();
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("different object"));
+}
+
+#[test]
+fn a_local_folder_rename_uses_the_folders_metadata_version() {
+    let rig = Rig::new("rename_folder");
+    let from = rig.root.join("before");
+    let to = rig.root.join("after");
+    std::fs::create_dir_all(&from).unwrap();
+    std::fs::rename(&from, &to).unwrap();
+    let id = cloud(MINE, "01FOLDER");
+    rig.script(
+        patch(item_url(MINE, "01FOLDER"))
+            .body_has("after")
+            .with("if-match"),
+        vec![ok(folder_item("01FOLDER", "after", "\"{FOLDER},2\"", ROOT))],
+    );
+
+    let moved = rig
+        .sink()
+        .move_item(
+            &from,
+            &to,
+            Known {
+                cloud_id: &id,
+                tag: Some("et:\"{FOLDER},1\""),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(moved.cloud_id, id);
+    assert_eq!(moved.etag.as_deref(), Some("et:\"{FOLDER},2\""));
+    let call = only_call(&rig.journal);
+    assert_eq!(call.header("if-match"), Some("\"{FOLDER},1\""));
+    assert_eq!(call.json()["name"], "after");
+}
 
 #[test]
 fn a_local_rename_is_a_conditional_patch_of_the_object() {

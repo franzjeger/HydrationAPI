@@ -427,7 +427,7 @@ const EMPTY_FOLDER: &str = r#"{"id":"01F","name":"Work","size":98123,
 fn an_empty_folder_facet_with_an_aggregate_size_is_a_folder() {
     let scope = primary(MINE);
     let m = map_alone(&scope, EMPTY_FOLDER).expect("an empty folder must map");
-    assert_eq!(kind_of(&m), &Kind::Folder);
+    assert!(matches!(kind_of(&m), Kind::Folder { .. }));
 
     // The page half's only residual power is catching a map_item/map_page
     // divergence, so it says that and nothing more: a first-sight folder produces
@@ -438,7 +438,9 @@ fn an_empty_folder_facet_with_an_aggregate_size_is_a_folder() {
     assert_eq!(mp.items.len(), 1, "{:?}", mp.items);
     assert_eq!(
         kind_of_item(&mp.items[0]),
-        &Kind::Folder,
+        &Kind::Folder {
+            etag: Some("et:\"{2B7E9C05-4A61-4F28-B0D3-8C1E5A72D69F},3\"".into()),
+        },
         "map_page must not diverge from map_item"
     );
 
@@ -683,7 +685,10 @@ const REMOTE_FOLDER: &str = r#"{"id":"01SH","name":"Team Files","size":4096,
 fn a_remote_item_folder_is_a_folder_and_the_identity_stays_on_the_near_drive() {
     let m = map_alone(&primary(MINE), REMOTE_FOLDER).expect("a shared folder must map");
     let (id, parent, name, kind) = as_upsert(&m);
-    assert_eq!(kind, &Kind::Folder, "not File{{4096}} from the outer size");
+    assert!(
+        matches!(kind, Kind::Folder { .. }),
+        "not File{{4096}} from the outer size"
+    );
     assert_eq!(id, cloud(MINE, "01SH"), "never b!theirs|01FAR");
     assert_eq!(parent, cloud(MINE, "01ROOT"));
     assert_eq!(name, "Team Files");
@@ -810,7 +815,9 @@ fn an_outer_file_facet_disagreeing_with_an_inner_folder_facet_follows_the_inner_
         .expect("inner-wins: not Ambiguous, which strands 240 children");
     assert_eq!(
         kind_of(&m),
-        &Kind::Folder,
+        &Kind::Folder {
+            etag: Some("et:\"{7C0E4B9A-1F82-4D36-A5B7-0E3C9D18F2A6},1\"".into()),
+        },
         "shape_body() is the whole answer — not File{{4096}}, not Ambiguous"
     );
 }
@@ -909,7 +916,9 @@ fn a_deleted_facet_inside_a_remote_item_does_not_delete_the_placeholder() {
             id: cloud(MINE, "01SH"),
             parent: cloud(MINE, "01ROOT"),
             name: "Team Files".into(),
-            kind: Kind::Folder,
+            kind: Kind::Folder {
+                etag: Some("et:\"{9E5A1D73-2C68-4B0F-A3E1-7D94C2B6F085},2\"".into()),
+            },
         }),
         "not Item::Delete for b!mine|01SH and not for b!theirs|01FAR"
     );
@@ -956,7 +965,9 @@ fn a_root_facet_inside_a_remote_item_does_not_become_a_second_root() {
             id: cloud(MINE, "01SHD"),
             parent: cloud(MINE, "01ROOT"),
             name: "Contoso Docs".into(),
-            kind: Kind::Folder,
+            kind: Kind::Folder {
+                etag: Some("et:\"{6B0F27D4-8E13-45A9-B2C7-90D6E4A15F38},1\"".into()),
+            },
         }),
         "not Item::Root"
     );
@@ -1031,13 +1042,10 @@ fn the_inner_remote_parent_reference_is_never_the_parent() {
         cloud(D1, "01BYE5RZ6QN3ZWBTUFOFD3GSPGOHDJD36K"),
         "the OUTER reference, never b!Pq2...|01FARROOT9ZWBTUFOFD3GSPGOHDJD36KQ2"
     );
-    assert_eq!(
-        kind,
-        &Kind::Folder,
+    assert!(
+        matches!(kind, Kind::Folder { etag: Some(_) }),
         "shape from shape_body(): `remoteItem` + `folder` and no `package` is a \
-         Folder. Accepting Opaque here would license \"a foreign library is not \
-         ours to walk into\", and collect_files then skips the entire mounted \
-         subtree, so no shared file ever syncs"
+         versioned Folder. Accepting Opaque here would skip the mounted subtree"
     );
     assert_eq!(
         mp.mounts,
@@ -2556,7 +2564,7 @@ fn a_childless_file_that_becomes_a_folder_is_forwarded_and_the_stale_file_remove
 
     let m = map_item(&scope, &index, TagSource::CTag, &one(SWAP_AS_FOLDER))
         .expect("a childless flip is an ordinary upsert, not a refusal");
-    assert_eq!(kind_of(&m), &Kind::Folder);
+    assert!(matches!(kind_of(&m), Kind::Folder { .. }));
 
     let second = map_page(
         &scope,

@@ -1072,7 +1072,13 @@ pub fn map_item(
 
     let node_kind = match kind {
         KindTag::Opaque => Kind::Opaque,
-        KindTag::Folder => Kind::Folder,
+        KindTag::Folder => Kind::Folder {
+            etag: item
+                .e_tag
+                .as_deref()
+                .filter(|tag| !tag.is_empty())
+                .map(|tag| format!("et:{tag}")),
+        },
         KindTag::File => {
             // Exactly a non-negative integer, and within the framework's
             // ceiling. Anything else is refused rather than repaired: a
@@ -1161,7 +1167,7 @@ pub fn map_page(
                         if let Some(key) = key_of_cloud_id(id) {
                             let tag = match kind {
                                 Kind::File { .. } => KindTag::File,
-                                Kind::Folder => KindTag::Folder,
+                                Kind::Folder { .. } => KindTag::Folder,
                                 Kind::Opaque => KindTag::Opaque,
                             };
                             let parent = ix.parents.get(&key).cloned();
@@ -1665,6 +1671,9 @@ enum StoredKind {
         ctag: Option<String>,
     },
     Folder,
+    VersionedFolder {
+        etag: String,
+    },
     /// Deliberately not collapsed into `Folder`. `Namespace` paths the two
     /// identically, which makes one `Dir` variant look like tidying — and a
     /// OneNote notebook restored as an ordinary folder is walked into on the
@@ -1703,7 +1712,10 @@ impl From<&Item> for StoredItem {
                         size: *size,
                         ctag: ctag.clone(),
                     },
-                    Kind::Folder => StoredKind::Folder,
+                    Kind::Folder { etag: Some(etag) } => {
+                        StoredKind::VersionedFolder { etag: etag.clone() }
+                    }
+                    Kind::Folder { etag: None } => StoredKind::Folder,
                     Kind::Opaque => StoredKind::Opaque,
                 },
             },
@@ -1727,7 +1739,8 @@ impl From<StoredItem> for Item {
                 name,
                 kind: match kind {
                     StoredKind::File { size, ctag } => Kind::File { size, ctag },
-                    StoredKind::Folder => Kind::Folder,
+                    StoredKind::Folder => Kind::Folder { etag: None },
+                    StoredKind::VersionedFolder { etag } => Kind::Folder { etag: Some(etag) },
                     StoredKind::Opaque => Kind::Opaque,
                 },
             },
@@ -2710,7 +2723,7 @@ pub fn deletions_since(before: &[Item], after: &Namespace) -> Result<Vec<Change>
             Change::Upserted { cloud_id, .. } if !present.contains(cloud_id.as_str()) => {
                 Some(Change::Removed { cloud_id })
             }
-            Change::FolderUpserted { cloud_id, path }
+            Change::FolderUpserted { cloud_id, path, .. }
                 if !path.is_empty() && !present.contains(cloud_id.as_str()) =>
             {
                 Some(Change::FolderRemoved { cloud_id, path })
@@ -2996,6 +3009,14 @@ fn item_content_url(key: &ObjectKey) -> String {
 /// The object itself: metadata with `GET`, the object with `DELETE`.
 fn item_url(key: &ObjectKey) -> String {
     format!("{}/items/{}", drive_base(key.drive()), key.item().as_str())
+}
+
+fn item_children_url(key: &ObjectKey) -> String {
+    format!(
+        "{}/items/{}/children",
+        drive_base(key.drive()),
+        key.item().as_str()
+    )
 }
 
 /// An upload session against an object that already exists.
@@ -3506,14 +3527,16 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
     /// which is a precondition that can never fail and silently overwrites the
     /// newer version it has just seen.
     fn precondition(&self, cloud_id: &str) -> Option<String> {
-        if self.tags != TagSource::CTag {
-            return None;
-        }
         let tag = self.known.get(cloud_id)?;
-        match tag.strip_prefix("ct:") {
-            Some(raw) if !raw.is_empty() => Some(raw.to_string()),
-            _ => None,
+        if let Some(raw) = tag.strip_prefix("et:").filter(|raw| !raw.is_empty()) {
+            return Some(raw.to_string());
         }
+        if self.tags == TagSource::CTag {
+            if let Some(raw) = tag.strip_prefix("ct:").filter(|raw| !raw.is_empty()) {
+                return Some(raw.to_string());
+            }
+        }
+        None
     }
 
     /// The content tag of the version an object holds right now.
@@ -3579,6 +3602,73 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
             cloud_id,
             etag: tag,
         })
+    }
+
+    fn settle_folder(&mut self, drive: &DriveId, body: &[u8]) -> io::Result<Uploaded> {
+        let item: DriveItem = serde_json::from_slice(body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        if !matches!(shape_of(&item), Shape::Folder) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the service answered a folder write with an object that is not an ordinary folder",
+            ));
+        }
+        let raw_id = item.id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the service accepted the folder write and named no object",
+            )
+        })?;
+        let key = ObjectKey::new(
+            drive.clone(),
+            ItemId::parse(raw_id).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("the service named {e:?}"),
+                )
+            })?,
+        );
+        let raw_tag = item
+            .e_tag
+            .as_deref()
+            .filter(|tag| !tag.is_empty())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the service accepted the folder write but returned no eTag",
+                )
+            })?;
+        let cloud_id = key.to_cloud_id().into_inner();
+        let tag = format!("et:{raw_tag}");
+        self.known.insert(cloud_id.clone(), tag.clone());
+        Ok(Uploaded {
+            cloud_id,
+            etag: Some(tag),
+        })
+    }
+
+    /// Reconcile a create whose name is already occupied by an ordinary folder.
+    ///
+    /// Folder identity has no content hash to prove, and it does not need one:
+    /// two same-name ordinary folders beneath the same stable parent represent
+    /// the same namespace container and their children are merged by identity.
+    /// Files and packages are never adopted through this path.
+    fn reconcile_folder(&mut self, drive: &DriveId, rel: &str) -> io::Result<Option<Uploaded>> {
+        let reply = self.call(&Request::new(Method::Get, path_metadata_url(drive, rel)))?;
+        if !(200..300).contains(&reply.status) {
+            return Err(service_refused(
+                "the object already at this folder name could not be read",
+                reply.status,
+                &reply.body,
+            ));
+        }
+        let item: DriveItem = serde_json::from_slice(&reply.body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        let ours = rel.rsplit('/').next().unwrap_or(rel);
+        if item.name.as_deref() != Some(ours) || !matches!(shape_of(&item), Shape::Folder) {
+            return Ok(None);
+        }
+        self.settle_folder(drive, &reply.body).map(Some)
     }
 
     // --- the simple form ---------------------------------------------------
@@ -4239,9 +4329,67 @@ impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K
                 .with_body(body),
         )?;
         match reply.status {
+            200..=299 if to.is_dir() => self.settle_folder(key.drive(), &reply.body),
             200..=299 => self.settle(key.drive(), &reply.body),
             _ => Err(service_refused(
                 "the object was not renamed",
+                reply.status,
+                &reply.body,
+            )),
+        }
+    }
+
+    fn create_folder(&mut self, path: &std::path::Path) -> io::Result<Uploaded> {
+        let rel = path
+            .strip_prefix(&self.root)
+            .map_err(|_| refused("the folder is not under this sink's sync root"))?
+            .to_str()
+            .ok_or_else(|| refused("the folder path below the sync root is not UTF-8"))?;
+        check_relative_name(rel)?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| refused("the folder name is not UTF-8"))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| refused("the folder has no parent below the sync root"))?;
+        let parent_id =
+            hydration_client::store::get_xattr(parent, hydration_client::store::XATTR_ID)?
+                .and_then(|raw| String::from_utf8(raw).ok())
+                .ok_or_else(|| refused("the parent folder has no recorded cloud identity"))?;
+        let parent_key = key_of_cloud_id(&parent_id)
+            .ok_or_else(|| refused("the parent folder's cloud identity is malformed"))?;
+        if parent_key.drive() != self.scope.drive() {
+            return Err(refused(
+                "the parent folder belongs to another drive; this create cannot be addressed there",
+            ));
+        }
+        let body = serde_json::json!({
+            "name": name,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "fail",
+        })
+        .to_string()
+        .into_bytes();
+        let reply = self.call(
+            &Request::new(Method::Post, item_children_url(&parent_key))
+                .with_header("content-type", "application/json")
+                .with_body(body),
+        )?;
+        match reply.status {
+            200..=299 => self.settle_folder(parent_key.drive(), &reply.body),
+            _ if collided_on_name(reply.status, &reply.body) => {
+                match self.reconcile_folder(parent_key.drive(), rel) {
+                    Ok(Some(folder)) => Ok(folder),
+                    Ok(None) => Err(refused(
+                        "a different object already exists in the cloud under this folder name; \
+                         it was not adopted or replaced",
+                    )),
+                    Err(e) => Err(e),
+                }
+            }
+            _ => Err(service_refused(
+                "the folder was not created",
                 reply.status,
                 &reply.body,
             )),
