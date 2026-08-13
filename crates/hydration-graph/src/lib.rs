@@ -1333,6 +1333,20 @@ pub struct Round {
     report: Report,
     token: Option<DeltaLink>,
     escalation: Option<Escalation>,
+    /// How many items the feed handed this round, mapped and applied.
+    ///
+    /// Not the same as `changes.len()`, and the difference is the whole reason
+    /// this exists. A new empty folder produces no `Change` — changes are about
+    /// files — but it *does* change the tree, and a round that skipped the tree
+    /// write on an empty change list would advance the token past the folder's
+    /// creation with no record of it. A delta feed never re-reports an unchanged
+    /// folder, so every file that ever arrives inside it waits for a parent that
+    /// will never come. `a_round_that_produced_no_changes_still_persists_its_
+    /// tree` is that failure, written down.
+    ///
+    /// An empty *feed*, though, is an empty round: nothing was applied, so the
+    /// tree on disk is still the tree.
+    applied: usize,
     /// Every placeholder-to-far-drive pair the round has seen.
     ///
     /// Kept here rather than dropped in `feed`, because the fan-out is decided
@@ -1354,6 +1368,7 @@ impl Round {
             report: Report::default(),
             token: None,
             escalation: None,
+            applied: 0,
             mounts: Vec::new(),
         }
     }
@@ -1404,6 +1419,7 @@ impl Round {
         }
 
         for item in mapped.items {
+            self.applied += 1;
             self.changes.extend(self.namespace.apply(item));
         }
 
@@ -1414,6 +1430,12 @@ impl Round {
 
     pub fn namespace(&self) -> &Namespace {
         &self.namespace
+    }
+
+    /// How many items the feed handed this round. Zero means the tree on disk is
+    /// still the tree.
+    pub fn applied(&self) -> usize {
+        self.applied
     }
 
     // The error side is large because a refused round carries its whole report,
@@ -2057,7 +2079,9 @@ impl StoredView {
 /// restored tree no longer holds emits no `Change` at all. The position
 /// recovers; the removal does not. So the pair moves together or not at all.
 struct Uncommitted {
-    tree: TreeBlob,
+    /// `None` when the round changed nothing and the tree on disk is still the
+    /// one this token was derived after.
+    tree: Option<TreeBlob>,
     token: TokenBlob,
 }
 
@@ -2065,6 +2089,13 @@ struct Uncommitted {
 struct Attempt {
     listing: Vec<Change>,
     removals: Vec<Change>,
+    /// Whether this round listed the drive from nothing rather than resuming a
+    /// token, which is one of the two states in which the tree must be written
+    /// whatever the feed said.
+    enumerated: bool,
+    /// How many items the feed handed this round. Zero means nothing was applied
+    /// and the tree on disk is still the tree.
+    applied: usize,
     items: Vec<Item>,
     mounts: Vec<MountPoint>,
     tokens: TokenBlob,
@@ -2184,7 +2215,9 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
-        self.store.save_tree(&pending.tree)?;
+        if let Some(tree) = &pending.tree {
+            self.store.save_tree(tree)?;
+        }
         self.store.save_token(&pending.token)
     }
 
@@ -2394,6 +2427,7 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
 
         let listing = round.namespace().listing();
         let items = round.namespace().snapshot();
+        let applied = round.applied();
         // Taken before `finish` consumes the round, and *before* the round's own
         // verdict is applied — but only unwrapped after it, so a round that was
         // going to escalate anyway is reported as what it is rather than as a
@@ -2426,6 +2460,8 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         Ok(Attempt {
             listing,
             removals,
+            enumerated: enumerate,
+            applied,
             items,
             mounts,
             tokens,
@@ -2457,14 +2493,52 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         // every ordering assertion and destroys the state a refusal was
         // protecting: the next round starts from a tree that agrees with the
         // page it refused to trust.
-        let generation = stored.generation + 1;
-        let tree = encode_tree(
-            self.scope.drive(),
-            done.tags,
-            &done.items,
-            &done.mounts,
-            generation,
-        );
+        // A round that changed nothing does not rewrite the tree.
+        //
+        // `encode_tree` serialises every object on the drive and `commit` writes
+        // the result. Measured on a live account on 2026-08-13: 167,890 objects,
+        // 67.6 MB, written every eight seconds to record that the cloud had not
+        // moved. That is where the daemon's 45% of a core went, and it grows
+        // with the user's file count, which is what made a large folder feel
+        // like the client's limit rather than the client's bug.
+        //
+        // The generation is what makes skipping it safe. A token may never be
+        // newer than the tree it was written after — that pair is unrecoverable
+        // and costs a full re-enumeration — so the token keeps the generation
+        // the tree on disk already carries. Equal is allowed; ahead is not.
+        // "Nothing was applied", not "no changes were emitted".
+        //
+        // A new empty folder emits no `Change` and still changes the tree, and
+        // `a_round_that_produced_no_changes_still_persists_its_tree` is the
+        // failure that follows from confusing the two: the token advances past
+        // the folder's creation, the feed never re-reports an unchanged folder,
+        // and every file that later arrives inside it waits forever for a parent
+        // that will never come. Sync stops permanently, on a folder.
+        //
+        // An empty feed is a different thing entirely. Nothing was applied, so
+        // the tree on disk is still the tree, and the only thing that moved is
+        // the delta link.
+        let unchanged = !done.enumerated
+            && done.applied == 0
+            && done.removals.is_empty()
+            && done.mounts == stored.mounts
+            && stored.tags == Some(done.tags);
+        let generation = if unchanged {
+            stored.generation
+        } else {
+            stored.generation + 1
+        };
+        let tree = if unchanged {
+            None
+        } else {
+            Some(encode_tree(
+                self.scope.drive(),
+                done.tags,
+                &done.items,
+                &done.mounts,
+                generation,
+            ))
+        };
 
         let mut token = done.tokens;
         token.generation = generation;
@@ -2494,6 +2568,20 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         // placeholder the user deleted locally never comes back — and the
         // restart is exactly when the framework has lost every other way to find
         // out. Removals first: they free the paths the upserts may claim.
+        // The batch is the tree plus this round's removals, never the round's
+        // own change list. After a restart the framework's `Store` knows only
+        // what is on disk, so filtering to what the service said changed means a
+        // placeholder the user deleted locally never comes back — and the
+        // restart is exactly when the framework has lost every other way to find
+        // out. Removals first: they free the paths the upserts may claim.
+        //
+        // Narrowing this to the round's own changes was tried, on the grounds
+        // that the five hundredth quiet round has nothing new to re-assert, and
+        // `a_quiet_steady_state_round_reports_the_tree_rather_than_an_empty_batch`
+        // refused it. It is right to: a quiet round would then be
+        // `(vec![], new_cursor)`, which is the shape PROVIDER.md:103 forbids and
+        // which one framework version ago consumed a refusal that had been
+        // deliberately held back.
         let mut batch = done.removals;
         batch.extend(done.listing);
         Ok((batch, cursor))

@@ -1318,10 +1318,9 @@ fn a_restart_never_reads_the_stored_tree_as_a_page_of_deletions() {
     ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
-        vec![
-            Ev::SaveTree(501),
-            Ev::SaveToken(format!("{MINE}={}", lnk("D10")))
-        ]
+        // As above: an empty feed applies nothing, so the 501-item tree already
+        // on disk is not rewritten to say the same thing again.
+        vec![Ev::SaveToken(format!("{MINE}={}", lnk("D10")))]
     );
     assert_eq!(tree_ids(&rig.store.stored_tree().unwrap()).len(), 501);
 }
@@ -2974,10 +2973,13 @@ fn a_delta_link_on_the_first_page_completes_the_round_and_nothing_further_is_fet
     ack(&mut d, &cursor);
     assert_eq!(
         rig.journal.writes(),
-        vec![
-            Ev::SaveTree(4),
-            Ev::SaveToken(format!("{MINE}={}", lnk("DELTA-1")))
-        ]
+        // No `SaveTree`: the feed handed this round nothing, so the tree on
+        // disk is still the tree and only the delta link moved. The rule that a
+        // round producing no *changes* still persists its tree is a different
+        // one and is untouched — see
+        // `a_round_that_produced_no_changes_still_persists_its_tree`, whose feed
+        // carries a folder.
+        vec![Ev::SaveToken(format!("{MINE}={}", lnk("DELTA-1")))]
     );
 }
 
@@ -4211,5 +4213,66 @@ fn a_removal_a_restart_interrupted_before_it_was_applied_is_still_reported() {
         },
         rig.journal.calls(),
         removed(&b2),
+    );
+}
+
+/// The rule the previous one is not.
+///
+/// `a_round_that_produced_no_changes_still_persists_its_tree` is about a feed
+/// that handed this round a folder: no `Change` comes of it, the tree changes,
+/// and skipping the write there stops sync permanently on that folder. This is
+/// the other case — a feed that handed the round *nothing at all*. Nothing was
+/// applied, so the tree on disk is still the tree, and rewriting it says the
+/// same thing again.
+///
+/// It says it expensively. Measured on a live account on 2026-08-13: 167,890
+/// objects, 67.6 MB of JSON serialised and written every eight seconds to record
+/// that the cloud had not moved. That was where most of a core went, and it grew
+/// with the user's file count — which is what made a large folder look like the
+/// client's limit rather than the client's bug.
+///
+/// The token still moves, and it moves carrying the generation the tree on disk
+/// already has. Equal is allowed; a token *ahead* of its tree is the
+/// unrecoverable pair, and this never produces one.
+#[test]
+fn an_empty_feed_moves_the_token_without_rewriting_the_tree() {
+    let rig = Rig::new();
+    rig.store.preload(primed(
+        &[
+            root_item(MINE, ROOT),
+            file_item(MINE, "01A", ROOT, "a.txt", 10, "c:{G},1"),
+            file_item(MINE, "01B", ROOT, "b.txt", 11, "c:{G},2"),
+        ],
+        Some("D9"),
+    ));
+    rig.script(
+        resume_req("D9"),
+        vec![Reply::ok(body_delta(&[], &lnk("D10")))],
+    );
+    rig.script(
+        resume_req("D10"),
+        vec![Reply::ok(body_delta(&[], &lnk("D11")))],
+    );
+
+    let mut d = rig.provider();
+    let (_, c1) = d
+        .changes(&Cursor::default())
+        .expect("the first quiet round");
+    ack(&mut d, &c1);
+
+    assert_eq!(
+        rig.journal.writes(),
+        vec![Ev::SaveToken(format!("{MINE}={}", lnk("D10")))],
+        "an empty feed rewrote the whole tree to say what it already said"
+    );
+
+    // And the tree still reaches disk the moment the feed says something.
+    rig.journal.clear();
+    let (_, c2) = d.changes(&c1).expect("a second quiet round");
+    ack(&mut d, &c2);
+    assert_eq!(
+        rig.journal.writes(),
+        vec![Ev::SaveToken(format!("{MINE}={}", lnk("D11")))],
+        "a second empty feed is no different from the first"
     );
 }

@@ -305,6 +305,21 @@ pub fn apply<M: Materialise>(
     mat: &mut M,
 ) -> io::Result<Applied> {
     let mut out = Applied::default();
+    // Nothing to apply means nothing to look at.
+    //
+    // The scan below walks the whole sync root, and `by_cloud_id` right after it
+    // stats and reads two extended attributes from every file it found. On the
+    // measured account that is about a million system calls, and the delta loop
+    // ran it every eight seconds to establish that the cloud had not changed:
+    // 48% of a core, permanently, on a tree of 167,890 files.
+    //
+    // A caller that wants the index refreshed on a quiet tree has to ask for it
+    // — `Store::scan` is public and the daemon loop does exactly that, on a
+    // cadence that suits keeping the lineage record fresh rather than one that
+    // suits polling a service.
+    if changes.is_empty() {
+        return Ok(out);
+    }
     store.scan(root)?;
 
     // Cloud id -> local file, for the removal half. Built once rather than per

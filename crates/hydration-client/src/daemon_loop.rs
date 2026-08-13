@@ -933,6 +933,9 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // still carry their own identity — so it is the one place that can
             // write down what an atomic save is about to destroy.
             let mut store = Store::new().remembering();
+            // Forced on the first turn, so the record exists from startup rather
+            // than five minutes into it.
+            let mut walked = std::time::Instant::now() - WALK_EVERY;
             let mut cursor = Cursor::default();
             // Set when a pass deliberately left something for a later one.
             //
@@ -1111,6 +1114,21 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     Ok(_) => {}
                     Err(e) => eprintln!("hydration-sync: could not list the cloud: {e}"),
                 }
+                // The lineage record is written by this store's scan, and
+                // `delta::apply` no longer scans on a round that has nothing to
+                // apply. So the walk gets a cadence of its own: often enough
+                // that a file's identity is written down well before an atomic
+                // save can destroy it, and rare enough that a quiet tree of
+                // 167,890 files costs nothing to keep quiet.
+                //
+                // Five seconds of polling and five minutes of walking are
+                // different jobs and were only ever the same number by accident.
+                if walked.elapsed() >= WALK_EVERY {
+                    if let Err(e) = store.scan(&mount) {
+                        eprintln!("hydration-sync: could not walk the sync root: {e}");
+                    }
+                    walked = std::time::Instant::now();
+                }
                 std::thread::sleep(Duration::from_secs(5));
             }
         });
@@ -1158,7 +1176,27 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // thread's walk for the third puts a tray within a second of the
             // number that actually moves, for one extra wakeup a second in a
             // process whose upload driver already wakes five times a second.
-            const TICKS_PER_MANIFEST: u32 = 30;
+            // Once every five minutes, not once every thirty seconds.
+            //
+            // `manifest::refresh` walks the whole sync root reading extended
+            // attributes, then renders and writes the result. On the measured
+            // account that is 167,890 files and a 43 MB file, and at the old
+            // cadence it was the single most expensive thing this daemon did:
+            // one thread pinned at essentially a full core, permanently, on a
+            // tree where nothing was changing. Measured 2026-08-13 — 99 seconds
+            // of CPU in 120 seconds of wall clock, all of it here.
+            //
+            // The manifest exists for §6d: it tells someone restoring a backup
+            // which files were not in it. Backups run daily. Nothing about that
+            // wants a thirty-second refresh, and the count it also feeds to the
+            // tray moves when the user's files move, which is not every half
+            // minute either.
+            //
+            // The right fix is one walk shared with the delta pass's, instead of
+            // two threads walking the same tree on different clocks. That is a
+            // larger change than this, and this is the one that stops the
+            // machine getting warm.
+            const TICKS_PER_MANIFEST: u32 = 300;
             let mut tick = 0;
             while !stop.load(Ordering::SeqCst) {
                 if tick == 0 {
@@ -1247,6 +1285,20 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
 /// in the cloud. The floor matters as much as any ratio would — a hundred
 /// removals is a folder, and a folder is exactly the thing somebody deletes on
 /// purpose.
+/// How often the sync root is walked when the cloud reports nothing.
+///
+/// The walk is what keeps the lineage record current — see `crate::lineage` for
+/// what that costs to be without — and it is the most expensive thing this
+/// daemon does: a stat and two extended attributes per file, 167,890 of them on
+/// the measured account. It used to happen on every delta round, eight seconds
+/// apart, and cost 48% of a core in perpetuity.
+///
+/// Five minutes bounds that to something unmeasurable while leaving the record
+/// far fresher than the failure it guards against needs: a file has to be
+/// uploaded and then saved atomically inside one window to slip through, and
+/// even then the content reconciliation in the Graph sink recovers it.
+const WALK_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
 const REMOVAL_BATCH_LIMIT: usize = 100;
 
 /// How many just-sent objects the upload driver remembers for the removal path.
