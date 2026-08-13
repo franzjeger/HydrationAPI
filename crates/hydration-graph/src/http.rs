@@ -458,7 +458,7 @@ fn may_authorize(url: &str, authorize: bool) -> io::Result<bool> {
 ///
 /// `Request::headers` is an ordinary `Vec` that any call site can push onto, so
 /// an `authorization` header placed there would walk straight past
-/// [`may_authorize`] and be sent to whatever host the request names. Refused
+/// `may_authorize` and be sent to whatever host the request names. Refused
 /// rather than dropped: a caller that set one meant something by it, and
 /// silently discarding it would leave that intent unmet and unreported.
 ///

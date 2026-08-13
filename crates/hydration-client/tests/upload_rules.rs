@@ -422,3 +422,58 @@ fn a_read_only_file_can_still_be_told_which_object_it_is() {
         .expect("the id was not recorded");
     assert_eq!(id, b"cloud-1");
 }
+
+/// A file that cannot be sent is not asked about every ten seconds forever.
+///
+/// A failure has to be re-queued: `begin` took the file out, and without that it
+/// is gone until the next resync walk, which on a stable system is days. It was
+/// re-queued through `touch`, which is the *edit* path — so the quiet period
+/// decided the retry cadence too, and shortening the quiet period from fifteen
+/// minutes to ten seconds turned a permanent conflict into a request storm.
+///
+/// Measured on the live account on 2026-08-13: two files in a genuine conflict,
+/// two Graph round trips each, every eleven seconds, with no end and no chance
+/// of a different answer.
+#[test]
+fn a_failing_upload_backs_off_instead_of_asking_every_quiet_period() {
+    let clock = TestClock::default();
+    let mut q = Queue::new(Duration::from_secs(10), clock.clone());
+    let f = FileId { fsid: 1, ino: 2 };
+
+    let mut waits = Vec::new();
+    let mut last = Duration::ZERO;
+    for _ in 0..6 {
+        q.failed(f);
+        // How long until it is due again.
+        let mut waited = Duration::ZERO;
+        while q.due().is_empty() {
+            clock.advance(Duration::from_secs(1));
+            waited += Duration::from_secs(1);
+            assert!(waited < Duration::from_secs(2000), "it never came due");
+        }
+        q.begin(f);
+        q.finish(f);
+        waits.push(waited);
+        assert!(
+            waited > last || waited >= Duration::from_secs(900),
+            "the wait did not grow: {waits:?}"
+        );
+        last = waited;
+    }
+    assert!(
+        waits.last().is_some_and(|w| *w >= Duration::from_secs(300)),
+        "six failures in a row still had it asking every few seconds: {waits:?}"
+    );
+
+    // And a real edit is not punished for what the old bytes could not do.
+    q.touch(f);
+    let mut waited = Duration::ZERO;
+    while q.due().is_empty() {
+        clock.advance(Duration::from_secs(1));
+        waited += Duration::from_secs(1);
+    }
+    assert!(
+        waited <= Duration::from_secs(11),
+        "an edit waited out the failure penalty rather than the quiet period: {waited:?}"
+    );
+}

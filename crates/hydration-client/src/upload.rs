@@ -103,6 +103,17 @@ pub struct Known<'a> {
     pub tag: Option<&'a str>,
 }
 
+/// How many times a repeated failure doubles its wait before the cap takes over.
+const RETRY_DOUBLINGS: u32 = 8;
+
+/// The longest a failing upload waits between attempts.
+///
+/// A conflict that needs a person is not resolved by asking sooner, and one that
+/// resolves itself — a service having a bad minute, a lock that clears — does so
+/// well inside this. The file stays visibly unsent the whole time, which is the
+/// thing the user is actually owed.
+const RETRY_CEILING: Duration = Duration::from_secs(900);
+
 /// How long a file must go untouched before it is sent.
 ///
 /// Rule 1 is what this exists for: an atomic save closes a temp file it is about
@@ -228,6 +239,9 @@ pub struct Queue<C: Clock> {
     /// *which* file is being sent, not just how many.
     in_flight: std::collections::HashSet<FileId>,
     debounce: Duration,
+    /// Consecutive failures per file, for the backoff. Not in `waiting`: that
+    /// entry is removed by `begin` before the attempt whose outcome sets this.
+    failures: HashMap<FileId, u32>,
     clock: C,
 }
 
@@ -235,6 +249,7 @@ impl<C: Clock> Queue<C> {
     pub fn new(debounce: Duration, clock: C) -> Self {
         Self {
             waiting: HashMap::new(),
+            failures: HashMap::new(),
             in_flight: std::collections::HashSet::new(),
             debounce,
             clock,
@@ -248,7 +263,44 @@ impl<C: Clock> Queue<C> {
     /// out never both exist.
     pub fn touch(&mut self, file: FileId) {
         let due = self.clock.now() + self.debounce;
+        // A real edit clears the failure history: whatever the last attempt
+        // could not send, this is different content, and it deserves the
+        // ordinary quiet period rather than the penalty the old bytes earned.
+        self.failures.remove(&file);
         self.waiting.insert(file, Waiting { due });
+    }
+
+    /// Send failed. Come back later, and later again if it keeps failing.
+    ///
+    /// A failure has to be re-queued — `begin` took the file out, and without
+    /// this it is simply gone until the next resync walk, which on a stable
+    /// system is days. But re-queuing it at the quiet period's cadence means a
+    /// file that *cannot* be sent is attempted every ten seconds forever, which
+    /// is a denial of service aimed at the user's own tenant and the surest way
+    /// to be throttled.
+    ///
+    /// Doubling from the quiet period, capped. The cap matters more than the
+    /// curve: a conflict that needs a person is not resolved by asking sooner,
+    /// and one that resolves itself does so within minutes.
+    pub fn failed(&mut self, file: FileId) {
+        // Held outside `waiting`, because `begin` removes that entry before the
+        // attempt runs and the outcome is only known afterwards. Keeping the
+        // count there meant it reset on every attempt and the wait never grew,
+        // which is the storm this exists to stop, wearing a fix.
+        let failures = self.failures.entry(file).or_insert(0);
+        *failures = failures.saturating_add(1);
+        let failures = *failures;
+        let backoff = self
+            .debounce
+            .saturating_mul(1u32 << failures.min(RETRY_DOUBLINGS))
+            .min(RETRY_CEILING);
+        let due = self.clock.now() + backoff;
+        self.waiting.insert(file, Waiting { due });
+    }
+
+    /// The file went out. Forget what the old bytes could not do.
+    pub fn sent(&mut self, file: FileId) {
+        self.failures.remove(&file);
     }
 
     /// The file was deleted. Drop any waiting edit rather than racing it.
@@ -256,6 +308,7 @@ impl<C: Clock> Queue<C> {
     /// Returns whether there was one, which the caller needs in order to
     /// distinguish "cancelled a pending upload" from "nothing was queued".
     pub fn cancel(&mut self, file: &FileId) -> bool {
+        self.failures.remove(file);
         self.waiting.remove(file).is_some()
     }
 

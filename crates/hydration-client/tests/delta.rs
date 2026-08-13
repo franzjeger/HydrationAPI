@@ -39,9 +39,21 @@ struct Recorder {
     /// mount, a directory owned by somebody else — and the reconciler cannot
     /// tell the difference: it sees an `io::Error` either way.
     refuse_with: Option<io::ErrorKind>,
+    /// How many changes the pass actually walked.
+    ///
+    /// `root_still_current` is asked once per change, so this counts work the
+    /// reconciler did whether or not any of it touched the tree — which is
+    /// exactly what a skipped pass must not do, and what `placed` cannot see
+    /// because a file already in the right state is never placed again.
+    visited: std::cell::Cell<usize>,
 }
 
 impl Materialise for Recorder {
+    fn root_still_current(&self) -> io::Result<bool> {
+        self.visited.set(self.visited.get() + 1);
+        Ok(true)
+    }
+
     fn place(
         &mut self,
         path: &Path,
@@ -796,4 +808,208 @@ fn a_pass_with_a_new_version_still_refreshes() {
     );
     assert_eq!(out.updated, 1, "{out:?}");
     assert_eq!(std::fs::metadata(&p).unwrap().len(), 250);
+}
+
+/// A pass that would do nothing is recognised and not done.
+///
+/// The provider hands the framework the whole listing every round —
+/// PROVIDER.md:103 forbids a quiet round from being an empty one — so on a drive
+/// that is not changing, the same batch arrives forever and is reconciled
+/// against the same tree forever. Measured on a live account of 167,890 objects:
+/// 3.17 seconds per round, almost all of it building two hash maps keyed by
+/// owned strings to discover that every file was already where it should be.
+///
+/// The saving is only legitimate because of what the second half of the
+/// fingerprint is: the tree as this pass's own walk just found it. Nothing here
+/// trusts a watch or a timer.
+#[test]
+fn an_identical_batch_over_an_unchanged_tree_is_not_applied_twice() {
+    let dir = scratch("fingerprint-skip");
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+    let batch = [
+        upserted("a.txt", 10, "cloud-a"),
+        upserted("b.txt", 11, "cloud-b"),
+    ];
+
+    let mut m = Recorder::default();
+    let mut store = Store::new();
+    let mut seen = None;
+    let first = hydration_client::delta::apply_remembering(
+        &dir,
+        &batch,
+        &mut store,
+        &q.waiting_set(),
+        &mut m,
+        &mut seen,
+    )
+    .expect("the first pass");
+    assert_eq!(first.created, 2, "the first pass has work to do");
+
+    // The second pass is the one that establishes the nothing: it runs in full,
+    // finds every file already where it should be, and records the tree it
+    // walked. Only a pass that changed nothing may record, because the walk
+    // happens before the work and a pass that changed something left a tree its
+    // own fingerprint does not describe.
+    let second = hydration_client::delta::apply_remembering(
+        &dir,
+        &batch,
+        &mut store,
+        &q.waiting_set(),
+        &mut m,
+        &mut seen,
+    )
+    .expect("the second pass");
+    assert_eq!(
+        (second.created, second.updated, second.removed, second.moved),
+        (0, 0, 0, 0),
+        "the second pass over an unchanged tree still had work to do"
+    );
+    assert!(seen.is_some(), "a pass that did nothing recorded nothing");
+
+    // `placed` cannot see this: a file already in the right state is never
+    // placed again, so it stays flat whether the pass ran or not. `visited`
+    // counts what the reconciler walked, which is the work being skipped.
+    let visited_before = m.visited.get();
+    let third = hydration_client::delta::apply_remembering(
+        &dir,
+        &batch,
+        &mut store,
+        &q.waiting_set(),
+        &mut m,
+        &mut seen,
+    )
+    .expect("the third pass");
+
+    assert_eq!(
+        m.visited.get(),
+        visited_before,
+        "the third pass walked the batch again, reconciling every change against \
+         a tree that had not moved"
+    );
+    assert_eq!(
+        (third.created, third.updated, third.removed, third.moved),
+        (0, 0, 0, 0)
+    );
+}
+
+/// And a tree that moved underneath an identical batch is applied in full.
+///
+/// This is the assertion the skip has to survive: the batch says the same thing,
+/// the local copy does not, and nothing but this pass will repair it. A design
+/// that recognised the batch alone would leave a file the user deleted gone for
+/// good, silently, because the batch never changes again.
+#[test]
+fn a_tree_that_changed_under_an_identical_batch_is_applied_again() {
+    let dir = scratch("fingerprint-tree-moved");
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+    let batch = [upserted("a.txt", 10, "cloud-a")];
+
+    let mut m = Recorder::default();
+    let mut store = Store::new();
+    let mut seen = None;
+    hydration_client::delta::apply_remembering(
+        &dir,
+        &batch,
+        &mut store,
+        &q.waiting_set(),
+        &mut m,
+        &mut seen,
+    )
+    .expect("the first pass");
+    // The pass that records the nothing, so the skip is armed.
+    hydration_client::delta::apply_remembering(
+        &dir,
+        &batch,
+        &mut store,
+        &q.waiting_set(),
+        &mut m,
+        &mut seen,
+    )
+    .expect("the quiet pass");
+    assert!(
+        seen.is_some(),
+        "the skip was never armed, so this proves nothing"
+    );
+    let placed_after_first = m.placed.len();
+    let visited_after_quiet = m.visited.get();
+
+    // What the user does, and what only this pass puts back.
+    std::fs::remove_file(dir.join("a.txt")).expect("the user deletes it");
+
+    let again = hydration_client::delta::apply_remembering(
+        &dir,
+        &batch,
+        &mut store,
+        &q.waiting_set(),
+        &mut m,
+        &mut seen,
+    )
+    .expect("the pass after the deletion");
+
+    assert_eq!(
+        again.created, 1,
+        "a file deleted locally was not put back: the batch had not changed, and \
+         nothing else was looking"
+    );
+    assert!(m.placed.len() > placed_after_first);
+    assert!(
+        m.visited.get() > visited_after_quiet,
+        "the pass was skipped over a tree that had moved"
+    );
+}
+
+/// A pass that did work must not record what it walked.
+///
+/// The tree half of the fingerprint is measured at the top of the pass, before
+/// any of the work — so a pass that created, moved or removed anything has left
+/// a tree its own fingerprint does not describe. Recording it there arms the
+/// skip against a state that no longer exists, and the next pass recognises a
+/// tree it is not looking at.
+///
+/// The damage is specific and silent: delete the file that pass created, and the
+/// next pass matches the fingerprint taken *before* it existed, skips, and the
+/// file stays gone. The batch never changes again, so nothing ever puts it back.
+/// This is the version of `a_tree_that_changed_under_an_identical_batch_is_
+/// applied_again` with no quiet pass in between — the quiet pass masks it, which
+/// is why both are here.
+#[test]
+fn a_pass_that_did_work_does_not_arm_the_skip_against_the_tree_it_started_from() {
+    let dir = scratch("fingerprint-after-work");
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+    let batch = [upserted("a.txt", 10, "cloud-a")];
+
+    let mut m = Recorder::default();
+    let mut store = Store::new();
+    let mut seen = None;
+    let first = hydration_client::delta::apply_remembering(
+        &dir,
+        &batch,
+        &mut store,
+        &q.waiting_set(),
+        &mut m,
+        &mut seen,
+    )
+    .expect("the first pass");
+    assert_eq!(first.created, 1);
+    assert!(
+        seen.is_none(),
+        "a pass that created a file recorded the tree from before it existed"
+    );
+
+    std::fs::remove_file(dir.join("a.txt")).expect("the user deletes it");
+    let again = hydration_client::delta::apply_remembering(
+        &dir,
+        &batch,
+        &mut store,
+        &q.waiting_set(),
+        &mut m,
+        &mut seen,
+    )
+    .expect("the pass after the deletion");
+
+    assert_eq!(
+        again.created, 1,
+        "the file stayed deleted: the skip was armed against a tree that had not \
+         been created yet"
+    );
 }
