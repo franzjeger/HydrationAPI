@@ -1085,7 +1085,7 @@ impl<T: TokenSource> PageSource for GraphHttp<T> {
 
     /// The link comes back out of the state store, not off a page, so this is
     /// the first time anything has looked at it since it was written. See
-    /// [`may_authorize`].
+    /// `may_authorize`.
     fn resume(&mut self, link: &DeltaLink) -> io::Result<RawPage> {
         self.page(link.as_str())
     }
