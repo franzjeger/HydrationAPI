@@ -729,6 +729,32 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // learn anything from the file. What it needs is what the delta
             // pass's scan wrote down while they were still there.
             let mut store = Store::new().consulting();
+
+            // Removals ride with the uploads because this thread already owns
+            // the sink, and a second thread holding it would put every deletion
+            // behind whatever transfer is running. It is also the right place in
+            // meaning: sending a change and withdrawing one are the same
+            // conversation with the service.
+            //
+            // A failure to start watching is survivable and is not silent. What
+            // it costs is that local deletions stop reaching the cloud, which is
+            // a sync that is behind rather than one that destroys anything.
+            let mut removals = match crate::removals::Removals::watch(&mount) {
+                Ok(w) => {
+                    eprintln!(
+                        "hydration-sync: watching {} directories for deletions",
+                        w.watched()
+                    );
+                    Some(w)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "hydration-sync: cannot watch for deletions ({e}); files deleted \
+                         here will stay in the cloud"
+                    );
+                    None
+                }
+            };
             while !stop.load(Ordering::SeqCst) {
                 // Close the holes in the change channel by looking, rather than
                 // by trusting that nothing was missed.
@@ -816,6 +842,23 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         }
                     }
                     eprintln!("hydration-sync: upload {file:?} -> {outcome:?}");
+                }
+
+                if let Some(w) = &mut removals {
+                    let gone = w.take();
+                    if w.lost_events() {
+                        // Missed removals leave objects in the cloud the user
+                        // deleted here. Behind, never destructive — but the user
+                        // is entitled to know their deletion did not land.
+                        eprintln!(
+                            "hydration-sync: the deletion watch overflowed; some files \
+                             deleted here will stay in the cloud until they are deleted \
+                             again"
+                        );
+                    }
+                    if !gone.is_empty() {
+                        apply_removals(&mount, &gone, &mut sink);
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -1164,6 +1207,135 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The most removals one batch may carry out before it stops and asks.
+///
+/// The catastrophic shape — an unmounted or rebuilt sync root read as "the user
+/// deleted everything" — cannot arise here at all, and that is the point of
+/// watching for events rather than inferring from absence: an unmounted root
+/// produces no events, because its watches went with it.
+///
+/// What is left is an ordinary `rm -rf` of a large folder, which is a real thing
+/// a user may mean. So this is a pause, not a refusal on principle: the batch is
+/// declined, it is said plainly what would have been removed, and the files stay
+/// in the cloud. The floor matters as much as any ratio would — a hundred
+/// removals is a folder, and a folder is exactly the thing somebody deletes on
+/// purpose.
+const REMOVAL_BATCH_LIMIT: usize = 100;
+
+/// What the framework knows about the object that used to be at a path.
+///
+/// Two registers, because the framework keeps the two halves of its tree in
+/// different places: `.hydration-lineage` records files that hold content, and
+/// §6d's manifest records the ones that do not. A deleted placeholder is the
+/// commonest deletion there is — it is how somebody clears out files they never
+/// opened — so covering only the first would be covering the rarer half.
+struct Registers {
+    lineage: crate::lineage::Lineage,
+    /// Parsed from the manifest on first miss and kept until it changes. It is
+    /// tens of megabytes on a large account, so it is not re-read per batch, and
+    /// it is not read at all unless a deletion actually needs it.
+    manifest: Option<(
+        std::time::SystemTime,
+        std::collections::HashMap<String, String>,
+    )>,
+}
+
+impl Registers {
+    fn load(root: &std::path::Path) -> Self {
+        Self {
+            lineage: crate::lineage::Lineage::load(root),
+            manifest: None,
+        }
+    }
+
+    fn cloud_id(&mut self, root: &std::path::Path, rel: &str) -> Option<String> {
+        if let Some(r) = self.lineage.get(rel) {
+            return Some(r.cloud_id.clone());
+        }
+        self.manifest(root)?.get(rel).cloned()
+    }
+
+    fn manifest(
+        &mut self,
+        root: &std::path::Path,
+    ) -> Option<&std::collections::HashMap<String, String>> {
+        let path = root.join(hydration_protocol::names::MANIFEST);
+        let stamp = std::fs::metadata(&path).ok()?.modified().ok()?;
+        let stale = self.manifest.as_ref().is_none_or(|(at, _)| *at != stamp);
+        if stale {
+            let raw = std::fs::read_to_string(&path).ok()?;
+            let mut by_path = std::collections::HashMap::new();
+            for line in raw.lines() {
+                if line.starts_with('#') || line.is_empty() {
+                    continue;
+                }
+                let mut f = line.split('\t');
+                if let (Some(p), Some(id)) = (f.next(), f.next()) {
+                    if !p.is_empty() && !id.is_empty() {
+                        by_path.insert(p.to_string(), id.to_string());
+                    }
+                }
+            }
+            self.manifest = Some((stamp, by_path));
+        }
+        self.manifest.as_ref().map(|(_, m)| m)
+    }
+}
+
+/// Withdraw from the cloud the files that went away here.
+///
+/// Called only with names the kernel reported as removed — never with an
+/// absence. `removals` explains at length why that distinction is the whole
+/// design and not a nicety.
+fn apply_removals<S: Sink>(root: &std::path::Path, gone: &[crate::removals::Gone], sink: &mut S) {
+    if gone.len() > REMOVAL_BATCH_LIMIT {
+        eprintln!(
+            "hydration-sync: {} files were deleted here at once, which is more than              this will remove from the cloud without being asked ({REMOVAL_BATCH_LIMIT}).              Nothing was removed; the files are still in the cloud and will come back              on the next delta pass. First few: {}",
+            gone.len(),
+            gone.iter()
+                .take(5)
+                .map(|g| g.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return;
+    }
+
+    let mut registers = Registers::load(root);
+    for g in gone {
+        let how = if g.moved_out {
+            "moved out of"
+        } else {
+            "deleted from"
+        };
+        let Some(cloud_id) = registers.cloud_id(root, &g.path) else {
+            // Not an error. A file created here and never uploaded has no object
+            // to withdraw, and that is the ordinary case for scratch files.
+            eprintln!(
+                "hydration-sync: {} was {how} the sync folder; nothing to remove, the \
+                 cloud has no record of it",
+                g.path
+            );
+            continue;
+        };
+        match sink.remove(&cloud_id) {
+            Ok(()) => eprintln!(
+                "hydration-sync: {} was {how} the sync folder; removed from the cloud",
+                g.path
+            ),
+            // Left alone rather than retried. The next delta pass will bring the
+            // object back down as a placeholder, which is visible and correct —
+            // the file is in the cloud, so it should be here. Retrying a removal
+            // in a loop is how one failure becomes a deletion nobody asked for.
+            Err(e) => eprintln!(
+                "hydration-sync: {} was {how} the sync folder, but the cloud copy could \
+                 not be removed: {e}. It will come back on the next delta pass.",
+                g.path
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
