@@ -1129,7 +1129,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     }
                     walked = std::time::Instant::now();
                 }
-                std::thread::sleep(Duration::from_secs(5));
+                std::thread::sleep(POLL_EVERY);
             }
         });
     }
@@ -1285,6 +1285,27 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
 /// in the cloud. The floor matters as much as any ratio would — a hundred
 /// removals is a folder, and a folder is exactly the thing somebody deletes on
 /// purpose.
+/// How often the cloud is asked whether anything changed.
+///
+/// Every round costs a reconciliation of the whole batch against the tree, and
+/// the batch is the whole listing — PROVIDER.md:103 requires a provider's quiet
+/// round to carry it rather than be `(vec![], new_cursor)`, because that shape
+/// once consumed a refusal that had been deliberately held back. So the price of
+/// a round is set by the drive's size, not by how much changed, and the only
+/// lever left is how often it is paid.
+///
+/// Five seconds was never argued for anywhere. Measured on a live account on
+/// 2026-08-13, on 167,890 files, it cost 40% of a core in perpetuity to keep
+/// asking a quiet drive the same question. Thirty seconds is what the walk
+/// beside it already used, is well inside what anyone notices for a change made
+/// on another device, and costs a sixth as much.
+///
+/// A change made *here* does not wait for this: local edits are seen by the
+/// helper's watch and uploaded on their own quiet period, and local deletions by
+/// the inotify watch in `crate::removals`. This interval only bounds how stale
+/// the *other* direction can be.
+const POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How often the sync root is walked when the cloud reports nothing.
 ///
 /// The walk is what keeps the lineage record current — see `crate::lineage` for
