@@ -165,10 +165,11 @@ struct Resync {
 /// `Dirty` in every state that matters:
 ///
 /// - A transfer cut off mid-stream. The worker writes through the event fd and
-///   clears the mark in `finish_hydration`; killed in between — which a
-///   machine-wide `pkill hydrationd` did on a live mount on 2026-08-10 — it
-///   leaves a file that is still marked, holds part of the object, and whose
-///   `pwrite` moved the mtime out from under the placeholder's stamp.
+///   settles what it wrote — `settle_range` for one range, `finish_hydration`
+///   for the last of them; killed in between — which a machine-wide `pkill
+///   hydrationd` did on a live mount on 2026-08-10 — it leaves a file that is
+///   still marked, holds part of the object, and whose `pwrite` moved the mtime
+///   out from under the placeholder's stamp.
 /// - A transfer in progress right now, which looks identical from here.
 /// - A punch of ours whose re-stamp failed. `dehydrate`, `evict` and `abandon`
 ///   all stamp with `let _ =`.
@@ -183,12 +184,23 @@ struct Resync {
 ///
 /// # Why not send them, then, if a user's bytes might be in there
 ///
-/// Because the upload path cannot carry them. `run_upload` reads the file to
-/// send it, and *that read* is what makes the helper punch: `clear_residue` is
-/// unconditional, so whatever is in a marked file is gone before a byte of it
-/// reaches the sink, and what gets uploaded is the cloud's own content. Queueing
-/// the file does not rescue an edit — it destroys it and pays for two transfers
-/// to do so.
+/// Because the upload path cannot carry them, and ranged fills did not change
+/// that — they only changed which half of the argument does the work.
+///
+/// `run_upload` reads the file to send it, and that read is what the helper
+/// answers. It asks `partial::Standing` first, and there are exactly two
+/// answers. `Unknown` — no worker record vouches for what is on disk — punches
+/// the file via `clear_residue` before a byte of it reaches the sink, so an edit
+/// that reached a marked file unintercepted is destroyed by the read that was
+/// meant to send it. `Ours` — the worker wrote those ranges itself and the file
+/// has not moved since — keeps them, but they are the *cloud's* bytes by
+/// construction, so there is nothing of the user's in them to rescue.
+///
+/// Either way the queue gains nothing and the read hydrates the rest of the
+/// object. Note that `clear_residue` used to be unconditional and this argument
+/// used to rest on that; ranged fills made a marked file holding bytes ordinary
+/// (`daemon.rs`, the `Standing::Unknown` arm), and the conclusion survives the
+/// premise being replaced.
 ///
 /// Clearing the mark first is the one thing that would let those bytes out, and
 /// it must never be done from here. A cut-off transfer holds a *prefix* of the
@@ -199,18 +211,31 @@ struct Resync {
 /// to install an ignore mark on a sized file occupying no disk. Guessing wrong
 /// destroys the object; not guessing costs a log line.
 ///
-/// So they are skipped and *named*. A marked file holding bytes is a state that
-/// is not supposed to survive between transfers, this walk is the only thing
-/// that looks at every file, and after the next read the file is quietly the
-/// cloud's copy again with nothing left to notice.
+/// So they are skipped, and the ones holding bytes are *named* — this walk is
+/// the only thing that looks at every file, and after the next read the file is
+/// quietly the cloud's copy again with nothing left to notice.
 ///
-/// The bytes question is asked only of a placeholder whose stamp already
-/// disagrees, and it is asked with `holds_data` — `SEEK_DATA`, never
+/// # Why `Clean` is the line, now that partial fills exist
+///
+/// The bytes question is asked with `holds_data` — `SEEK_DATA`, never
 /// `st_blocks`, which reports the same count for an empty placeholder and a
-/// filled one (§8z). A `Clean` placeholder is skipped without asking: putting
-/// bytes in one moves its mtime, and nothing in the framework writes into a
-/// marked file and re-stamps it. That keeps the syscall off the overwhelming
-/// majority of placeholders, which are `Clean`.
+/// filled one (§8z) — and it is asked only of a placeholder whose stamp already
+/// disagrees. That gate began as an optimisation and is now the thing that keeps
+/// the warning true.
+///
+/// It rested on "nothing in the framework writes into a marked file and
+/// re-stamps it". `settle_range` does exactly that: it is how a ranged fill
+/// records the part it has, and it stamps precisely so a resync walk does not
+/// read the fill as the user's own edit. So a marked file that is `Clean` *and*
+/// holds bytes is no longer impossible — it is the ordinary shape of a partially
+/// hydrated file, and it is the framework's own content.
+///
+/// Warning about those would put a line in front of the user on every resync for
+/// every file the helper is part-way through, which is how the line that matters
+/// stops being read. `Clean` is what separates "the framework put these bytes
+/// here and vouches for them" from "these bytes arrived some other way", and it
+/// is the only signal on this side that does: `partial::Standing` lives in the
+/// worker's memory and nothing on this side of the socket can consult it.
 ///
 /// Measured before it was used (`probes/seekdata.c`, 7.1.6, btrfs and ext4):
 /// `open` and `lseek(SEEK_DATA)` fire no pre-content event, while a `read` on
@@ -1279,6 +1304,50 @@ mod tests {
 
         let found = dirty_files(&dir).unwrap();
         assert_eq!(found, Resync::default());
+    }
+
+    /// A partially hydrated file: marked, holding bytes, and `Clean`.
+    ///
+    /// This state did not exist when the walk was written — `clear_residue` was
+    /// unconditional and a marked file holding bytes could not survive between
+    /// transfers. Ranged fills made it ordinary: `settle_range` writes a range
+    /// into a still-marked file and stamps it, so the file holds the cloud's
+    /// bytes and reads `Clean`.
+    ///
+    /// It must be silent. Not because there is nothing there — there is — but
+    /// because those bytes are the framework's own and the helper is part-way
+    /// through putting them there. Warning would name every file being hydrated,
+    /// on every resync, in the same sentence used for bytes that are about to be
+    /// punched; the honest line and the routine one would be identical and the
+    /// user would learn to skip both.
+    ///
+    /// The `Clean` gate is what holds this, and it is the only signal available:
+    /// `partial::Standing` lives in the worker's memory, on the far side of the
+    /// socket. Removing the gate — or "fixing" the stale premise that once
+    /// justified it — turns the warning into noise, so it is pinned here.
+    #[test]
+    fn a_partially_hydrated_file_is_not_reported_as_holding_bytes() {
+        let dir = scratch("partial-fill");
+        let p = placeholder(&dir, "half.iso", 1 << 20);
+
+        // What `settle_range` leaves: bytes in the hole, mark untouched, and a
+        // stamp describing the file as it now stands.
+        fill_range(&p, 4096);
+        stamp::write(&p).unwrap();
+
+        assert_eq!(
+            stamp::state(&p).unwrap(),
+            State::Clean,
+            "a settled range leaves the file Clean, which is what the gate reads"
+        );
+        assert!(holds_data(&p).unwrap(), "and it really does hold bytes");
+        assert!(
+            store::get_xattr(&p, xattr::DEHYDRATED).unwrap().is_some(),
+            "and it is still a placeholder"
+        );
+
+        let found = dirty_files(&dir).unwrap();
+        assert_eq!(found, Resync::default(), "a partial fill is not news");
     }
 
     /// The reason the `Dirty` arm exists, and it still has to work: an in-place
