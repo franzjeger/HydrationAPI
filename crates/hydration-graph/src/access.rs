@@ -2,8 +2,8 @@
 
 use crate::auth::{AuthConfig, Clock, CredentialStore, RefreshToken, TokenCache};
 use crate::{
-    CloudId, DriveScope, GraphDiscover, GraphHttp, GraphSink, GraphTokens, PersistedState, Sleeper,
-    StateStore, TagSource, TokenBlob, TreeBlob,
+    CloudId, DriveScope, GraphDiscover, GraphHttp, GraphSink, GraphTokens, Method, PersistedState,
+    Request, Sleeper, StateStore, TagSource, TokenBlob, Transport, TreeBlob,
 };
 use hydration_client::{CloudAccess, Provider};
 use hydration_protocol::transport::Body;
@@ -125,6 +125,65 @@ impl Sleeper for SystemSleeper {
 pub struct GraphProvider {
     http: GraphHttp<SharedTokenCache>,
 }
+
+impl GraphProvider {
+    /// QuickXor for the exact cTag the placeholder promises, when Graph has one.
+    ///
+    /// The persisted tag remains the concurrency/version token used by uploads.
+    /// Integrity is read independently at hydration time, so choosing a usable
+    /// `if-match` no longer silently gives up the hash Graph also carries.
+    fn quickxor_for(
+        &mut self,
+        key: &crate::ObjectKey,
+        expected_version: &str,
+    ) -> io::Result<Option<String>> {
+        let reply = self
+            .http
+            .send(&Request::new(Method::Get, crate::item_metadata_url(key)))?;
+        if !(200..300).contains(&reply.status) {
+            return Err(io::Error::other(format!(
+                "the object's integrity metadata was refused with HTTP {}",
+                reply.status
+            )));
+        }
+        let item: crate::DriveItem = serde_json::from_slice(&reply.body).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the object's integrity metadata was malformed",
+            )
+        })?;
+        quickxor_for_version(expected_version, &item)
+    }
+}
+
+/// Separate a version precondition from a content-integrity value.
+///
+/// Kept outside the HTTP method so the judgment is testable without a token or
+/// a socket. A metadata read for a newer cTag must never be used to bless bytes
+/// for the older placeholder: that would hydrate a version and size the local
+/// namespace has not applied yet.
+fn quickxor_for_version(
+    expected_version: &str,
+    item: &crate::DriveItem,
+) -> io::Result<Option<String>> {
+    let body = item.body();
+    let current = crate::content_tag(&body, TagSource::CTag).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the object's metadata carried no cTag",
+        )
+    })?;
+    if current != expected_version {
+        return Err(io::Error::other(
+            "the object changed after this placeholder was installed; waiting for delta",
+        ));
+    }
+    Ok(body
+        .hashes
+        .and_then(|hashes| hashes.quick_xor_hash.as_deref())
+        .map(str::to_string))
+}
+
 impl Provider for GraphProvider {
     fn fetch(
         &mut self,
@@ -154,6 +213,33 @@ impl Provider for GraphProvider {
                 let mut verified = crate::QuickXorWriter::new(out);
                 self.http.download_span(&key, span, size, &mut verified)?;
                 verified.verify(expected)
+            }
+            _ if span.is_whole(size) && content_tag.is_some_and(|tag| tag.starts_with("ct:")) => {
+                let expected_version = content_tag.unwrap();
+                match self.quickxor_for(&key, expected_version)? {
+                    Some(expected) => {
+                        let mut verified = crate::QuickXorWriter::new(out);
+                        self.http.download_span(&key, span, size, &mut verified)?;
+                        verified.verify(&expected)?;
+                        // Metadata and content are separate Graph requests. A
+                        // matching hash proves the bytes, while this second
+                        // version read proves they still belong to the cTag the
+                        // placeholder names rather than a newer version with
+                        // identical content.
+                        self.quickxor_for(&key, expected_version)?;
+                        Ok(())
+                    }
+                    // Not every Graph-backed library reports hashes. The cTag
+                    // is checked on both sides of the download so a same-sized
+                    // edit cannot slip through between metadata and content.
+                    // TLS and the service remain the byte-integrity boundary
+                    // for that drive.
+                    None => {
+                        self.http.download_span(&key, span, size, out)?;
+                        self.quickxor_for(&key, expected_version)?;
+                        Ok(())
+                    }
+                }
             }
             _ => self.http.download_span(&key, span, size, out),
         }
@@ -472,6 +558,45 @@ mod tests {
             quickxor(&(0_u8..=255).collect::<Vec<_>>()),
             "QkGEfSisZcA7k+FCh71r2dbCayY="
         );
+    }
+
+    fn item_with_tags(ctag: &str, quickxor: Option<&str>) -> crate::DriveItem {
+        let hashes = quickxor
+            .map(|hash| serde_json::json!({"quickXorHash": hash}))
+            .unwrap_or_else(|| serde_json::json!({}));
+        serde_json::from_value(serde_json::json!({
+            "id": "01A",
+            "name": "report.txt",
+            "size": 11,
+            "cTag": ctag,
+            "file": {"hashes": hashes}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_ctag_version_and_its_quickxor_are_independent_facts() {
+        let item = item_with_tags("c:{G},2", Some("aCgDG9jwBhDc4Q1yawMZAAAAAAA="));
+        assert_eq!(
+            quickxor_for_version("ct:c:{G},2", &item)
+                .unwrap()
+                .as_deref(),
+            Some("aCgDG9jwBhDc4Q1yawMZAAAAAAA=")
+        );
+    }
+
+    #[test]
+    fn integrity_from_a_newer_version_cannot_bless_an_old_placeholder() {
+        let item = item_with_tags("c:{G},3", Some("aCgDG9jwBhDc4Q1yawMZAAAAAAA="));
+        let err = quickxor_for_version("ct:c:{G},2", &item).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(err.to_string().contains("changed"));
+    }
+
+    #[test]
+    fn a_drive_without_quickxor_keeps_ctag_as_its_version_boundary() {
+        let item = item_with_tags("c:{G},2", None);
+        assert_eq!(quickxor_for_version("ct:c:{G},2", &item).unwrap(), None);
     }
 
     #[test]

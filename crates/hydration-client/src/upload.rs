@@ -142,6 +142,48 @@ pub trait Sink: Send {
         path: &std::path::Path,
         existing: Option<Known<'_>>,
     ) -> io::Result<Uploaded>;
+
+    /// Move or rename an existing cloud object to match its local path.
+    ///
+    /// This is a distinct operation from uploading content. An implementation
+    /// which addresses an update by object id can successfully send the bytes
+    /// while leaving the object under its old name forever; the next delta pass
+    /// then moves the local file back. Keeping the operation explicit prevents
+    /// a content-only sink from presenting that loop as successful sync.
+    fn move_item(
+        &mut self,
+        _from: &std::path::Path,
+        _to: &std::path::Path,
+        _existing: Known<'_>,
+    ) -> io::Result<Uploaded> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this cloud provider cannot move or rename objects",
+        ))
+    }
+
+    /// Create a cloud folder for a directory created locally.
+    ///
+    /// Declared now even though the daemon does not call it yet: without this
+    /// operation an empty directory can never sync, so a sink with only file
+    /// upload and delete is not a complete two-way contract.
+    fn create_folder(&mut self, _path: &std::path::Path) -> io::Result<Uploaded> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this cloud provider cannot create folders",
+        ))
+    }
+
+    /// Remove an object whose identity and base version are both known.
+    ///
+    /// The default preserves the older id-only contract for providers which do
+    /// not support conditional deletion. Providers with a usable version token
+    /// should override this and refuse a stale delete rather than erasing work
+    /// from another device.
+    fn remove_known(&mut self, existing: Known<'_>) -> io::Result<()> {
+        self.remove(existing.cloud_id)
+    }
+
     fn remove(&mut self, cloud_id: &str) -> io::Result<()>;
 }
 

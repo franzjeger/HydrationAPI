@@ -22,7 +22,7 @@ use crate::manifest::{BackupPolicy, Manifest};
 use crate::place::TmpfilePlacer;
 use crate::reclaim;
 use crate::store::Store;
-use crate::upload::{run_upload, Outcome, Queue, Sink, SystemClock};
+use crate::upload::{run_upload, Known, Outcome, Queue, Sink, SystemClock};
 use crate::{Changes, Daemon, Provider};
 use hydration_protocol::transport::DaemonConn;
 use hydration_protocol::FileId;
@@ -870,7 +870,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 }
 
                 if let Some(w) = &mut removals {
-                    let gone = w.take();
+                    let local = w.take();
                     if w.lost_events() {
                         // Missed removals leave objects in the cloud the user
                         // deleted here. Behind, never destructive — but the user
@@ -881,8 +881,26 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                              again"
                         );
                     }
-                    if !gone.is_empty() {
-                        apply_removals(&mount, &gone, &recent, &mut sink);
+                    if !local.folders_moved_out.is_empty() {
+                        eprintln!(
+                            "hydration-sync: {} folder(s) were moved out of the sync root; \
+                             their cloud folders were left untouched because recursive folder \
+                             deletion is not yet an explicit, guarded operation. First few: {}",
+                            local.folders_moved_out.len(),
+                            local
+                                .folders_moved_out
+                                .iter()
+                                .take(5)
+                                .map(String::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    if !local.renamed.is_empty() {
+                        apply_renames(&mount, &local.renamed, &mut sink);
+                    }
+                    if !local.gone.is_empty() {
+                        apply_removals(&mount, &local.gone, &recent, &mut sink);
                     }
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -1343,7 +1361,7 @@ struct Registers {
     /// it is not read at all unless a deletion actually needs it.
     manifest: Option<(
         std::time::SystemTime,
-        std::collections::HashMap<String, String>,
+        std::collections::HashMap<String, crate::lineage::Record>,
     )>,
 }
 
@@ -1355,9 +1373,9 @@ impl Registers {
         }
     }
 
-    fn cloud_id(&mut self, root: &std::path::Path, rel: &str) -> Option<String> {
+    fn record(&mut self, root: &std::path::Path, rel: &str) -> Option<crate::lineage::Record> {
         if let Some(r) = self.lineage.get(rel) {
-            return Some(r.cloud_id.clone());
+            return Some(r.clone());
         }
         self.manifest(root)?.get(rel).cloned()
     }
@@ -1365,7 +1383,7 @@ impl Registers {
     fn manifest(
         &mut self,
         root: &std::path::Path,
-    ) -> Option<&std::collections::HashMap<String, String>> {
+    ) -> Option<&std::collections::HashMap<String, crate::lineage::Record>> {
         let path = root.join(hydration_protocol::names::MANIFEST);
         let stamp = std::fs::metadata(&path).ok()?.modified().ok()?;
         let stale = self.manifest.as_ref().is_none_or(|(at, _)| *at != stamp);
@@ -1377,15 +1395,102 @@ impl Registers {
                     continue;
                 }
                 let mut f = line.split('\t');
-                if let (Some(p), Some(id)) = (f.next(), f.next()) {
+                if let (Some(p), Some(id), Some(_size), Some(tag)) =
+                    (f.next(), f.next(), f.next(), f.next())
+                {
                     if !p.is_empty() && !id.is_empty() {
-                        by_path.insert(p.to_string(), id.to_string());
+                        by_path.insert(
+                            p.to_string(),
+                            crate::lineage::Record {
+                                cloud_id: id.to_string(),
+                                tag: (tag != "-").then(|| tag.to_string()),
+                            },
+                        );
                     }
                 }
             }
             self.manifest = Some((stamp, by_path));
         }
         self.manifest.as_ref().map(|(_, m)| m)
+    }
+}
+
+/// Carry a local identity-preserving rename to the cloud.
+///
+/// A genuine filesystem rename keeps the inode and its cloud xattrs. An atomic
+/// save does not: the temporary inode takes the destination name without the
+/// replaced object's identity. That distinction lets this avoid both failure
+/// modes — moving a cloud object for an editor's scratch name, and uploading
+/// content successfully while leaving a real rename under its old cloud name.
+fn apply_renames<S: Sink>(
+    root: &std::path::Path,
+    renamed: &[crate::removals::Renamed],
+    sink: &mut S,
+) {
+    for item in renamed {
+        if item.is_dir {
+            eprintln!(
+                "hydration-sync: folder {} was renamed to {}; the cloud folder was left \
+                 untouched because folder identity is not yet part of the move contract",
+                item.from, item.to
+            );
+            continue;
+        }
+        let internal = |path: &str| {
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(hydration_protocol::names::is_internal)
+        };
+        if internal(&item.from) || internal(&item.to) {
+            continue;
+        }
+
+        let target = root.join(&item.to);
+        let Some(cloud_id) = crate::store::get_xattr(&target, crate::store::XATTR_ID)
+            .ok()
+            .flatten()
+            .and_then(|raw| String::from_utf8(raw).ok())
+        else {
+            // This is normally an atomic save. Its content path uses the
+            // lineage record to update the existing object conditionally; it
+            // is not a namespace move from the temporary name.
+            eprintln!(
+                "hydration-sync: {} became {} without carrying a cloud identity; \
+                 treating it as replacement content, not a cloud rename",
+                item.from, item.to
+            );
+            continue;
+        };
+        let tag = crate::store::get_xattr(&target, crate::store::XATTR_ETAG)
+            .ok()
+            .flatten()
+            .and_then(|raw| String::from_utf8(raw).ok());
+        let known = Known {
+            cloud_id: &cloud_id,
+            tag: tag.as_deref(),
+        };
+        match sink.move_item(&root.join(&item.from), &target, known) {
+            Ok(uploaded) => {
+                let mut store = Store::new();
+                match store.adopt_cloud_id(&target, &uploaded.cloud_id, uploaded.etag.as_deref()) {
+                    Ok(()) => eprintln!(
+                        "hydration-sync: renamed {} to {} in the cloud",
+                        item.from, item.to
+                    ),
+                    Err(e) => eprintln!(
+                        "hydration-sync: renamed {} to {} in the cloud, but could not record \
+                         the returned identity on the local file: {e}",
+                        item.from, item.to
+                    ),
+                }
+            }
+            Err(e) => eprintln!(
+                "hydration-sync: {} became {}, but the cloud object could not be renamed: \
+                 {e}. The next delta pass may restore the cloud name locally.",
+                item.from, item.to
+            ),
+        }
     }
 }
 
@@ -1423,10 +1528,14 @@ fn apply_removals<S: Sink>(
         } else {
             "deleted from"
         };
-        let Some(cloud_id) = recent
-            .get(g.path.as_str())
+        let recent_id = recent.get(g.path.as_str());
+        let recorded = recent_id
+            .is_none()
+            .then(|| registers.record(root, &g.path))
+            .flatten();
+        let Some(cloud_id) = recent_id
             .cloned()
-            .or_else(|| registers.cloud_id(root, &g.path))
+            .or_else(|| recorded.as_ref().map(|known| known.cloud_id.clone()))
         else {
             // Not an error. A file created here and never uploaded has no object
             // to withdraw, and that is the ordinary case for scratch files.
@@ -1437,7 +1546,14 @@ fn apply_removals<S: Sink>(
             );
             continue;
         };
-        match sink.remove(&cloud_id) {
+        let removed = match recorded.as_ref() {
+            Some(known) => sink.remove_known(Known {
+                cloud_id: &known.cloud_id,
+                tag: known.tag.as_deref(),
+            }),
+            None => sink.remove(&cloud_id),
+        };
+        match removed {
             Ok(()) => eprintln!(
                 "hydration-sync: {} was {how} the sync folder; removed from the cloud",
                 g.path
@@ -1685,6 +1801,160 @@ mod tests {
         let found = dirty_files(&dir).unwrap();
         assert_eq!(found.send.len(), 1);
         assert_eq!(found.holding, Vec::<PathBuf>::new());
+    }
+
+    #[derive(Default)]
+    struct RenameSink {
+        moves: Vec<(PathBuf, PathBuf, String, Option<String>)>,
+    }
+
+    impl Sink for RenameSink {
+        fn upload(
+            &mut self,
+            _path: &Path,
+            _existing: Option<Known<'_>>,
+        ) -> io::Result<crate::upload::Uploaded> {
+            unreachable!("this sink only records namespace operations")
+        }
+
+        fn move_item(
+            &mut self,
+            from: &Path,
+            to: &Path,
+            existing: Known<'_>,
+        ) -> io::Result<crate::upload::Uploaded> {
+            self.moves.push((
+                from.to_path_buf(),
+                to.to_path_buf(),
+                existing.cloud_id.to_string(),
+                existing.tag.map(str::to_string),
+            ));
+            Ok(crate::upload::Uploaded {
+                cloud_id: existing.cloud_id.to_string(),
+                etag: Some("ctag-after-rename".into()),
+            })
+        }
+
+        fn remove(&mut self, _cloud_id: &str) -> io::Result<()> {
+            unreachable!("this sink only records namespace operations")
+        }
+    }
+
+    #[test]
+    fn identity_preserving_local_rename_uses_the_namespace_operation() {
+        let dir = scratch("rename-cloud");
+        let target = dir.join("after.txt");
+        std::fs::write(&target, b"same bytes").unwrap();
+        store::set_xattr(&target, store::XATTR_ID, b"cloud-rename").unwrap();
+        store::set_xattr(&target, store::XATTR_ETAG, b"ctag-before").unwrap();
+        let mut sink = RenameSink::default();
+
+        apply_renames(
+            &dir,
+            &[crate::removals::Renamed {
+                from: "before.txt".into(),
+                to: "after.txt".into(),
+                is_dir: false,
+            }],
+            &mut sink,
+        );
+
+        assert_eq!(
+            sink.moves,
+            [(
+                dir.join("before.txt"),
+                target.clone(),
+                "cloud-rename".into(),
+                Some("ctag-before".into()),
+            )]
+        );
+        assert_eq!(
+            store::get_xattr(&target, store::XATTR_ETAG)
+                .unwrap()
+                .unwrap(),
+            b"ctag-after-rename"
+        );
+    }
+
+    #[test]
+    fn atomic_replacement_without_identity_is_not_a_cloud_rename() {
+        let dir = scratch("replace-not-rename");
+        std::fs::write(dir.join("doc.txt"), b"new inode").unwrap();
+        let mut sink = RenameSink::default();
+
+        apply_renames(
+            &dir,
+            &[crate::removals::Renamed {
+                from: "doc.txt.tmp".into(),
+                to: "doc.txt".into(),
+                is_dir: false,
+            }],
+            &mut sink,
+        );
+
+        assert!(sink.moves.is_empty());
+    }
+
+    #[derive(Default)]
+    struct DeleteSink {
+        known: Vec<(String, Option<String>)>,
+        plain: Vec<String>,
+    }
+
+    impl Sink for DeleteSink {
+        fn upload(
+            &mut self,
+            _path: &Path,
+            _existing: Option<Known<'_>>,
+        ) -> io::Result<crate::upload::Uploaded> {
+            unreachable!("this sink only records deletion")
+        }
+
+        fn remove_known(&mut self, existing: Known<'_>) -> io::Result<()> {
+            self.known.push((
+                existing.cloud_id.to_string(),
+                existing.tag.map(str::to_string),
+            ));
+            Ok(())
+        }
+
+        fn remove(&mut self, cloud_id: &str) -> io::Result<()> {
+            self.plain.push(cloud_id.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn deleting_a_placeholder_preserves_its_manifest_precondition() {
+        let dir = scratch("delete-manifest-tag");
+        crate::manifest::Manifest {
+            entries: vec![crate::manifest::Entry {
+                path: "gone.txt".into(),
+                cloud_id: "drive|cloud-delete".into(),
+                size: 9,
+                etag: Some("ct:c:{G},9".into()),
+            }],
+            unrecoverable: vec![],
+        }
+        .write(&dir)
+        .unwrap();
+        let mut sink = DeleteSink::default();
+
+        apply_removals(
+            &dir,
+            &[crate::removals::Gone {
+                path: "gone.txt".into(),
+                moved_out: false,
+            }],
+            &std::collections::HashMap::new(),
+            &mut sink,
+        );
+
+        assert_eq!(
+            sink.known,
+            [("drive|cloud-delete".into(), Some("ct:c:{G},9".into()))]
+        );
+        assert!(sink.plain.is_empty());
     }
 
     /// A scratch directory whose *canonical* path is used, because these tests

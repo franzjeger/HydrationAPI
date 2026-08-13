@@ -51,7 +51,7 @@
 //! A successful upload calls `Store::adopt_cloud_id`, which writes the extended
 //! attributes back. So a file only depends on this record between the save that
 //! destroyed its attributes and the upload that restores them. Nothing here is
-//! authoritative over what is on the file itself; [`Store::lookup`] reads this
+//! authoritative over what is on the file itself; `Store::lookup` reads this
 //! only when the file has nothing to say.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
