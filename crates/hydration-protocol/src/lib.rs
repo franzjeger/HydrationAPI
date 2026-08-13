@@ -349,12 +349,25 @@ pub mod names {
     /// Lives in the sync root. Named so it sorts early and reads as what it is.
     pub const MANIFEST: &str = ".hydration-manifest";
 
+    /// What the framework last knew about the object at each path.
+    ///
+    /// In the sync root rather than in a daemon's state directory, because it
+    /// describes *these files*: a sync root that is moved, or attached to a
+    /// rebuilt daemon, keeps the record of what its edits are based on. It is
+    /// never uploaded — `is_internal` sees to that — so it does not reach the
+    /// cloud or any other device.
+    pub const LINEAGE: &str = ".hydration-lineage";
+
     /// True for anything the framework wrote for its own purposes.
     ///
     /// Matched on the file name alone, so it holds at any depth — scratch names
     /// are created wherever a placeholder is, which is wherever the cloud says.
     pub fn is_internal(name: &str) -> bool {
-        name == MANIFEST || name == concat!(".hydration-manifest", ".tmp") || is_scratch(name)
+        name == MANIFEST
+            || name == concat!(".hydration-manifest", ".tmp")
+            || name == LINEAGE
+            || name == concat!(".hydration-lineage", ".tmp")
+            || is_scratch(name)
     }
 
     /// A half-finished placeholder rename: `.<base>.hydration-<seq>`.

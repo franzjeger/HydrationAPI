@@ -723,7 +723,12 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     return;
                 }
             };
-            let mut store = Store::new();
+            // Reads the lineage record, never writes it. This scan runs only when
+            // something is already due, which for a file saved atomically is a
+            // debounce after its extended attributes went away — far too late to
+            // learn anything from the file. What it needs is what the delta
+            // pass's scan wrote down while they were still there.
+            let mut store = Store::new().consulting();
             while !stop.load(Ordering::SeqCst) {
                 // Close the holes in the change channel by looking, rather than
                 // by trusting that nothing was missed.
@@ -855,7 +860,11 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // reach — safe, and pointless. `None` means "no mount right now",
             // which is the same state the thread starts in.
             let mut placer: Option<TmpfilePlacer> = None;
-            let mut store = Store::new();
+            // The maintaining side. `delta::apply` scans every round, which is
+            // the only regular walk this daemon does, and it happens while files
+            // still carry their own identity — so it is the one place that can
+            // write down what an atomic save is about to destroy.
+            let mut store = Store::new().remembering();
             let mut cursor = Cursor::default();
             // Set when a pass deliberately left something for a later one.
             //

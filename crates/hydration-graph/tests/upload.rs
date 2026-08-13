@@ -4044,3 +4044,140 @@ fn an_update_is_conditional_on_the_tag_recorded_on_the_file_with_no_help_from_th
         "an edit to a file the cloud already holds was not sent: {outcome:?}"
     );
 }
+
+/// The other half of what was measured on 2026-08-13, and the harder one.
+///
+/// Git writes its index by creating a lock file and renaming it into place.
+/// Most editors save the same way, and §5.4 is about exactly this shape. What
+/// survives the rename is a *different inode*, and extended attributes do not
+/// travel across one — so the file loses `user.hydration.id` and
+/// `user.hydration.etag` at the instant of the save.
+///
+/// Read from the file alone, it is then indistinguishable from a document the
+/// cloud has never heard of. The upload became a create, the service answered
+/// `409 nameAlreadyExists`, the failure was re-queued, and it repeated for as
+/// long as the daemon ran: six files, hours, edits that existed on one machine.
+///
+/// The lineage record is what bridges it. Nothing here calls `record_tag` and
+/// nothing re-attaches the attributes by hand — the scan wrote down what the
+/// file said while it still said it, and the save that destroyed the attributes
+/// did not destroy that.
+///
+/// Scripted `.with("if-match")` for the same reason as the test above: an
+/// unconditional write, or a create, finds no reply at all rather than failing
+/// an assertion about one.
+#[test]
+fn a_file_saved_atomically_is_still_an_update_of_the_object_it_came_from() {
+    use std::os::unix::fs::MetadataExt;
+
+    let rig = Rig::new("atomic_save_keeps_its_lineage");
+    let path = rig.file("Work/report.docx", b"the version that came down");
+    store::set_xattr(&path, xattr::ID, cloud(MINE, "01REPORT").as_bytes())
+        .expect("the cloud id the delta pass wrote");
+    store::set_xattr(&path, xattr::ETAG, b"ct:c:{G},1").expect("the tag it was placed at");
+
+    // The scan that runs before every upload batch, while the file still has
+    // something to say for itself.
+    let mut store = Store::new().remembering();
+    store
+        .scan(&rig.root)
+        .expect("the scan that records the lineage");
+
+    // The atomic save. A new inode, no extended attributes, renamed over the
+    // name the old one had — which is all git does, and all most editors do.
+    let tmp = rig.root.join("Work/.report.docx.swp");
+    std::fs::write(&tmp, b"the paragraph the user just wrote").expect("the temp file");
+    std::fs::rename(&tmp, &path).expect("the atomic save");
+    let md = std::fs::metadata(&path).expect("the saved file");
+    let file = FileId {
+        fsid: md.dev(),
+        ino: md.ino(),
+    };
+    {
+        // Asserted through the same call the daemon makes, on a store that
+        // remembers nothing: this is the file as it now is. Without it the test
+        // would pass on a filesystem where the attributes somehow survived, which
+        // is to say it would pass without testing anything.
+        let mut bare = Store::new();
+        bare.scan(&rig.root).expect("a scan with no memory");
+        assert!(
+            bare.lookup(&file).and_then(|e| e.cloud_id).is_none(),
+            "the fixture did not reproduce the failure: the save kept the file's \
+             identity, so nothing here needed recovering"
+        );
+    }
+    store.scan(&rig.root).expect("the scan after the save");
+
+    rig.script(
+        put(item_content(MINE, "01REPORT")).with("if-match"),
+        vec![ok(drive_item("01REPORT", "report.docx", 33, "c:{G},2"))],
+    );
+
+    let mut sink = rig.sink();
+    let outcome = run_upload(file, &mut store, &mut sink);
+
+    let call = only_call(&rig.journal);
+    assert_eq!(
+        call.path(),
+        item_content(MINE, "01REPORT"),
+        "the edit was sent as a create, which the service answers 409 \
+         nameAlreadyExists for as long as the daemon runs: {call:?}"
+    );
+    assert_eq!(
+        call.header("if-match"),
+        Some("c:{G},1"),
+        "the update carried no precondition, or not the version the file was \
+         placed at: {call:?}"
+    );
+    assert!(
+        matches!(outcome, RunOutcome::Sent { .. }),
+        "an edit saved the way every editor saves never left the machine: {outcome:?}"
+    );
+}
+
+/// And the record does not outlive the truth it was written from.
+///
+/// A path-keyed record is only safe while an object is at one path. If the cloud
+/// renames `01REPORT` away and something unrelated is created at the old name,
+/// a surviving record would send the new file's contents into the renamed
+/// object — past the `if-match`, which guards the version and not the identity.
+///
+/// `Lineage::absorb` evicts on the object rather than on the path, so the scan
+/// that finds `01REPORT` living somewhere else drops the stale claim in the same
+/// pass. This is the assertion that the eviction reaches all the way through
+/// `Store::lookup`.
+#[test]
+fn a_new_file_does_not_inherit_the_identity_of_an_object_renamed_away_from_its_path() {
+    use std::os::unix::fs::MetadataExt;
+
+    let rig = Rig::new("atomic_save_does_not_inherit");
+    let old = rig.file("Work/report.docx", b"the version that came down");
+    store::set_xattr(&old, xattr::ID, cloud(MINE, "01REPORT").as_bytes()).expect("id");
+    store::set_xattr(&old, xattr::ETAG, b"ct:c:{G},1").expect("tag");
+
+    let mut store = Store::new().remembering();
+    store
+        .scan(&rig.root)
+        .expect("the scan that records the lineage");
+
+    // The cloud renamed it; the delta pass renamed the file to match.
+    let moved = rig.root.join("Work/quarterly.docx");
+    std::fs::rename(&old, &moved).expect("the delta pass rename");
+    // And something entirely unrelated is created at the name it used to have.
+    std::fs::write(&old, b"a different document that happens to share a name").expect("new file");
+
+    let md = std::fs::metadata(&old).expect("the new file");
+    let file = FileId {
+        fsid: md.dev(),
+        ino: md.ino(),
+    };
+    store.scan(&rig.root).expect("the scan after the rename");
+
+    let entry = store.lookup(&file).expect("the new file is indexed");
+    assert_eq!(
+        entry.cloud_id, None,
+        "a new local file inherited the identity of an object that had been \
+         renamed away from its path; its contents would have been written into \
+         Work/quarterly.docx"
+    );
+}
