@@ -787,6 +787,107 @@ impl DriveItem {
     }
 }
 
+// The QuickXorHash lives here rather than beside the transport that verifies
+// downloads with it. It is an algorithm, not a socket, and the collision
+// reconciliation in `put_at_path` needs it in a build with no HTTP feature at
+// all — which is how it came to be referenced through a module that did not
+// exist there.
+/// Streaming implementation of Microsoft's published 160-bit QuickXorHash.
+/// The bytes are never buffered beyond the HTTP client's own read buffer.
+pub(crate) struct QuickXorWriter<W> {
+    inner: W,
+    digest: [u8; 20],
+    length: u64,
+}
+
+impl<W> QuickXorWriter<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self {
+            inner,
+            digest: [0; 20],
+            length: 0,
+        }
+    }
+
+    pub(crate) fn verify(mut self, expected: &str) -> io::Result<()> {
+        for (slot, byte) in self.digest[12..].iter_mut().zip(self.length.to_le_bytes()) {
+            *slot ^= byte;
+        }
+        if base64_20(&self.digest) == expected {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Graph content did not match its QuickXorHash",
+            ))
+        }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for QuickXorWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        for &byte in &buf[..written] {
+            let shift = (self.length % 160) as usize * 11 % 160;
+            let value = (byte as u16) << (shift % 8);
+            let cell = shift / 8;
+            self.digest[cell] ^= value as u8;
+            self.digest[(cell + 1) % 20] ^= (value >> 8) as u8;
+            self.length += 1;
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// QuickXorHash of a whole buffer, in the form Graph reports it.
+///
+/// Used to answer one question and only one: is the object already in the cloud
+/// at this name byte for byte the same document as the local file? A hash is
+/// exactly the right instrument for that and exactly the wrong one for a
+/// precondition, which is why `TagSource::QuickXor` is not used as an
+/// `if-match` and this is not used as a version.
+pub fn quickxor_of(bytes: &[u8]) -> String {
+    use std::io::Write as _;
+    let mut sink = std::io::sink();
+    let mut w = QuickXorWriter::new(&mut sink);
+    // Writing to a sink cannot fail, and a hash that silently gave up would
+    // answer "not the same" and turn a safe reconciliation into a conflict.
+    if w.write_all(bytes).is_err() {
+        return String::new();
+    }
+    for (slot, byte) in w.digest[12..].iter_mut().zip(w.length.to_le_bytes()) {
+        *slot ^= byte;
+    }
+    base64_20(&w.digest)
+}
+
+pub(crate) fn base64_20(bytes: &[u8; 20]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(28);
+    for chunk in bytes.chunks(3) {
+        let value = (chunk[0] as u32) << 16
+            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
+            | chunk.get(2).copied().unwrap_or(0) as u32;
+        out.push(ALPHABET[((value >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((value >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((value >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(value & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// The content version, from the source the caller pinned.
 ///
 /// Prefixed, and never silently substituted. A source that quietly falls back
@@ -2850,6 +2951,21 @@ const WRITE_SELECT: &[&str] = &[
     "parentReference",
 ];
 
+/// The metadata of whatever object currently holds a name.
+///
+/// Path-addressed on purpose, and it is the only read in this crate that is. It
+/// answers one question — what is already sitting at the name a create just
+/// collided with — and an id cannot ask it, because not knowing the id is the
+/// whole situation.
+fn path_metadata_url(drive: &DriveId, rel: &str) -> String {
+    format!(
+        "{}/root:/{}?$select={}",
+        drive_base(drive),
+        encode_path(rel),
+        WRITE_SELECT.join(",")
+    )
+}
+
 fn item_metadata_url(key: &ObjectKey) -> String {
     format!("{}?$select={}", item_url(key), WRITE_SELECT.join(","))
 }
@@ -3165,6 +3281,30 @@ fn service_refused(what: &str, status: u16, body: &[u8]) -> io::Error {
 /// refuses every update to an object that already exists, and the framework then
 /// keeps the file visibly unsent instead of overwriting a stranger's edit with
 /// it.
+/// What was about to be written, kept only long enough to compare it.
+struct Sent {
+    len: u64,
+    hash: String,
+}
+
+/// Whether a refused write was refused because the *name* is taken.
+///
+/// By the service's own error code, never by the status alone: 409 also carries
+/// quota and locking refusals, and treating those as a name collision would send
+/// this into a content comparison that answers a question nobody asked.
+fn collided_on_name(status: u16, body: &[u8]) -> bool {
+    status == 409
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string)
+            })
+            .is_some_and(|c| c == "nameAlreadyExists")
+}
+
 fn no_precondition() -> io::Error {
     refused(
         "this drive offers no value the service accepts as a precondition, so the \
@@ -3383,9 +3523,80 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
     }
 
     /// A whole file as one `PUT`, at a name the drive may or may not hold.
+    /// Whether the object already at `rel` is byte for byte what we just tried
+    /// to send.
+    ///
+    /// `Ok(Some(u))` means it is, and `u` names it — the caller adopts that
+    /// identity and no write is made. `Ok(None)` means it is a different
+    /// document. `Err` means the question could not be answered, which is a
+    /// third thing and must not be collapsed into the second: reporting "they
+    /// differ" for a request that failed would strand a file for a reason that
+    /// was never established.
+    ///
+    /// Size first, because it is free and settles almost every case. The hash is
+    /// what makes the answer a proof rather than a guess — two files of the same
+    /// length are routine, and a length check alone would adopt a stranger's
+    /// object whenever it happened to match, which is the exact failure the
+    /// collision branch exists to prevent.
+    fn reconcile_by_content(
+        &mut self,
+        drive: &DriveId,
+        rel: &str,
+        sent: &Sent,
+    ) -> io::Result<Option<Uploaded>> {
+        let reply = self.call(&Request::new(Method::Get, path_metadata_url(drive, rel)))?;
+        if !(200..300).contains(&reply.status) {
+            return Err(service_refused(
+                "the object already at this name could not be read",
+                reply.status,
+                &reply.body,
+            ));
+        }
+        let item: DriveItem = serde_json::from_slice(&reply.body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        let body = item.body();
+        // The name has to match exactly, and this is not pedantry.
+        //
+        // Graph resolves a path case-insensitively, so `report.txt` finds an
+        // object named `Report.txt` and answers `409 nameAlreadyExists` for a
+        // create at either. If the two happen to hold the same bytes — an
+        // ordinary thing for a copy — adopting on content alone would give two
+        // distinct local files one object id. Both would read Clean, and
+        // deleting either would remove the object the other depends on. The
+        // existing `two_local_names_differing_only_in_case_stay_two_objects`
+        // caught precisely that, which is what a suite is for.
+        let ours = rel.rsplit('/').next().unwrap_or(rel);
+        if item.name.as_deref() != Some(ours) {
+            return Ok(None);
+        }
+        // `as_u64` the same way the mapper does: the service sends this as a
+        // number or as a string depending on the endpoint, and a size that will
+        // not convert is a size we do not know.
+        if body.size.and_then(|v| v.as_u64()) != Some(sent.len) {
+            return Ok(None);
+        }
+        // A drive that reports no hash cannot prove anything, and an unproven
+        // adoption is the thing this must not do.
+        let Some(theirs) = body.hashes.and_then(|h| h.quick_xor_hash.as_deref()) else {
+            return Ok(None);
+        };
+        if theirs != sent.hash || sent.hash.is_empty() {
+            return Ok(None);
+        }
+        self.settle(drive, &reply.body).map(Some)
+    }
+
     fn put_at_path(&mut self, rel: &str, body: Vec<u8>) -> io::Result<Uploaded> {
         check_relative_name(rel)?;
         let drive = self.scope.drive().clone();
+        // Hashed before the body is handed to the request, which consumes it.
+        // Only paid for when the write collides — the hash is cheap next to the
+        // transfer that just happened, and it is the only thing that can tell a
+        // stranger's file from this one.
+        let sent = Sent {
+            len: body.len() as u64,
+            hash: quickxor_of(&body),
+        };
         let request = Request::new(
             Method::Put,
             // Never `replace`, and never `rename`. A create has never seen the
@@ -3406,6 +3617,36 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
             // then evict the local file, the next read fetches their document,
             // and when the user deletes their own file the framework calls
             // `remove` on the stranger's object.
+            //
+            // Every one of those consequences rests on the object being a
+            // *stranger's*. If the bytes already at that name are the bytes we
+            // were about to send, it is not a stranger's document — it is this
+            // one, and adopting its id is not a write at all. Evicting and
+            // refetching gives back the same content; removing it removes the
+            // object the file actually is.
+            //
+            // So the collision is reconciled when, and only when, the content
+            // can be proved identical. This is what strands a file whose
+            // extended attributes were destroyed by an atomic save before
+            // anything recorded them: it has no id, the create collides, and
+            // until now the answer was to fail forever. Measured on a live
+            // account on 2026-08-13 — five files, retried in a loop for hours,
+            // three of them git pack files whose names are content-addressed
+            // and which therefore could never have differed.
+            _ if collided_on_name(reply.status, &reply.body) => {
+                match self.reconcile_by_content(&drive, rel, &sent) {
+                    Ok(Some(u)) => Ok(u),
+                    Ok(None) => Err(refused(
+                        "a different file already exists in the cloud under this name, and                          this copy has no record of which version it was based on, so it                          cannot be sent without overwriting that one blind",
+                    )),
+                    // Could not find out. Not the same as "they differ", and it
+                    // must not be reported as though it were.
+                    Err(e) => Err(io::Error::other(format!(
+                        "a file already exists in the cloud under this name, and whether it \
+                         holds the same content could not be established: {e}"
+                    ))),
+                }
+            }
             _ => Err(service_refused(
                 "the create was refused",
                 reply.status,

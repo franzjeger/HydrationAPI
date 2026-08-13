@@ -151,87 +151,13 @@ impl Provider for GraphProvider {
         // 4 KiB read, and it is recorded here rather than left to be discovered.
         match content_tag.and_then(|tag| tag.strip_prefix("qx:")) {
             Some(expected) if span.is_whole(size) => {
-                let mut verified = QuickXorWriter::new(out);
+                let mut verified = crate::QuickXorWriter::new(out);
                 self.http.download_span(&key, span, size, &mut verified)?;
                 verified.verify(expected)
             }
             _ => self.http.download_span(&key, span, size, out),
         }
     }
-}
-
-/// Streaming implementation of Microsoft's published 160-bit QuickXorHash.
-/// The bytes are never buffered beyond the HTTP client's own read buffer.
-struct QuickXorWriter<W> {
-    inner: W,
-    digest: [u8; 20],
-    length: u64,
-}
-
-impl<W> QuickXorWriter<W> {
-    fn new(inner: W) -> Self {
-        Self {
-            inner,
-            digest: [0; 20],
-            length: 0,
-        }
-    }
-
-    fn verify(mut self, expected: &str) -> io::Result<()> {
-        for (slot, byte) in self.digest[12..].iter_mut().zip(self.length.to_le_bytes()) {
-            *slot ^= byte;
-        }
-        if base64_20(&self.digest) == expected {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Graph content did not match its QuickXorHash",
-            ))
-        }
-    }
-}
-
-impl<W: Write> Write for QuickXorWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(buf)?;
-        for &byte in &buf[..written] {
-            let shift = (self.length % 160) as usize * 11 % 160;
-            let value = (byte as u16) << (shift % 8);
-            let cell = shift / 8;
-            self.digest[cell] ^= value as u8;
-            self.digest[(cell + 1) % 20] ^= (value >> 8) as u8;
-            self.length += 1;
-        }
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-fn base64_20(bytes: &[u8; 20]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(28);
-    for chunk in bytes.chunks(3) {
-        let value = (chunk[0] as u32) << 16
-            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
-            | chunk.get(2).copied().unwrap_or(0) as u32;
-        out.push(ALPHABET[((value >> 18) & 63) as usize] as char);
-        out.push(ALPHABET[((value >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[((value >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(value & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 pub struct GraphAccess {
@@ -524,9 +450,9 @@ mod tests {
 
     fn quickxor(bytes: &[u8]) -> String {
         let mut out = Vec::new();
-        let mut writer = QuickXorWriter::new(&mut out);
+        let mut writer = crate::QuickXorWriter::new(&mut out);
         writer.write_all(bytes).unwrap();
-        let expected = base64_20(&{
+        let expected = crate::base64_20(&{
             let mut digest = writer.digest;
             for (slot, byte) in digest[12..].iter_mut().zip(writer.length.to_le_bytes()) {
                 *slot ^= byte;
@@ -553,14 +479,14 @@ mod tests {
         let bytes = (0_u8..=255).cycle().take(100_003).collect::<Vec<_>>();
         let expected = quickxor(&bytes);
         let mut out = Vec::new();
-        let mut writer = QuickXorWriter::new(&mut out);
+        let mut writer = crate::QuickXorWriter::new(&mut out);
         for chunk in bytes.chunks(7919) {
             writer.write_all(chunk).unwrap();
         }
         writer.verify(&expected).unwrap();
         assert_eq!(out, bytes);
 
-        let mut writer = QuickXorWriter::new(Vec::new());
+        let mut writer = crate::QuickXorWriter::new(Vec::new());
         writer.write_all(b"tampered").unwrap();
         let err = writer.verify("AAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

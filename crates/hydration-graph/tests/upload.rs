@@ -117,6 +117,11 @@ fn item_content(drive: &str, item: &str) -> String {
     format!("{BASE}/drives/{drive}/items/{item}/content")
 }
 
+/// Reading the metadata of whatever object holds a drive-root-relative path.
+fn path_meta(drive: &str, rel: &str) -> String {
+    format!("{BASE}/drives/{drive}/root:/{rel}")
+}
+
 /// `PUT`ting content at a drive-root-relative path. The create form.
 fn path_content(drive: &str, rel: &str) -> String {
     format!("{BASE}/drives/{drive}/root:/{rel}:/content")
@@ -142,6 +147,27 @@ fn upload_url(tag: &str) -> String {
 }
 
 // --- bodies ----------------------------------------------------------------
+
+/// A drive item that also carries the QuickXorHash Graph reports for content.
+///
+/// `drive_item` deliberately has none — most of this file is about tags and
+/// names, where a hash would be noise. The collision-reconciliation path is the
+/// one place the hash is the whole answer.
+fn hashed_item(id: &str, name: &str, body: &[u8], ctag: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "name": name,
+        "size": body.len(),
+        "cTag": ctag,
+        "eTag": ctag,
+        "file": {
+            "mimeType": "application/octet-stream",
+            "hashes": {"quickXorHash": hydration_graph::quickxor_of(body)},
+        },
+        "parentReference": {"driveId": MINE, "id": ROOT},
+    })
+    .to_string()
+}
 
 fn drive_item(id: &str, name: &str, size: u64, ctag: &str) -> String {
     serde_json::json!({
@@ -2884,16 +2910,23 @@ fn two_local_names_differing_only_in_case_stay_two_objects() {
 
     let second = sink.upload(&lower, None);
     assert!(second.is_err(), "the service will not hold both names");
-    let call = only_call(&rig.journal);
+
+    // Two calls now, not one: the collision is followed by a metadata read that
+    // asks whether the object already at this name is this same document. It is
+    // not — Graph resolved the path case-insensitively and answered with
+    // `Report.txt` — so nothing is adopted and nothing is written. The count was
+    // only ever a proxy for "no second write"; that is asserted directly here,
+    // across every call rather than the one.
+    let calls = rig.journal.calls();
     assert!(
-        call.url.contains("root:/report.txt:"),
-        "the name is sent as it is on disk, case preserved: {}",
-        call.url
+        calls.iter().any(|c| c.url.contains("root:/report.txt:")),
+        "the name is sent as it is on disk, case preserved: {calls:#?}"
     );
-    assert_ne!(
-        call.path(),
-        item_content(MINE, "01A"),
-        "the second file is not written over the first"
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.method == Method::Put && c.path() == item_content(MINE, "01A")),
+        "the second file was written over the first: {calls:#?}"
     );
 }
 
@@ -4179,5 +4212,161 @@ fn a_new_file_does_not_inherit_the_identity_of_an_object_renamed_away_from_its_p
         "a new local file inherited the identity of an object that had been \
          renamed away from its path; its contents would have been written into \
          Work/quarterly.docx"
+    );
+}
+
+/// The five that were stuck, and why they were.
+///
+/// A file whose extended attributes were destroyed by an atomic save before
+/// anything recorded them has no id, so its upload is a create, and the create
+/// collides with the object already at that name. Until now the answer was to
+/// fail, and to keep failing: measured on a live account on 2026-08-13, five
+/// files retried in a loop for hours, three of them git pack files whose names
+/// are content-addressed and which therefore could not possibly have differed
+/// from what was already there.
+///
+/// Stopping was right for the reason `put_at_path` gives — adopting a
+/// stranger's object id would let reclaim evict the local file, the next read
+/// fetch their document, and a local delete remove their object. Every one of
+/// those rests on it being a *stranger's*. When the bytes already at the name
+/// are the bytes being sent, it is this document, and taking its id is not a
+/// write at all.
+#[test]
+fn a_create_that_collides_with_its_own_content_adopts_it_instead_of_failing() {
+    let rig = Rig::new("collide_same_content");
+    let body = b"the pack file, which is named after its own contents";
+    let path = rig.file("Work/pack.pack", body);
+
+    rig.script(
+        put(path_content(MINE, "Work/pack.pack")),
+        vec![reply(409, graph_error("nameAlreadyExists"))],
+    );
+    rig.script(
+        get(path_meta(MINE, "Work/pack.pack")),
+        vec![ok(hashed_item("01PACK", "pack.pack", body, "c:{G},1"))],
+    );
+
+    let mut sink = rig.sink();
+    let out = sink.upload(&path, None).expect(
+        "a create that collided with a byte-identical object left the file stranded, which \
+         is the state five files were measured in",
+    );
+
+    assert_eq!(
+        out.cloud_id,
+        cloud(MINE, "01PACK"),
+        "the identity recovered is not the object that holds the bytes"
+    );
+    let calls = rig.journal.calls().len();
+    assert_eq!(
+        calls, 2,
+        "expected the create and one metadata read, got {calls} requests — anything more \
+         means a second write was attempted"
+    );
+}
+
+/// And when it is genuinely a different document, nothing is written.
+#[test]
+fn a_create_that_collides_with_different_content_is_still_refused() {
+    let rig = Rig::new("collide_other_content");
+    let path = rig.file("Work/notes.txt", b"what this machine has");
+
+    rig.script(
+        put(path_content(MINE, "Work/notes.txt")),
+        vec![reply(409, graph_error("nameAlreadyExists"))],
+    );
+    rig.script(
+        get(path_meta(MINE, "Work/notes.txt")),
+        vec![ok(hashed_item(
+            "01NOTES",
+            "notes.txt",
+            b"what somebody else has",
+            "c:{G},1",
+        ))],
+    );
+
+    let mut sink = rig.sink();
+    let err = sink
+        .upload(&path, None)
+        .expect_err("a stranger's document was overwritten, or its id adopted");
+    let said = err.to_string();
+    assert!(
+        said.contains("overwriting that one blind"),
+        "the refusal did not say why it refused: {said}"
+    );
+}
+
+/// A 409 that is not about the name is not sent looking for content.
+///
+/// Graph answers 409 for quota and for locking too. Treating those as a name
+/// collision would spend a metadata read answering a question nobody asked, and
+/// would report the wrong reason for the failure.
+#[test]
+fn a_collision_on_something_other_than_the_name_is_not_reconciled() {
+    let rig = Rig::new("collide_not_name");
+    let path = rig.file("Work/notes.txt", b"x");
+    rig.script(
+        put(path_content(MINE, "Work/notes.txt")),
+        vec![reply(409, graph_error("quotaLimitReached"))],
+    );
+
+    let mut sink = rig.sink();
+    let err = sink
+        .upload(&path, None)
+        .expect_err("a quota refusal was accepted");
+    assert!(
+        err.to_string().contains("quotaLimitReached"),
+        "the quota refusal was reported as something else: {err}"
+    );
+    assert_eq!(
+        rig.journal.calls().len(),
+        1,
+        "a quota refusal sent the sink looking for content that was never in question"
+    );
+}
+
+/// The hazard the content check opens, and the name check closes.
+///
+/// Graph resolves a path case-insensitively, so a create at `report.txt` collides
+/// with an object named `Report.txt`. If the two hold the same bytes — an
+/// ordinary thing for a copy — then reconciling on content *alone* would give
+/// two distinct local files one object id. Both would read Clean, and deleting
+/// either would remove the object the other depends on.
+///
+/// `two_local_names_differing_only_in_case_stay_two_objects` caught this when the
+/// content check was first written, with contents that differed. This is the same
+/// trap with contents that do not, which is the version the size-and-hash test
+/// cannot see.
+#[test]
+fn a_name_that_matches_only_by_case_is_not_the_same_object_however_alike() {
+    let rig = Rig::new("case_collision_same_bytes");
+    let body = b"byte for byte the same";
+    let lower = rig.file("report.txt", body);
+
+    rig.script(
+        put(path_content(MINE, "report.txt")),
+        vec![reply(409, graph_error("nameAlreadyExists"))],
+    );
+    // What Graph answers for `root:/report.txt` on a drive holding `Report.txt`:
+    // the other object, with the other name, and identical content.
+    rig.script(
+        get(path_meta(MINE, "report.txt")),
+        vec![ok(hashed_item("01UPPER", "Report.txt", body, "c:{G},1"))],
+    );
+
+    let mut sink = rig.sink();
+    let out = sink.upload(&lower, None);
+
+    assert!(
+        out.is_err(),
+        "a file adopted the id of an object with a different name because their \
+         contents happened to match; deleting either would now remove the other"
+    );
+    let calls = rig.journal.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.method == Method::Put && c.path() == item_content(MINE, "01UPPER")),
+        "the other object was written over: {calls:#?}"
     );
 }
