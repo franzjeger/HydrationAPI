@@ -34,6 +34,15 @@
 /// everything else.
 pub mod auth;
 
+/// The loopback listener for `auth`'s browser (PKCE) sign-in.
+///
+/// Feature-free on purpose: `http` exists to keep the TLS stack optional, and
+/// this module has no TLS to keep optional — its one socket *listens*, on
+/// `127.0.0.1`, for the browser's redirect. It opens no outbound connection;
+/// the note on `http` about being the only code that opens a socket means
+/// outbound ones, and still holds.
+pub mod browser;
+
 #[cfg(feature = "http")]
 mod access;
 #[cfg(feature = "http")]

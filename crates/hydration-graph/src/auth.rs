@@ -417,6 +417,13 @@ impl AuthConfig {
         )
     }
 
+    pub fn authorize_url_base(&self) -> String {
+        format!(
+            "https://{}/{}/oauth2/v2.0/authorize",
+            self.authority_host, self.tenant
+        )
+    }
+
     fn scope_param(&self) -> String {
         self.scopes.join(" ")
     }
@@ -440,6 +447,26 @@ impl AuthConfig {
                 ("client_id", &self.client_id),
                 ("grant_type", DEVICE_CODE_GRANT),
                 ("device_code", device_code.expose()),
+            ]),
+        }
+    }
+
+    fn auth_code_request(
+        &self,
+        code: &Secret,
+        redirect_uri: &str,
+        verifier: &Secret,
+    ) -> TokenRequest {
+        TokenRequest {
+            grant: Grant::AuthCode,
+            url: self.token_url(),
+            body: form(&[
+                ("client_id", &self.client_id),
+                ("grant_type", "authorization_code"),
+                ("code", code.expose()),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", verifier.expose()),
+                ("scope", &self.scope_param()),
             ]),
         }
     }
@@ -546,6 +573,8 @@ pub enum Grant {
     DeviceCode,
     /// Poll for the token that device code will eventually yield.
     DeviceToken,
+    /// Redeem an authorization code from the browser (PKCE) flow.
+    AuthCode,
     /// Spend the refresh token.
     Refresh,
 }
@@ -956,6 +985,132 @@ fn read_device_code(reply: &TokenReply, now: Duration) -> Result<DeviceCode, Aut
         interval,
         expires_at: now.saturating_add(expires_in.min(MAX_TOKEN_LIFETIME)),
     })
+}
+
+// ---------------------------------------------------------------------------
+// The browser (authorization code + PKCE) flow
+//
+// The second way in, added under docs/PKCE-ENROLLMENT-REVIEW.md in the
+// OneDriveHydration repository (accepted 2026-08-13) and *beside* device code,
+// not replacing it: device code is the only flow a headless machine has, and
+// a tenant blocking it — which is what made this flow necessary — is the
+// tenant's choice, not a property of the flow. Adapted from the working
+// reference client, OneDriveForLinux `crates/graph-client/src/pkce.rs`
+// (MIT OR Apache-2.0, same as this crate), rewritten against this module's
+// types so the verifier lives in a [`Secret`] and the redeeming request can
+// only be built by [`AuthConfig`].
+// ---------------------------------------------------------------------------
+
+/// base64url without padding, as RFC 7636 requires for both PKCE halves.
+///
+/// Hand-written rather than a dependency: the alphabet is 64 constants and the
+/// loop is nine lines, and it is pinned below to RFC 7636 Appendix B's own
+/// vector, which exercises every step of it.
+fn b64url(raw: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(raw.len().div_ceil(3) * 4);
+    for chunk in raw.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for i in 0..=chunk.len() {
+            out.push(ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char);
+        }
+    }
+    out
+}
+
+/// base64url(sha256(verifier)) — the S256 challenge of RFC 7636 §4.2.
+fn code_challenge(verifier: &Secret) -> String {
+    use sha2::{Digest, Sha256};
+    b64url(&Sha256::digest(verifier.expose().as_bytes()))
+}
+
+/// 32 bytes of kernel entropy, base64url — the PKCE verifier and the `state`
+/// parameter are both this.
+///
+/// `/dev/urandom` directly, not a randomness dependency: this crate is part of
+/// a Linux-only framework (the privileged half is fanotify), the kernel CSPRNG
+/// is exactly the right source for a one-shot credential-flow nonce, and the
+/// failure mode — no readable `/dev/urandom` — is a broken system this flow
+/// could not survive anyway. The error is surfaced, never papered over with a
+/// weaker source.
+fn random_token() -> io::Result<String> {
+    use io::Read;
+    let mut raw = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
+    Ok(b64url(&raw))
+}
+
+/// One prepared browser sign-in: what the user's browser must be sent, and
+/// what redeeming the code it produces will need.
+///
+/// The verifier never leaves this struct except inside the token request that
+/// `AuthConfig`'s private `auth_code_request` builds — named in prose rather
+/// than linked, because a doc link to a private item fails `cargo doc
+/// -D warnings` — it is a [`Secret`], so it cannot be printed, and there is
+/// no accessor for it. The `state` is *not* secret
+/// (it rides in the authorize URL), and the caller needs it to check the
+/// redirect before spending the code, so it is readable.
+#[derive(Debug)]
+pub struct BrowserCode {
+    verifier: Secret,
+    state: String,
+    redirect_uri: String,
+    authorize_url: String,
+}
+
+impl BrowserCode {
+    /// Open this in the user's browser, or print it for the user to open.
+    ///
+    /// It carries `client_id`, `scope`, `state` and the S256 challenge — the
+    /// *public* half of PKCE. None of these is a credential: a browser history
+    /// or a `/proc/<pid>/cmdline` that captures this URL captures nothing an
+    /// attacker can redeem.
+    pub fn authorize_url(&self) -> &str {
+        &self.authorize_url
+    }
+
+    /// Compare against the `state` the redirect carries, **before** reading
+    /// its `code`. A mismatch means the response does not belong to this
+    /// request (RFC 6749 §10.12), and the code in it must not be spent.
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+
+    /// The exact `redirect_uri` the authorize URL was built with. The token
+    /// request repeats it, and the two must match byte for byte.
+    pub fn redirect_uri(&self) -> &str {
+        &self.redirect_uri
+    }
+}
+
+/// The loopback rule, enforced at the moment the flow is built.
+///
+/// `http://127.0.0.1:{port}` — the literal address, never the name
+/// `localhost`. Measured (see the review, §1a): `getaddrinfo("localhost")`
+/// answers `::1` first on real machines, `[::1]:P` is independently bindable
+/// while `127.0.0.1:P` is held, and `[::1]` cannot even be registered as a
+/// redirect URI — so advertising the name points the browser at an address a
+/// local squatter can own. The literal resolves nothing and has no IPv6 twin
+/// to race. Microsoft's loopback rules ignore the port when matching, which
+/// is what makes an ephemeral port here legal against one registered
+/// path-less `http://127.0.0.1`.
+fn check_loopback_redirect(uri: &str) -> Result<(), AuthError> {
+    let Some(port) = uri.strip_prefix("http://127.0.0.1:") else {
+        return Err(AuthError::BadConfig(
+            "the redirect_uri must be http://127.0.0.1:{port}, literally",
+        ));
+    };
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(AuthError::BadConfig(
+            "the redirect_uri must end in a bare port number",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1423,6 +1578,85 @@ impl<T: TokenTransport, C: Clock, S: CredentialStore> TokenCache<T, C, S> {
         Err(AuthError::PollLimit {
             attempts: MAX_POLL_ATTEMPTS,
         })
+    }
+
+    /// Prepare a browser (authorization code + PKCE) sign-in.
+    ///
+    /// No request is made — this builds the authorize URL for the caller to
+    /// open in the user's browser and the secrets that redeeming the result
+    /// will need. The caller owns the loopback listener and the browser
+    /// launch; both are session concerns a shared cache has no business in
+    /// (see [`crate::browser`] for the listener). When the redirect arrives,
+    /// check its `state` against [`BrowserCode::state`] and hand the code to
+    /// [`TokenCache::complete_browser_code`].
+    ///
+    /// `redirect_uri` must be literal-loopback — `http://127.0.0.1:{port}` —
+    /// and anything else is refused here, before a URL exists to open. See
+    /// `check_loopback_redirect` for why the name `localhost` is the one bug
+    /// this signature exists to make unwritable.
+    ///
+    /// `prompt=select_account` is always sent: without it a live SSO session
+    /// silently enrolls whichever account the browser already holds, which is
+    /// exactly the mistake worth making impossible when a test account and a
+    /// production account both exist.
+    pub fn begin_browser_code(&self, redirect_uri: &str) -> Result<BrowserCode, AuthError> {
+        check_loopback_redirect(redirect_uri)?;
+        let verifier =
+            Secret::new(random_token().map_err(|e| AuthError::Transport { kind: e.kind() })?);
+        let state = random_token().map_err(|e| AuthError::Transport { kind: e.kind() })?;
+        let authorize_url = format!(
+            "{}?{}",
+            self.config.authorize_url_base(),
+            form(&[
+                ("client_id", &self.config.client_id),
+                ("response_type", "code"),
+                ("redirect_uri", redirect_uri),
+                ("response_mode", "query"),
+                ("scope", &self.config.scope_param()),
+                ("state", &state),
+                ("code_challenge", &code_challenge(&verifier)),
+                ("code_challenge_method", "S256"),
+                ("prompt", "select_account"),
+            ]),
+        );
+        Ok(BrowserCode {
+            verifier,
+            state,
+            redirect_uri: redirect_uri.to_string(),
+            authorize_url,
+        })
+    }
+
+    /// Redeem the authorization code the browser flow produced, and install
+    /// the result exactly as a completed device code flow would.
+    ///
+    /// Straight into this shared cache and out through its
+    /// [`CredentialStore`] — never through a file. The plaintext-on-disk
+    /// moment the external enrollment script had was a property of being
+    /// external, not of PKCE, and building the flow here is what removes it
+    /// (the review's single biggest conclusion).
+    ///
+    /// The caller must have validated the redirect's `state` against
+    /// [`BrowserCode::state`] before extracting the code — [`crate::browser`]'s
+    /// listener refuses to yield a code from a mismatched redirect, so a
+    /// caller using it cannot get this wrong.
+    ///
+    /// A completed browser sign-in is the cure for a rejected credential, so
+    /// like the device code path it also lifts the death sentence.
+    pub fn complete_browser_code(&self, flow: &BrowserCode, code: &str) -> Result<(), AuthError> {
+        let request =
+            self.config
+                .auth_code_request(&Secret::new(code), &flow.redirect_uri, &flow.verifier);
+        let reply = self.post(&request)?;
+        let tokens = read_token_reply(&reply)?;
+        let mut state = self.state();
+        let (_, rotated) = install(&mut state, tokens, self.clock.now());
+        state.clear_failures();
+        if rotated {
+            self.persist(&mut state);
+        }
+        self.publish(&state);
+        Ok(())
     }
 
     // --- observability -----------------------------------------------------
@@ -2948,6 +3182,186 @@ mod tests {
     }
 
     // =======================================================================
+    // The browser (PKCE) flow
+    // =======================================================================
+
+    /// RFC 7636 Appendix B's own vector, exercising every step of the
+    /// challenge: the base64url alphabet, the padding strip, and SHA-256
+    /// itself. A wrong challenge is not an error anyone sees here — it is an
+    /// `invalid_grant` at redemption, on a real tenant, after a real sign-in.
+    #[test]
+    fn the_s256_challenge_matches_rfc_7636s_own_vector() {
+        assert_eq!(
+            code_challenge(&Secret::new("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    /// The loopback rule, enforced before a URL exists to open. `localhost`
+    /// is the one bug the review measured in the prior-art script — the name
+    /// resolves to `::1` first, where a local squatter can listen — and this
+    /// is where writing it becomes impossible rather than merely wrong.
+    #[test]
+    fn a_browser_flow_refuses_any_redirect_that_is_not_literal_loopback() {
+        let rig = Rig::new(vec![]);
+        let cache = rig.cache();
+        for wrong in [
+            "http://localhost:8080",
+            "https://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "http://127.0.0.1.evil.example:8080",
+            "http://127.0.0.1:8080/path",
+            "http://127.0.0.1:",
+            "http://127.0.0.1",
+        ] {
+            assert!(
+                matches!(
+                    cache.begin_browser_code(wrong),
+                    Err(AuthError::BadConfig(_))
+                ),
+                "{wrong} was accepted as a redirect_uri"
+            );
+        }
+        cache
+            .begin_browser_code("http://127.0.0.1:49152")
+            .expect("the literal-loopback shape is the accepted one");
+    }
+
+    /// The authorize URL carries the public half and only the public half:
+    /// the challenge, never the verifier. And two flows never share material —
+    /// a reused `state` makes one flow's redirect satisfy another's check,
+    /// and a reused verifier is a replayable secret.
+    #[test]
+    fn the_authorize_url_carries_the_challenge_and_two_flows_share_nothing() {
+        let rig = Rig::new(vec![]);
+        let cache = rig.cache();
+        let one = cache.begin_browser_code("http://127.0.0.1:41234").unwrap();
+        let two = cache.begin_browser_code("http://127.0.0.1:41234").unwrap();
+
+        let url = one.authorize_url();
+        assert!(url.starts_with("https://login.microsoftonline.com/common/oauth2/v2.0/authorize?"));
+        for expected in [
+            "response_type=code",
+            "code_challenge_method=S256",
+            "prompt=select_account",
+            &format!("state={}", one.state()),
+        ] {
+            assert!(url.contains(expected), "{expected} missing from {url}");
+        }
+        assert!(
+            !url.contains("code_verifier"),
+            "the verifier is the secret half and never rides in a URL: {url}"
+        );
+        assert_ne!(one.state(), two.state());
+        let challenge = |u: &str| {
+            u.split("code_challenge=")
+                .nth(1)
+                .and_then(|s| s.split('&').next())
+                .map(str::to_owned)
+        };
+        assert_ne!(
+            challenge(one.authorize_url()),
+            challenge(two.authorize_url()),
+            "two flows minted the same verifier"
+        );
+    }
+
+    /// Redeeming the code installs into this cache and persists through its
+    /// store, exactly as a completed device code flow does — never through a
+    /// file. The review's single biggest conclusion was that the plaintext
+    /// hand-off only existed because enrollment was an external process, and
+    /// this is the test that the in-product flow has no such moment.
+    #[test]
+    fn completing_a_browser_code_installs_and_persists_like_device_code() {
+        let rig = Rig::new(vec![ok_tokens("ACCESS-B", "REFRESH-B", 3600)]);
+        let cache = rig.cache();
+        let flow = cache.begin_browser_code("http://127.0.0.1:41234").unwrap();
+
+        cache
+            .complete_browser_code(&flow, "AUTH-CODE-FROM-REDIRECT")
+            .expect("redeem the code");
+
+        let bodies = bodies_of(&rig.script, Grant::AuthCode);
+        assert_eq!(bodies.len(), 1);
+        for expected in [
+            "grant_type=authorization_code",
+            "code=AUTH-CODE-FROM-REDIRECT",
+            "redirect_uri=http%3A%2F%2F127.0.0.1%3A41234",
+            "code_verifier=",
+        ] {
+            assert!(
+                bodies[0].contains(expected),
+                "{expected} missing from the body"
+            );
+        }
+        assert_eq!(rig.store.saved(), vec!["REFRESH-B"]);
+        assert!(cache.is_signed_in());
+        assert_eq!(
+            cache
+                .token()
+                .expect("installed, not re-fetched")
+                .header_value(),
+            "Bearer ACCESS-B"
+        );
+        assert_eq!(
+            rig.journal.posts(),
+            1,
+            "the access token came with the redemption; asking again is a \
+             second request the reply already answered"
+        );
+    }
+
+    /// A completed browser sign-in lifts the death sentence, exactly as a
+    /// completed device code flow does. It is the same cure — different
+    /// bytes — and a browser flow that left the `rejected` flag standing
+    /// would sign the user in to a cache that still refuses to use it.
+    #[test]
+    fn a_completed_browser_sign_in_lifts_a_rejected_credentials_sentence() {
+        let rig = Rig::new(vec![
+            oauth("invalid_grant"),
+            oauth("invalid_grant"),
+            oauth("invalid_grant"),
+            ok_tokens("ACCESS-B", "REFRESH-B", 3600),
+        ]);
+        let cache = rig.signed_in("REFRESH-DEAD");
+        for _ in 0..MAX_REJECTIONS {
+            assert_eq!(cache.token(), Err(AuthError::InvalidGrant));
+            rig.clock.advance(MAX_REFRESH_BACKOFF);
+        }
+        assert!(!cache.is_signed_in());
+
+        let flow = cache.begin_browser_code("http://127.0.0.1:41234").unwrap();
+        cache
+            .complete_browser_code(&flow, "AUTH-CODE")
+            .expect("redeem the code");
+
+        assert!(cache.is_signed_in(), "the fresh sign-in is a new chance");
+        assert_eq!(
+            cache
+                .token()
+                .expect("the new credential works")
+                .header_value(),
+            "Bearer ACCESS-B"
+        );
+    }
+
+    /// The failure the service reports at redemption is the failure the
+    /// caller sees, and nothing was installed or persisted on the way.
+    #[test]
+    fn a_refused_redemption_installs_nothing() {
+        let rig = Rig::new(vec![oauth("invalid_grant")]);
+        let cache = rig.cache();
+        let flow = cache.begin_browser_code("http://127.0.0.1:41234").unwrap();
+
+        assert_eq!(
+            cache.complete_browser_code(&flow, "SPENT-OR-FORGED-CODE"),
+            Err(AuthError::InvalidGrant)
+        );
+        assert!(!cache.is_signed_in());
+        assert_eq!(rig.store.saved(), Vec::<String>::new());
+    }
+
+    // =======================================================================
     // Nothing leaks
     // =======================================================================
 
@@ -3008,6 +3422,18 @@ mod tests {
         // And the redaction is a placeholder rather than an empty string, so a
         // reader can tell "not printed" from "not present".
         assert!(format!("{secret:?}").contains("redacted"));
+
+        // The browser flow's verifier is random, so its absence cannot be
+        // asserted by value; what can be is that the one secret field renders
+        // as the placeholder, and that nothing longer than the public parts
+        // appears. The challenge in the URL is public by design.
+        let flow = cache
+            .begin_browser_code("http://127.0.0.1:41234")
+            .expect("browser flow");
+        assert!(
+            format!("{flow:?}").contains("redacted"),
+            "the verifier field is not redacted: {flow:?}"
+        );
     }
 
     /// A transport that puts its request body into its error message — a debug
