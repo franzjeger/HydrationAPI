@@ -81,13 +81,39 @@ pub struct Uploaded {
     pub etag: Option<String>,
 }
 
+/// What the framework already knows about the object a local file came from.
+///
+/// Two facts, and a conditional write needs both: the id says *which* object,
+/// the tag says *which version of it this edit is based on*. Passing only the
+/// id — which is all this interface used to carry — left the provider with no
+/// precondition to offer, so every update to an object that already existed was
+/// refused rather than written blind. Measured on a live account: the tag was on
+/// the file the whole time, in `user.hydration.etag`, read by `Store::lookup`
+/// and then dropped at this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Known<'a> {
+    pub cloud_id: &'a str,
+    /// The tag recorded for the version this edit is based on.
+    ///
+    /// `None` is a real state, not a gap: a file whose lineage was lost with an
+    /// atomic save has no record of what it was based on, and a provider whose
+    /// tags are not preconditions has nothing to offer either. What to do about
+    /// it belongs to the provider, which is the half that knows what its service
+    /// accepts.
+    pub tag: Option<&'a str>,
+}
+
 /// Uploading and deleting, the half only the client knows how to do.
 pub trait Sink: Send {
-    /// Send this file's current content. `existing` is the cloud ID if the
-    /// object is already known, so the client can make the write conditional.
+    /// Send this file's current content. `existing` is what the framework knows
+    /// about the object already, so the client can make the write conditional.
     ///
     /// Takes a path resolved *now*, not a name captured when the job was queued.
-    fn upload(&mut self, path: &std::path::Path, existing: Option<&str>) -> io::Result<Uploaded>;
+    fn upload(
+        &mut self,
+        path: &std::path::Path,
+        existing: Option<Known<'_>>,
+    ) -> io::Result<Uploaded>;
     fn remove(&mut self, cloud_id: &str) -> io::Result<()>;
 }
 
@@ -255,12 +281,23 @@ pub fn run_upload<S: Sink>(file: FileId, store: &mut Store, sink: &mut S) -> Out
         };
         let path: PathBuf = entry.path.clone();
         let existing = entry.cloud_id.clone();
+        // Read from the file, not from anything this process happens to
+        // remember. A provider's own memory of a tag only covers objects its
+        // delta rounds have mentioned, and delta reports *changes* — so an
+        // object that has not moved in the cloud since the daemon started is
+        // never in it, and every update to a long-settled file was refused for
+        // want of a precondition that was on disk the whole time.
+        let based_on = entry.etag.clone();
 
         // Observed before the sink reads a byte, so the stamp written on success
         // can never describe content newer than what was sent.
         let sent_state = std::fs::metadata(&path).ok();
 
-        let uploaded = match sink.upload(&path, existing.as_deref()) {
+        let known = existing.as_deref().map(|cloud_id| Known {
+            cloud_id,
+            tag: based_on.as_deref(),
+        });
+        let uploaded = match sink.upload(&path, known) {
             Ok(u) => u,
             Err(e) => return Outcome::Failed(e.to_string()),
         };
@@ -391,7 +428,11 @@ pub fn run_upload<S: Sink>(file: FileId, store: &mut Store, sink: &mut S) -> Out
 pub struct ProviderSink<P>(pub P);
 
 impl<P: Provider + Sink> Sink for ProviderSink<P> {
-    fn upload(&mut self, path: &std::path::Path, existing: Option<&str>) -> io::Result<Uploaded> {
+    fn upload(
+        &mut self,
+        path: &std::path::Path,
+        existing: Option<Known<'_>>,
+    ) -> io::Result<Uploaded> {
         self.0.upload(path, existing)
     }
     fn remove(&mut self, cloud_id: &str) -> io::Result<()> {

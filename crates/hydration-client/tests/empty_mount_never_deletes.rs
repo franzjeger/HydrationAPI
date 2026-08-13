@@ -20,7 +20,7 @@
 use hydration_client::delta::{apply, Change};
 use hydration_client::place::TmpfilePlacer;
 use hydration_client::store::Store;
-use hydration_client::upload::{run_upload, Outcome, Sink, Uploaded};
+use hydration_client::upload::{run_upload, Known, Outcome, Sink, Uploaded};
 use hydration_protocol::FileId;
 use std::collections::HashSet;
 use std::io;
@@ -55,7 +55,7 @@ struct RecordingSink {
 }
 
 impl Sink for RecordingSink {
-    fn upload(&mut self, path: &Path, _existing: Option<&str>) -> io::Result<Uploaded> {
+    fn upload(&mut self, path: &Path, _existing: Option<Known<'_>>) -> io::Result<Uploaded> {
         self.uploaded.push(path.to_path_buf());
         if let Some(victim) = self.delete_on_upload.take() {
             std::fs::remove_file(&victim)?;

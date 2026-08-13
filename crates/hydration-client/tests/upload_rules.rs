@@ -6,7 +6,7 @@
 //! time is that reproducing them by sleeping does not work.
 
 use hydration_client::store::{self, Store};
-use hydration_client::upload::{run_upload, Outcome, Queue, Sink, TestClock, Uploaded};
+use hydration_client::upload::{run_upload, Known, Outcome, Queue, Sink, TestClock, Uploaded};
 use hydration_protocol::FileId;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -48,7 +48,7 @@ impl Recorder {
 }
 
 impl Sink for Recorder {
-    fn upload(&mut self, path: &Path, _existing: Option<&str>) -> io::Result<Uploaded> {
+    fn upload(&mut self, path: &Path, _existing: Option<Known<'_>>) -> io::Result<Uploaded> {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         self.ops.lock().unwrap().push(format!("PUT {name}"));
         // The upload is in flight from here until it returns.
@@ -352,7 +352,7 @@ fn an_edit_during_the_upload_is_not_recorded_as_sent() {
     /// an impatient user amounts to.
     struct EditsMidFlight;
     impl Sink for EditsMidFlight {
-        fn upload(&mut self, path: &Path, _existing: Option<&str>) -> io::Result<Uploaded> {
+        fn upload(&mut self, path: &Path, _existing: Option<Known<'_>>) -> io::Result<Uploaded> {
             let sent = std::fs::read(path)?;
             // The user saves again before the transfer finishes.
             std::fs::write(path, b"a much later version written during the upload")?;

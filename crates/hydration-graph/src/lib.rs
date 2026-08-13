@@ -3724,7 +3724,11 @@ enum Transferred {
 }
 
 impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K> {
-    fn upload(&mut self, path: &std::path::Path, existing: Option<&str>) -> io::Result<Uploaded> {
+    fn upload(
+        &mut self,
+        path: &std::path::Path,
+        existing: Option<hydration_client::upload::Known<'_>>,
+    ) -> io::Result<Uploaded> {
         // §5.5 states the absence rule about the moment an upload *finishes*.
         // The moment it starts is the same fact: `run_upload` folds `ENOENT`
         // into `None` and calls this anyway, so the path is routinely one that
@@ -3761,7 +3765,8 @@ impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K
 
         let target = match existing {
             None => None,
-            Some(cloud_id) => {
+            Some(known) => {
+                let cloud_id = known.cloud_id;
                 let Some(key) = key_of_cloud_id(cloud_id) else {
                     // A junk id is a damaged record of *which* object this file
                     // is. Creating a second one instead would put the same
@@ -3773,6 +3778,33 @@ impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K
                          no object this write could be addressed at",
                     ));
                 };
+                // Seed this process's memory from the framework's durable
+                // record, so a conditional write has something to be conditional
+                // on.
+                //
+                // Without this, `known` is populated by `record_tag` — and
+                // `record_tag` was called from forty-three tests and from
+                // nothing else in either repository. On a live account the map
+                // was therefore always empty, `precondition` always answered
+                // `None`, and every update to an object that already existed was
+                // refused for want of a precondition. Measured 2026-08-13: six
+                // files sat unsent for hours, retried in a loop, while the tag
+                // each one was based on lay in its own `user.hydration.etag`.
+                //
+                // `or_insert`, never overwrite: what this process learned from a
+                // completed round is at least as fresh as what is on the file,
+                // and the tag an update may carry is the one it is *based on* —
+                // taking the newer of the two is how a precondition stops being
+                // able to fail.
+                //
+                // A stale tag is the safe direction to be wrong in. It fails the
+                // `if-match` and the edit stays queued and visible, which is the
+                // outcome this whole path exists to choose over a blind write.
+                if let Some(tag) = known.tag {
+                    self.known
+                        .entry(cloud_id.to_string())
+                        .or_insert_with(|| tag.to_string());
+                }
                 Some((key, cloud_id.to_string()))
             }
         };

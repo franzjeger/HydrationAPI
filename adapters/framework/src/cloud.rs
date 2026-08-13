@@ -146,7 +146,16 @@ impl Provider for Cloud {
 }
 
 impl Sink for Cloud {
-    fn upload(&mut self, path: &std::path::Path, existing: Option<&str>) -> io::Result<Uploaded> {
+    fn upload(
+        &mut self,
+        path: &std::path::Path,
+        existing: Option<hydration_client::upload::Known<'_>>,
+    ) -> io::Result<Uploaded> {
+        // The conformance cloud has one writer and no versions, so the tag it is
+        // offered decides nothing here. It is still part of what a provider is
+        // handed, and a suite that dropped it silently would let a provider that
+        // never makes a write conditional pass unremarked.
+        let existing = existing.map(|k| k.cloud_id);
         // The name is read here, at send time — never captured when the job was
         // queued. That is rule 2, and this is the line where an atomic save
         // either works or does not.

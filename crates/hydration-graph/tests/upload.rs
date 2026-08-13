@@ -54,7 +54,7 @@ use std::time::Duration;
 use hydration_client::delta::Change;
 use hydration_client::namespace::Namespace;
 use hydration_client::store::{self, Store};
-use hydration_client::upload::{run_upload, Outcome as RunOutcome, Sink, Uploaded};
+use hydration_client::upload::{run_upload, Known, Outcome as RunOutcome, Sink, Uploaded};
 use hydration_graph::{
     DeltaPage, DriveId, DriveScope, GraphSink, ItemId, Method, ObjectKey, Reply, Request, Round,
     Sleeper, TagSource, Transport, UploadPolicy, FRAGMENT_QUANTUM, MAX_FRAGMENT_BYTES,
@@ -80,6 +80,20 @@ fn drive_id(s: &str) -> DriveId {
 
 fn item_id(s: &str) -> ItemId {
     ItemId::parse(s).unwrap_or_else(|e| panic!("fixture item id {s:?} must parse: {e:?}"))
+}
+
+/// The framework's `Known`, carrying an id and no tag.
+///
+/// No tag on purpose: these tests seed the sink's own memory with `record_tag`,
+/// so they go on measuring the provider's recollection of a completed round.
+/// The path where the *framework* supplies the tag — the one that had never run
+/// outside a test — is covered separately, by the test that calls no
+/// `record_tag` at all.
+fn at(id: &str) -> Option<Known<'_>> {
+    Some(Known {
+        cloud_id: id,
+        tag: None,
+    })
 }
 
 /// The expected `cloud_id`, built the only way the crate permits one to be
@@ -814,7 +828,7 @@ fn an_update_writes_to_the_item_id_never_to_the_path() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     let call = only_call(&rig.journal);
     assert_eq!(
@@ -876,7 +890,7 @@ fn an_update_creates_an_item_addressed_session_never_a_path_addressed_one() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     let sessions: Vec<Rec> = rig
         .journal
@@ -921,7 +935,7 @@ fn content_replacement_never_deletes_first() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     assert!(
         rig.journal.deletes().is_empty(),
@@ -951,7 +965,7 @@ fn a_failed_write_never_deletes_the_destination() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     assert!(out.is_err(), "a 500 is a failure, not a success");
     assert!(
@@ -1167,7 +1181,7 @@ fn a_412_is_terminal_and_never_retries_unconditionally_creates_or_returns_ok() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     assert!(
         out.is_err(),
@@ -1203,7 +1217,7 @@ fn an_update_with_no_usable_precondition_is_refused_rather_than_written_blind() 
     let mut sink = rig.sink_with(MINE, TagSource::QuickXor, UploadPolicy::default());
     // A quickXor tree records a hash. Nothing here is a valid `if-match`.
     sink.record_tag(&cloud(MINE, "01NOTES"), "qx:BAJk9sAAAAAAAAAAAAAAAAAAAAA=");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01NOTES")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01NOTES")));
 
     // Not "every write carries some if-match": `if-match: *` and `if-match:
     // qx:BAJk9s…` are both headers, both pass such a check, and both are the
@@ -1250,7 +1264,7 @@ fn the_precondition_is_the_tag_the_upload_is_based_on_not_one_just_read_back() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     let writes = rig.journal.writes();
     match writes.first() {
@@ -1282,7 +1296,7 @@ fn a_renumbered_update_returns_the_new_composed_id_and_removes_nothing() {
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01OLD"), "ct:c:{G},1");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01OLD")))
+        .upload(&path, at(&cloud(MINE, "01OLD")))
         .expect("the write succeeded");
 
     assert_eq!(
@@ -1391,7 +1405,7 @@ fn every_create_session_states_its_conflict_behaviour_and_never_replaces_without
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let updated = sink.upload(&update, Some(&cloud(MINE, "01A")));
+    let updated = sink.upload(&update, at(&cloud(MINE, "01A")));
     let made = sink.upload(&create, None);
 
     // Both are scripted end to end. Discarding the results let a sink that
@@ -1475,7 +1489,7 @@ fn a_202_on_the_last_fragment_is_not_a_successful_upload() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01BIG"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01BIG")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01BIG")));
 
     assert!(
         out.is_err(),
@@ -1529,7 +1543,7 @@ fn a_202_on_a_fragment_is_progress_and_is_never_a_completed_upload() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     assert!(out.is_err(), "no fragment was ever answered 200 or 201");
     let frags = fragments(&rig.journal, &u);
@@ -1586,7 +1600,7 @@ fn a_file_that_changed_during_a_session_is_not_committed_as_a_splice() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01BIG"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01BIG")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01BIG")));
 
     let frags = fragments(&rig.journal, &u);
     // The `<= 1` and the loop below are both true of an empty log, and the
@@ -1656,7 +1670,7 @@ fn a_session_does_not_commit_after_the_item_changed_under_it() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01BIG"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01BIG")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01BIG")));
 
     assert!(out.is_err(), "the object moved on under the session");
     let calls = rig.journal.calls();
@@ -1799,7 +1813,7 @@ fn the_cloud_id_comes_from_the_commit_response_not_from_the_existing_id() {
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01OLD"), "ct:c:{G},1");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01OLD")))
+        .upload(&path, at(&cloud(MINE, "01OLD")))
         .expect("the session committed");
 
     assert_eq!(
@@ -1853,7 +1867,7 @@ fn a_commit_response_without_a_content_tag_never_yields_ok_with_no_etag() {
     // upload that already happened, forever, so `Err` is not an acceptable way
     // to avoid inventing a tag — reading the tag back is.
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01A")))
+        .upload(&path, at(&cloud(MINE, "01A")))
         .expect("the commit succeeded, so the call succeeded");
 
     assert_eq!(
@@ -1910,7 +1924,7 @@ fn abandoning_a_session_never_deletes_the_drive_item() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     assert!(out.is_err(), "a 400 mid-session is a failure");
     let calls = rig.journal.calls();
@@ -1961,7 +1975,7 @@ fn positive_control_an_abandoned_session_is_cancelled_at_the_upload_url() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     assert!(out.is_err(), "the call still fails");
     let cancels: Vec<Rec> = rig
@@ -2019,7 +2033,7 @@ fn a_retried_fragment_resends_the_same_bytes_from_the_same_offset() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     assert!(out.is_ok(), "a retried fragment is recoverable: {out:?}");
     let frags = fragments(&rig.journal, &u);
@@ -2081,7 +2095,7 @@ fn a_416_is_resolved_by_asking_the_server_where_it_is() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     assert_eq!(
         out.expect("the session recovered").cloud_id,
@@ -2169,7 +2183,7 @@ fn the_servers_next_expected_ranges_outrank_the_local_byte_counter() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     let frags = fragments(&rig.journal, &u);
     let backwards = frags
@@ -2231,7 +2245,7 @@ fn a_next_expected_range_is_a_starting_point_not_a_fragment_size() {
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
     // Every continuation is scripted through to a commit, so a discarded result
     // hid the case where the sink gives up after the odd range.
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
     assert!(
         out.is_ok(),
         "a `nextExpectedRanges` entry with an end is not an error: {out:?}"
@@ -2297,7 +2311,7 @@ fn every_fragment_declares_the_total_size_fixed_when_the_session_was_created() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let _ = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let _ = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     let frags = fragments(&rig.journal, &u);
     assert!(!frags.is_empty(), "at least one fragment was sent");
@@ -2357,7 +2371,7 @@ fn a_file_that_shrinks_mid_session_is_never_padded() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     let frags = fragments(&rig.journal, &u);
     for (f, body) in &frags {
@@ -2415,7 +2429,7 @@ fn the_default_fragment_size_is_a_multiple_of_320_kib_and_under_60_mib() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     assert!(
         out.is_ok(),
@@ -2487,7 +2501,7 @@ fn a_404_on_the_final_fragment_is_not_evidence_that_the_commit_happened() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01A")));
 
     let calls = rig.journal.calls();
     assert!(
@@ -2547,7 +2561,7 @@ fn the_upload_url_never_reaches_the_framework_in_an_error_string() {
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
     let err = sink
-        .upload(&path, Some(&cloud(MINE, "01A")))
+        .upload(&path, at(&cloud(MINE, "01A")))
         .expect_err("the transport failed");
 
     // A sink that refused this upload before ever creating a session never held
@@ -2616,7 +2630,7 @@ fn a_second_upload_call_never_resumes_a_session_from_the_first() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01A"), "ct:c:{G},1");
-    let one = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let one = sink.upload(&path, at(&cloud(MINE, "01A")));
     assert!(one.is_err(), "the first call lost its connection");
 
     // The user saved again: different length, different content.
@@ -2627,7 +2641,7 @@ fn a_second_upload_call_never_resumes_a_session_from_the_first() {
     std::fs::write(&path, &second).expect("the second save");
     rig.journal.clear();
 
-    let two = sink.upload(&path, Some(&cloud(MINE, "01A")));
+    let two = sink.upload(&path, at(&cloud(MINE, "01A")));
     assert!(
         two.is_ok(),
         "the second call must be able to succeed: {two:?}"
@@ -2678,7 +2692,7 @@ fn a_fresh_sink_honours_an_existing_id_it_never_minted() {
     // Brand new: this instance has returned no id in its lifetime.
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01OLD"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01OLD")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01OLD")));
 
     let call = only_call(&rig.journal);
     assert_eq!(
@@ -2792,7 +2806,7 @@ fn an_update_never_returns_a_none_etag_when_the_response_carries_a_tag() {
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01OLD"), "ct:c:{G},1");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01OLD")))
+        .upload(&path, at(&cloud(MINE, "01OLD")))
         .expect("the update must succeed");
 
     assert_eq!(
@@ -2903,7 +2917,7 @@ fn an_existing_id_the_service_no_longer_has_becomes_a_create() {
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01GONE"), "ct:c:{G},1");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01GONE")))
+        .upload(&path, at(&cloud(MINE, "01GONE")))
         .expect("a stale id is recoverable");
 
     assert_eq!(out.cloud_id, cloud(MINE, "01FRESH"));
@@ -3024,7 +3038,7 @@ fn positive_control_an_ordinary_update_is_one_conditional_put_and_returns_the_ne
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01REPORT")))
+        .upload(&path, at(&cloud(MINE, "01REPORT")))
         .expect("an ordinary update must succeed");
 
     assert_eq!(
@@ -3143,7 +3157,7 @@ fn positive_control_a_large_file_commits_through_a_session_with_conforming_fragm
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01BIG"), "ct:c:{G},7");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01BIG")))
+        .upload(&path, at(&cloud(MINE, "01BIG")))
         .expect("a large file must commit");
 
     assert_eq!(
@@ -3227,7 +3241,7 @@ fn positive_control_a_three_fragment_session_completes_in_one_pass() {
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01OLD"), "ct:c:{G},1");
     let out = sink
-        .upload(&path, Some(&cloud(MINE, "01OLD")))
+        .upload(&path, at(&cloud(MINE, "01OLD")))
         .expect("three fragments must commit");
 
     assert_eq!(
@@ -3324,7 +3338,7 @@ fn a_dehydrated_placeholder_is_never_uploaded_as_content() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     assert!(
         out.is_err(),
@@ -3354,7 +3368,7 @@ fn positive_control_a_file_of_real_zeros_with_no_eviction_mark_uploads() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01IMG"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01IMG")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01IMG")));
 
     assert_eq!(
         out.expect("a file of zeros is still a file").cloud_id,
@@ -3415,7 +3429,7 @@ fn an_eviction_that_lands_mid_session_never_commits_the_placeholders_zeros() {
 
     let mut sink = rig.sink_policy(session_policy());
     sink.record_tag(&cloud(MINE, "01BIG"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01BIG")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01BIG")));
 
     let frags = fragments(&rig.journal, &u);
     for (f, body) in &frags {
@@ -3467,7 +3481,7 @@ fn a_file_that_is_gone_is_never_uploaded_as_an_empty_object_or_from_a_remembered
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
     let out = sink.upload(
         &a.root.join("Work/report.docx"),
-        Some(&cloud(MINE, "01REPORT")),
+        at(&cloud(MINE, "01REPORT")),
     );
 
     assert!(
@@ -3496,12 +3510,12 @@ fn a_file_that_is_gone_is_never_uploaded_as_an_empty_object_or_from_a_remembered
 
     let mut sink = b.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    sink.upload(&path, Some(&cloud(MINE, "01REPORT")))
+    sink.upload(&path, at(&cloud(MINE, "01REPORT")))
         .expect("the first send succeeds");
     std::fs::remove_file(&path).expect("the user deletes the file");
     b.journal.clear();
 
-    let again = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let again = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
     assert!(again.is_err(), "the file is gone; there is nothing to send");
     assert!(
         b.journal.calls().is_empty(),
@@ -3522,7 +3536,7 @@ fn a_file_that_is_gone_is_never_uploaded_as_an_empty_object_or_from_a_remembered
     let mut sink = c.sink();
     sink.record_tag(&cloud(MINE, "01NOTES"), "ct:c:{G},1");
     let out = sink
-        .upload(&empty, Some(&cloud(MINE, "01NOTES")))
+        .upload(&empty, at(&cloud(MINE, "01NOTES")))
         .expect("an empty file is a file");
 
     assert_eq!(out.cloud_id, cloud(MINE, "01NOTES"));
@@ -3568,7 +3582,7 @@ fn a_throttled_write_is_retried_with_its_precondition_and_after_the_advertised_d
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     assert_eq!(
         out.expect("a 429 is the service asking for a moment, not refusing")
@@ -3645,7 +3659,7 @@ fn a_transient_failure_on_an_update_never_becomes_a_create() {
 
     let mut sink = rig.sink();
     sink.record_tag(&cloud(MINE, "01REPORT"), "ct:c:{G},1");
-    let out = sink.upload(&path, Some(&cloud(MINE, "01REPORT")));
+    let out = sink.upload(&path, at(&cloud(MINE, "01REPORT")));
 
     assert!(out.is_err(), "the service never accepted the write");
     let calls = rig.journal.calls();
@@ -3801,7 +3815,12 @@ impl FakeCloud {
 }
 
 impl Sink for FakeCloud {
-    fn upload(&mut self, path: &std::path::Path, existing: Option<&str>) -> io::Result<Uploaded> {
+    fn upload(
+        &mut self,
+        path: &std::path::Path,
+        existing: Option<Known<'_>>,
+    ) -> io::Result<Uploaded> {
+        let existing = existing.map(|k| k.cloud_id);
         self.calls
             .lock()
             .unwrap()
@@ -3854,7 +3873,7 @@ impl Sink for FakeCloud {
 /// §5.4's guarantee is that no upload can succeed under a name the file does not
 /// have when the bytes are sent, and the framework's own repair path is where it
 /// is lost. `run_upload` answers a rename-mid-upload by calling
-/// `sink.upload(&moved.path, Some(&uploaded.cloud_id))`, and Class A requires
+/// `sink.upload(&moved.path, at(&uploaded.cloud_id))`, and Class A requires
 /// that an update address the id. Both rules kept literally leave the object
 /// named whatever the atomic save's temp file was called — the bytes are right,
 /// the name is `report.docx.tmp.194149`, and bug #52 is back, reached through
@@ -3961,5 +3980,67 @@ fn the_stamp_written_after_a_rename_never_blesses_an_edit_that_was_not_sent() {
         "the file reads as already sent over a paragraph that never left the \
          machine: it is not re-queued, reclaim may evict it, and the next delta \
          pass replaces it with a placeholder for the version without it"
+    );
+}
+
+/// The one this suite could not see, and the reason it could not.
+///
+/// `GraphSink::precondition` reads `self.known`, and `record_tag` is the only
+/// thing that fills it. `record_tag` is called forty-three times in this file
+/// and *nowhere else in either repository* — so every test above seeds by hand
+/// a map that a running daemon never populates. On a live account `precondition`
+/// therefore always answered `None`, `put_at_item` always returned
+/// `no_precondition`, and no update to an object that already existed had ever
+/// succeeded outside this file.
+///
+/// Measured 2026-08-13: six edited files unsent for hours, retried in a loop,
+/// each one holding in its own `user.hydration.etag` the very tag the write
+/// needed. The framework read it — `Store::lookup` fills `Entry::etag` — and
+/// then dropped it at the `Sink` boundary, which carried the id and not the
+/// version.
+///
+/// So this test calls no `record_tag`. It goes the way the daemon goes:
+/// `run_upload` reads the file's extended attributes through `Store`, passes
+/// them as `Known`, and the write is conditional on what was on disk all along.
+/// The request is scripted `.with("if-match")`, so an unconditional write does
+/// not merely assert wrongly — it finds no scripted reply at all.
+#[test]
+fn an_update_is_conditional_on_the_tag_recorded_on_the_file_with_no_help_from_the_sink() {
+    use std::os::unix::fs::MetadataExt;
+
+    let rig = Rig::new("durable_tag_reaches_the_wire");
+    let path = rig.file("Work/report.docx", b"edited on this machine");
+    store::set_xattr(&path, xattr::ID, cloud(MINE, "01REPORT").as_bytes())
+        .expect("the cloud id the delta pass would have written");
+    store::set_xattr(&path, xattr::ETAG, b"ct:c:{G},1")
+        .expect("the tag of the version this edit is based on");
+
+    rig.script(
+        put(item_content(MINE, "01REPORT")).with("if-match"),
+        vec![ok(drive_item("01REPORT", "report.docx", 22, "c:{G},2"))],
+    );
+
+    let md = std::fs::metadata(&path).expect("the fixture");
+    let file = FileId {
+        fsid: md.dev(),
+        ino: md.ino(),
+    };
+    let mut store = Store::new();
+    store.scan(&rig.root).expect("a scan of the sync root");
+
+    // No `record_tag`. That is the whole point.
+    let mut sink = rig.sink();
+    let outcome = run_upload(file, &mut store, &mut sink);
+
+    let call = only_call(&rig.journal);
+    assert_eq!(
+        call.header("if-match"),
+        Some("c:{G},1"),
+        "the update went out with no precondition, or with one that is not the \
+         version the file says it is based on: {call:?}"
+    );
+    assert!(
+        matches!(outcome, RunOutcome::Sent { .. }),
+        "an edit to a file the cloud already holds was not sent: {outcome:?}"
     );
 }
