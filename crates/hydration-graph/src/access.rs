@@ -283,6 +283,51 @@ impl GraphAccess {
     pub fn shared_token_cache(&self) -> SharedTokenCache {
         Arc::clone(&self.cache)
     }
+
+    /// The tag source every tag on this drive was actually written with.
+    ///
+    /// The constructor takes one, and the persisted tree pins one, and until
+    /// this existed nothing made the two agree. Measured on a live account on
+    /// 2026-08-13: the tree was pinned to `CTag`, every extended attribute on
+    /// disk held a `ct:` value, and the product passed `QuickXor`. The mapper
+    /// followed the pin and the sink followed the argument, so
+    /// `GraphSink::precondition` returned `None` on its first line — a drive
+    /// whose tags are hashes has nothing Graph accepts as a precondition — and
+    /// every update to an object that already existed was refused. No amount of
+    /// carrying the right tag to the sink could have helped: it was not looking
+    /// at the tag.
+    ///
+    /// The pin wins because it is not a preference. It is the record of what the
+    /// values on disk *are*, and `delta::is_current` compares them byte for
+    /// byte. The constructor's value is what to pin when there is nothing
+    /// pinned yet, which is the first round against a new account and the only
+    /// moment the choice is still open.
+    ///
+    /// Said out loud when they disagree. The argument is a caller's belief about
+    /// this drive, and a caller that is wrong about it should hear so once
+    /// rather than have it quietly corrected forever.
+    fn tags_in_force(&self) -> TagSource {
+        let pinned = FileStateStore::new(&self.state_dir)
+            .load()
+            .ok()
+            .flatten()
+            .and_then(|state| state.tree().map(|t| t.tag_source()))
+            .and_then(Result::ok);
+        match pinned {
+            Some(pin) if pin != self.tags => {
+                eprintln!(
+                    "hydration-graph: this drive's tags are pinned to {pin:?} and the \
+                     caller asked for {:?}; using {pin:?}, which is what every tag \
+                     already written here is. An upload cannot be made conditional on \
+                     a tag of a shape the drive does not use.",
+                    self.tags
+                );
+                pin
+            }
+            Some(pin) => pin,
+            None => self.tags,
+        }
+    }
 }
 impl CloudAccess for GraphAccess {
     type Fetch = GraphProvider;
@@ -297,7 +342,7 @@ impl CloudAccess for GraphAccess {
         Ok(GraphSink::new(
             self.scope.clone(),
             &self.root,
-            self.tags,
+            self.tags_in_force(),
             GraphHttp::new(Arc::clone(&self.cache)),
             SystemSleeper,
         ))
@@ -356,6 +401,54 @@ mod tests {
             AuthConfig::public_client("client").with_scopes(["Files.ReadWrite.All"]),
             TagSource::CTag,
         )
+    }
+
+    /// A drive's tags are what is already written on it, not what a caller
+    /// believes.
+    ///
+    /// Measured on a live account on 2026-08-13. The persisted tree was pinned
+    /// to `CTag`, every `user.hydration.etag` on disk held a `ct:` value, and
+    /// the product passed `QuickXor`. The mapper followed the pin and the sink
+    /// followed the argument, so `GraphSink::precondition` refused on its first
+    /// line — a drive whose tags are hashes has nothing Graph accepts as an
+    /// `if-match` — and no update to an object that already existed had ever
+    /// succeeded. Six files sat unsent for hours with the tag they needed in
+    /// their own extended attributes.
+    ///
+    /// One value, supplied twice, with nothing checking they agreed.
+    #[test]
+    fn the_sink_follows_the_tag_source_the_drive_is_pinned_to() {
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let drive = crate::DriveId::parse("drive").unwrap();
+        FileStateStore::new(&state)
+            .save_tree(&TreeBlob::encode(&drive, TagSource::CTag, &[]))
+            .unwrap();
+
+        let access = GraphAccess::with_token_cache(
+            DriveScope::primary(drive),
+            d.path().join("mount"),
+            &state,
+            // What the product passed, and what the drive is not.
+            TagSource::QuickXor,
+            access(d.path()).shared_token_cache(),
+        );
+
+        assert_eq!(
+            access.tags_in_force(),
+            TagSource::CTag,
+            "the sink would judge this drive's cTags as though they were hashes, \
+             and refuse every update to a file that already exists"
+        );
+    }
+
+    /// And before there is a tree, the caller's value is the one that gets
+    /// pinned — which is the only moment the choice is still open.
+    #[test]
+    fn with_nothing_pinned_yet_the_callers_choice_stands() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(access(d.path()).tags_in_force(), TagSource::CTag);
     }
 
     #[test]

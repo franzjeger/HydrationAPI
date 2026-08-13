@@ -162,20 +162,43 @@ impl Store {
                 }
                 if keeping_lineage {
                     if let Some(rel) = crate::lineage::relative(root, &path) {
+                        // Placeholders are left out, and the reason is size.
+                        //
+                        // Recording every file with a cloud id put 167,883 lines
+                        // and 43 MB into the sync root on the measured account —
+                        // a near-duplicate of the manifest, rewritten whenever
+                        // any one object changed. The 1,018 files that actually
+                        // hold content come to 0.3 MB.
+                        //
+                        // The limit this accepts: a placeholder that is replaced
+                        // by an atomic save *without ever being read* loses its
+                        // identity with no record here to recover it. Its
+                        // identity is in §6d's manifest, which lists exactly the
+                        // dehydrated files and carries the same three columns —
+                        // so the information is not gone, only not wired to this
+                        // path. Wiring it would double a 43 MB file to cover a
+                        // case that needs a program to write over a document it
+                        // never opened.
+                        let placeholder = get_xattr(&path, hydration_protocol::xattr::DEHYDRATED)
+                            .ok()
+                            .flatten()
+                            .is_some();
                         // Recorded from the file only when the file has something
                         // to say. A file that has lost its attributes contributes
                         // its *path* and nothing else, which is what keeps the
                         // record it needs alive rather than erasing it.
-                        if let Some(cloud_id) = get_xattr_string(&path, XATTR_ID) {
-                            seen.insert(
-                                rel.clone(),
-                                crate::lineage::Record {
-                                    cloud_id,
-                                    tag: get_xattr_string(&path, XATTR_ETAG),
-                                },
-                            );
+                        if !placeholder {
+                            if let Some(cloud_id) = get_xattr_string(&path, XATTR_ID) {
+                                seen.insert(
+                                    rel.clone(),
+                                    crate::lineage::Record {
+                                        cloud_id,
+                                        tag: get_xattr_string(&path, XATTR_ETAG),
+                                    },
+                                );
+                            }
+                            live.insert(rel);
                         }
-                        live.insert(rel);
                     }
                 }
                 self.index.insert(
