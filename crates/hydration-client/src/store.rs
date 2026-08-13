@@ -423,6 +423,20 @@ pub fn set_xattr(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+pub fn remove_xattr(path: &Path, name: &str) -> io::Result<()> {
+    let p = CString::new(path.as_os_str().as_bytes())?;
+    let n = CString::new(name)?;
+    let rc = unsafe { libc::removexattr(p.as_ptr(), n.as_ptr()) };
+    if rc < 0 {
+        let e = io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(()),
+            _ => Err(e),
+        };
+    }
+    Ok(())
+}
+
 fn get_xattr_string(path: &Path, name: &str) -> Option<String> {
     get_xattr(path, name)
         .ok()

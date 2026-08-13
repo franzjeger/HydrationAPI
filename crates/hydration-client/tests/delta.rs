@@ -92,6 +92,13 @@ fn upserted(path: &str, size: u64, id: &str) -> Change {
     }
 }
 
+fn folder(path: &str, id: &str) -> Change {
+    Change::FolderUpserted {
+        cloud_id: id.into(),
+        path: path.into(),
+    }
+}
+
 fn run(root: &Path, changes: &[Change], q: &Queue<TestClock>, m: &mut Recorder) -> Applied {
     let mut store = Store::new();
     // Snapshotted here exactly as the binary does it, so the tests exercise the
@@ -257,6 +264,143 @@ fn a_removal_for_an_unknown_object_is_not_an_error() {
         &mut m,
     );
     assert_eq!(out, Applied::default(), "{out:?}");
+}
+
+#[test]
+fn an_empty_cloud_folder_is_materialised_with_its_identity() {
+    let dir = scratch("empty-folder");
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+    let mut m = Recorder::default();
+
+    let out = run(&dir, &[folder("Projects/Empty", "folder-1")], &q, &mut m);
+
+    let p = dir.join("Projects/Empty");
+    assert!(
+        p.is_dir(),
+        "the empty cloud folder was not represented locally"
+    );
+    assert_eq!(out.created, 1, "{out:?}");
+    assert_eq!(
+        store::get_xattr(&p, store::XATTR_ID).unwrap().unwrap(),
+        b"folder-1"
+    );
+}
+
+#[test]
+fn the_cloud_root_identity_is_recorded_without_creating_a_child() {
+    let dir = scratch("root-folder-id");
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+    let mut m = Recorder::default();
+
+    let out = run(&dir, &[folder("", "root-1")], &q, &mut m);
+
+    assert_eq!(out, Applied::default(), "{out:?}");
+    assert_eq!(
+        store::get_xattr(&dir, store::XATTR_ID).unwrap().unwrap(),
+        b"root-1"
+    );
+}
+
+#[test]
+fn a_remote_folder_move_follows_identity_and_preserves_the_directory() {
+    let dir = scratch("folder-move");
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+    let mut m = Recorder::default();
+    run(&dir, &[folder("Old", "folder-1")], &q, &mut m);
+    let before = std::fs::metadata(dir.join("Old")).unwrap().ino();
+
+    let out = run(&dir, &[folder("Archive/New", "folder-1")], &q, &mut m);
+
+    assert_eq!(out.moved, 1, "{out:?}");
+    assert!(!dir.join("Old").exists());
+    assert_eq!(
+        std::fs::metadata(dir.join("Archive/New")).unwrap().ino(),
+        before,
+        "the move recreated the folder instead of following its identity"
+    );
+}
+
+#[test]
+fn a_remote_folder_delete_removes_an_empty_directory_only() {
+    let dir = scratch("empty-folder-delete");
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+    let mut m = Recorder::default();
+    run(&dir, &[folder("Empty", "folder-1")], &q, &mut m);
+
+    let out = run(
+        &dir,
+        &[Change::FolderRemoved {
+            cloud_id: "folder-1".into(),
+            path: "Empty".into(),
+        }],
+        &q,
+        &mut m,
+    );
+
+    assert_eq!(out.removed, 1, "{out:?}");
+    assert!(!dir.join("Empty").exists());
+}
+
+#[test]
+fn a_remote_folder_delete_never_recursively_erases_local_content() {
+    let dir = scratch("nonempty-folder-delete");
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+    let mut m = Recorder::default();
+    run(&dir, &[folder("Work", "folder-1")], &q, &mut m);
+    std::fs::write(dir.join("Work/local-only.txt"), b"only copy").unwrap();
+
+    let out = run(
+        &dir,
+        &[Change::FolderRemoved {
+            cloud_id: "folder-1".into(),
+            path: "Work".into(),
+        }],
+        &q,
+        &mut m,
+    );
+
+    assert_eq!(out, Applied::default(), "{out:?}");
+    assert_eq!(
+        std::fs::read(dir.join("Work/local-only.txt")).unwrap(),
+        b"only copy"
+    );
+    assert_eq!(
+        store::get_xattr(&dir.join("Work"), store::XATTR_ID).unwrap(),
+        None,
+        "the surviving local-only folder retained a deleted cloud identity"
+    );
+
+    let next = run(&dir, &[folder("Work", "folder-2")], &q, &mut m);
+    assert_eq!(next, Applied::default(), "{next:?}");
+    assert_eq!(
+        store::get_xattr(&dir.join("Work"), store::XATTR_ID)
+            .unwrap()
+            .unwrap(),
+        b"folder-2",
+        "a new cloud object could not adopt the surviving local folder"
+    );
+}
+
+#[test]
+fn a_folder_destination_claimed_by_another_identity_is_retryable() {
+    let dir = scratch("folder-id-collision");
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+    let mut m = Recorder::default();
+    run(&dir, &[folder("Work", "folder-1")], &q, &mut m);
+
+    let out = run(&dir, &[folder("Work", "folder-2")], &q, &mut m);
+
+    assert!(out.retryable, "the cursor must not advance: {out:?}");
+    assert_eq!(
+        out.failed,
+        vec![Failed::new("Work", Failure::DestinationOccupied)]
+    );
+    assert_eq!(
+        store::get_xattr(&dir.join("Work"), store::XATTR_ID)
+            .unwrap()
+            .unwrap(),
+        b"folder-1"
+    );
 }
 
 /// The cloud supplies these paths, so they are untrusted input.

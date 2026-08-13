@@ -958,6 +958,15 @@ fn paths(cs: &[Change]) -> BTreeSet<String> {
         .collect()
 }
 
+fn folder_paths(cs: &[Change]) -> BTreeSet<String> {
+    cs.iter()
+        .filter_map(|c| match c {
+            Change::FolderUpserted { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn cursor_str(c: &Cursor) -> String {
     c.0.clone()
         .unwrap_or_else(|| panic!("a completed round must return a cursor, got Cursor(None)"))
@@ -2461,7 +2470,7 @@ fn a_token_that_does_not_belong_to_the_stored_tree_is_discarded() {
 /// `Namespace::waiting` under a parent that will never come and blocks the token
 /// forever. Sync stops permanently, on a folder.
 #[test]
-fn a_round_that_produced_no_changes_still_persists_its_tree() {
+fn a_round_that_produced_only_folder_changes_still_persists_its_tree() {
     let rig = Rig::new();
     rig.script(
         first_req(MINE),
@@ -2478,12 +2487,15 @@ fn a_round_that_produced_no_changes_still_persists_its_tree() {
     let (changes, cursor) = d.changes(&Cursor::default()).expect("a clean round");
 
     assert!(
-        changes.is_empty(),
-        "a root and an empty folder are no files"
+        paths(&changes).is_empty(),
+        "no file was described: {changes:?}"
     );
-    // An empty batch is still acknowledged — `hydration-sync.rs` advances the
-    // cursor on a quiet pass too — so the tree still reaches disk, one call
-    // later and with the folder in it.
+    assert_eq!(
+        folder_paths(&changes),
+        ["".to_string(), "Work".to_string()].into_iter().collect()
+    );
+    // Folder-only batches are acknowledged after their filesystem changes are
+    // applied, so the tree reaches disk one call later with the folder in it.
     assert!(
         rig.journal.writes().is_empty(),
         "{:?}",
