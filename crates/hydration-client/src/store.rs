@@ -336,12 +336,44 @@ impl Store {
         cloud_id: &str,
         etag: Option<&str>,
     ) -> io::Result<()> {
-        set_xattr(path, XATTR_ID, cloud_id.as_bytes())?;
+        write_xattr_even_if_read_only(path, XATTR_ID, cloud_id.as_bytes())?;
         if let Some(e) = etag {
-            set_xattr(path, XATTR_ETAG, e.as_bytes())?;
+            write_xattr_even_if_read_only(path, XATTR_ETAG, e.as_bytes())?;
         }
         Ok(())
     }
+}
+
+/// Set an extended attribute on a file whose mode forbids writing.
+///
+/// The kernel gates `user.*` attributes on write permission to the *inode*, not
+/// on how it was opened — so a file the user owns and can chmod at will still
+/// refuses, and this framework has no way to record what such a file is.
+///
+/// Measured on a live account on 2026-08-13: git creates its pack files 0444,
+/// and three of them could not be given back the identity an atomic save had
+/// destroyed. `adopt_cloud_id` failed with `EACCES`, the upload was re-queued,
+/// and it would have repeated forever — the recovery worked and could not be
+/// written down.
+///
+/// The mode is restored whichever way the write goes, including the failing one.
+/// A file left writable because recording its id failed is a permission change
+/// the user never made, on a file something else deliberately protected.
+fn write_xattr_even_if_read_only(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    match set_xattr(path, name, value) {
+        Err(e) if e.raw_os_error() == Some(libc::EACCES) => {}
+        other => return other,
+    }
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    let mut relaxed = std::fs::Permissions::from_mode(mode | 0o200);
+    std::fs::set_permissions(path, relaxed.clone())?;
+    let out = set_xattr(path, name, value);
+    relaxed.set_mode(mode);
+    // Reported only if it is the only thing that went wrong. The caller is
+    // owed the original failure ahead of this one.
+    let restored = std::fs::set_permissions(path, relaxed);
+    out.and(restored)
 }
 
 pub fn get_xattr(path: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {

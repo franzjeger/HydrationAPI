@@ -3637,7 +3637,9 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
                 match self.reconcile_by_content(&drive, rel, &sent) {
                     Ok(Some(u)) => Ok(u),
                     Ok(None) => Err(refused(
-                        "a different file already exists in the cloud under this name, and                          this copy has no record of which version it was based on, so it                          cannot be sent without overwriting that one blind",
+                        "a different file already exists in the cloud under this name, and this \
+                         copy has no record of which version it was based on, so it \
+                         cannot be sent without overwriting that one blind",
                     )),
                     // Could not find out. Not the same as "they differ", and it
                     // must not be reported as though it were.
