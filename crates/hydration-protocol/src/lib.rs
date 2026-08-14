@@ -172,6 +172,21 @@ pub mod xattr {
     pub const ETAG: &str = "user.hydration.etag";
     /// A mode the cloud has nowhere to store.
     pub const MODE: &str = "user.hydration.mode";
+    /// Set while the user wants this file — or everything under this directory —
+    /// kept on device: skipped by manual eviction, and by the auto-eviction
+    /// policy when one exists.
+    ///
+    /// Presence-only, exactly like `DEHYDRATED`; the value is `b"1"` by
+    /// convention so a `getfattr` at 2am is legible, and every reader tests
+    /// presence and ignores it. Forging it is *benign*, and that is load-bearing:
+    /// a same-uid process can write any `user.*` attribute — the very reason the
+    /// "under construction" mark below was removed — but a forged pin can only
+    /// make the framework keep more content on disk or decline an eviction. It
+    /// can never make a placeholder serve zeros and never destroy data, the same
+    /// safe direction the stamp relies on. Do not "harden" this into something
+    /// that fails closed: a pin that failed closed would evict the data it exists
+    /// to protect.
+    pub const PINNED: &str = "user.hydration.pinned";
     // There is deliberately no "under construction" mark here.
     //
     // An earlier version had one, and the helper trusted it to decide that an
