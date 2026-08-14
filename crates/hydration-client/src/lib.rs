@@ -11,6 +11,7 @@
 
 pub mod daemon_loop;
 pub mod delta;
+pub mod evict_policy;
 pub mod lineage;
 pub mod manifest;
 pub mod mount;
