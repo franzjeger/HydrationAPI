@@ -138,6 +138,15 @@ impl Lineage {
         self.by_path.get(rel)
     }
 
+    /// Every path recorded, with what was known about it.
+    ///
+    /// For the offline-deletion reconciliation, which needs the whole set of
+    /// hydrated-file paths the last run recorded — the half of the presence
+    /// journal the manifest does not cover.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &Record)> {
+        self.by_path.iter().map(|(p, r)| (p.as_str(), r))
+    }
+
     pub fn len(&self) -> usize {
         self.by_path.len()
     }

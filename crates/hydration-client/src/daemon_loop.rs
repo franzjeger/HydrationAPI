@@ -706,6 +706,21 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // instances themselves never touch it again.
     let access = Arc::new(Mutex::new(access));
 
+    // Deletions the user made while the daemon was stopped, found now — before
+    // the delta and manifest threads rewrite the journal they are detected in —
+    // and withdrawn by the upload thread below once it has a sink. The walk it
+    // costs happens once, at startup, on the tree it was going to scan anyway.
+    // See `detect_offline_removals` for why absence across a whole root is not
+    // read as a deletion.
+    let offline_deletions = detect_offline_removals(&config.mount);
+    if !offline_deletions.is_empty() {
+        eprintln!(
+            "hydration-sync: {} file(s) were deleted while the daemon was stopped; \
+             withdrawing them from the cloud",
+            offline_deletions.len()
+        );
+    }
+
     // The upload driver keeps its own store: a held upload must never block a
     // status query behind a shared lock.
     {
@@ -733,6 +748,26 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     return;
                 }
             };
+            // Heal the past before watching the future. These were deleted while
+            // this daemon was not running, detected at startup while the journal
+            // still had them (see `detect_offline_removals`). `sink.remove` is
+            // idempotent — a 404 for an object already gone is not an error — so
+            // a candidate that overlaps something the online path also catches
+            // costs nothing.
+            for (path, cloud_id) in &offline_deletions {
+                match sink.remove(cloud_id) {
+                    Ok(()) => eprintln!(
+                        "hydration-sync: {path} was deleted while the daemon was stopped; \
+                         removed from the cloud"
+                    ),
+                    Err(e) => eprintln!(
+                        "hydration-sync: {path} was deleted while the daemon was stopped, but \
+                         the cloud copy could not be removed: {e}. It will return as a \
+                         placeholder and can be deleted again."
+                    ),
+                }
+            }
+
             // Reads the lineage record, never writes it. This scan runs only when
             // something is already due, which for a file saved atomically is a
             // debounce after its extended attributes went away — far too late to
@@ -1486,6 +1521,129 @@ impl Registers {
         }
         self.manifest.as_ref().map(|(_, m)| m)
     }
+}
+
+/// Deletions made while the daemon was not running.
+///
+/// The inotify watch in `removals` sees only what happens while it is open. A
+/// file deleted while the daemon was stopped is invisible to it: at the next
+/// start the file is simply absent, and absence alone is the one signal the
+/// whole removal design refuses to act on — a file is absent because the user
+/// deleted it, because the delta pass has not placed it, or because the sync
+/// root is empty, unmounted, or wrong, and acting on the last of those empties
+/// the account.
+///
+/// So this does not act on absence. It acts on the *difference* between what the
+/// framework wrote down as present and what is present now. The record is the
+/// persistent presence journal — the manifest (placeholders) and the lineage
+/// (hydrated files) together, both keyed by path and carrying a cloud id.
+///
+/// Both live inside the sync root, and that co-location is the safety. A rebuilt
+/// or empty or wrong root carries neither file, so the journal is empty and the
+/// difference is nothing. The catastrophic shape — every file "missing" because
+/// the subvolume did not mount — cannot arise, for the same reason
+/// `empty_mount_never_deletes` holds: the record of what was here is gone with
+/// the files it described. The mount check in [`run`] is a second line, refusing
+/// to start at all when the root is not a mount.
+///
+/// Run once, synchronously, before any thread starts: the first delta scan and
+/// the first manifest write both rewrite the journal within seconds, and this
+/// has to read what the *last* run left. The result is carried into the upload
+/// thread, which owns the sink and withdraws each object once it is built.
+///
+/// Two guards beyond the co-location:
+///   * an object still on disk under a *different* path moved rather than
+///     vanished, and is not withdrawn — an offline `mv` inside the root;
+///   * a disappearance larger than [`REMOVAL_BATCH_LIMIT`] is refused whole and
+///     said out loud. A hundred files gone at once is a large `rm -rf` the user
+///     should confirm with the daemon running, or a residual wrong-root the
+///     co-location did not catch. Either way it is not withdrawn unasked.
+fn detect_offline_removals(root: &std::path::Path) -> Vec<(String, String)> {
+    // The presence journal, both halves, co-located in the sync root.
+    let mut journal: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (path, (cloud_id, _tag)) in crate::manifest::entries(root) {
+        journal.insert(path, cloud_id);
+    }
+    for (path, record) in crate::lineage::Lineage::load(root).entries() {
+        journal.insert(path.to_string(), record.cloud_id.clone());
+    }
+    if journal.is_empty() {
+        return Vec::new();
+    }
+
+    // What is here now, and which objects sit on any path, so an offline move is
+    // not read as a deletion.
+    let (present, on_disk) = scan_present(root);
+
+    let mut gone: Vec<(String, String)> = journal
+        .into_iter()
+        .filter(|(path, _)| !present.contains(path))
+        .filter(|(_, cloud_id)| !on_disk.contains(cloud_id))
+        .collect();
+    gone.sort();
+
+    if gone.len() > REMOVAL_BATCH_LIMIT {
+        eprintln!(
+            "hydration-sync: {} files recorded here are gone since the daemon last ran — more \
+             than it will withdraw from the cloud without being asked ({REMOVAL_BATCH_LIMIT}). \
+             Nothing was removed; they are still in the cloud and will return as placeholders. \
+             If you deleted them on purpose, delete them again with the daemon running. First \
+             few: {}",
+            gone.len(),
+            gone.iter()
+                .take(5)
+                .map(|(p, _)| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return Vec::new();
+    }
+    gone
+}
+
+/// Walk the sync root once: which relative paths hold a file, and which cloud
+/// ids sit on any of them. Framework files are skipped, as everywhere.
+fn scan_present(
+    root: &std::path::Path,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    let mut present = std::collections::HashSet::new();
+    let mut on_disk = std::collections::HashSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(md) = entry.metadata() else {
+                continue;
+            };
+            if md.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !md.is_file()
+                || path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(hydration_protocol::names::is_internal)
+            {
+                continue;
+            }
+            if let Some(rel) = crate::lineage::relative(root, &path) {
+                present.insert(rel);
+            }
+            if let Ok(Some(bytes)) = crate::store::get_xattr(&path, crate::store::XATTR_ID) {
+                if let Ok(id) = String::from_utf8(bytes) {
+                    on_disk.insert(id);
+                }
+            }
+        }
+    }
+    (present, on_disk)
 }
 
 #[derive(Debug)]
@@ -2642,5 +2800,146 @@ mod tests {
         let n = BufReader::new(theirs).read_line(&mut line).unwrap();
         assert_eq!(n, 0, "a refused watcher must see EOF, got {line:?}");
         drop(peers);
+    }
+
+    // ---- offline deletion reconciliation --------------------------------
+
+    fn write_manifest(root: &Path, entries: &[(&str, &str)]) {
+        let mut s = String::from("# path\tcloud-id\tsize\tetag\n");
+        for (p, id) in entries {
+            s.push_str(&format!("{p}\t{id}\t10\t-\n"));
+        }
+        std::fs::write(root.join(hydration_protocol::names::MANIFEST), s).unwrap();
+    }
+
+    fn write_lineage(root: &Path, entries: &[(&str, &str)]) {
+        let mut s = String::from("# path\tcloud-id\tetag\n");
+        for (p, id) in entries {
+            s.push_str(&format!("{p}\t{id}\n"));
+        }
+        std::fs::write(root.join(hydration_protocol::names::LINEAGE), s).unwrap();
+    }
+
+    /// A file present on disk, carrying the cloud id the journal knows it by.
+    fn place(root: &Path, rel: &str, cloud_id: &str) {
+        let abs = root.join(rel);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&abs, b"x").unwrap();
+        store::set_xattr(&abs, store::XATTR_ID, cloud_id.as_bytes()).unwrap();
+    }
+
+    fn candidate_paths(root: &Path) -> Vec<String> {
+        let mut v: Vec<String> = detect_offline_removals(root)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The whole point: a file the journal recorded and that is gone now is a
+    /// deletion the daemon slept through, and it is found. Both halves of the
+    /// journal — a placeholder in the manifest, a hydrated file in the lineage —
+    /// are covered.
+    #[test]
+    fn a_file_deleted_while_the_daemon_was_stopped_is_detected() {
+        let root = scratch("offline/detected");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_manifest(&root, &[("kept.pdf", "idK"), ("gone.pdf", "idG")]);
+        write_lineage(
+            &root,
+            &[("Work/kept.txt", "idKH"), ("Work/gone.txt", "idGH")],
+        );
+        place(&root, "kept.pdf", "idK");
+        place(&root, "Work/kept.txt", "idKH");
+        // gone.pdf and Work/gone.txt are deleted: recorded, not on disk.
+
+        assert_eq!(
+            candidate_paths(&root),
+            vec!["Work/gone.txt".to_string(), "gone.pdf".to_string()],
+            "a deletion made while the daemon was stopped was not detected"
+        );
+    }
+
+    /// The safety the whole design turns on: a root with no journal produces no
+    /// candidates, whatever is or is not on disk.
+    ///
+    /// This is the shape of a subvolume that did not mount, or a rebuilt one, or
+    /// simply the wrong directory. The record of what was here lives here, so
+    /// when the files are gone the record is gone with them, and the difference
+    /// is nothing. Files are placed to prove the candidates come from the
+    /// journal and never from the disk — an empty journal over a full tree is
+    /// still empty.
+    #[test]
+    fn a_root_with_no_journal_deletes_nothing() {
+        let root = scratch("offline/no-journal");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        place(&root, "a.txt", "idA");
+        place(&root, "b.txt", "idB");
+        assert!(
+            detect_offline_removals(&root).is_empty(),
+            "a root with no journal produced deletion candidates — the empty-mount \
+             catastrophe, arrived at offline"
+        );
+    }
+
+    /// An offline `mv` inside the sync root is not a deletion.
+    ///
+    /// The old path is gone from disk, so by absence it looks deleted. But the
+    /// object is still here under its new name — the same cloud id sits on the
+    /// moved file — so nothing is withdrawn.
+    #[test]
+    fn an_offline_move_is_not_a_deletion() {
+        let root = scratch("offline/moved");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_manifest(&root, &[("old/a.txt", "idA")]);
+        place(&root, "new/a.txt", "idA"); // moved: same object, new path
+
+        assert!(
+            detect_offline_removals(&root).is_empty(),
+            "a file moved while the daemon was stopped was withdrawn from the cloud as \
+             though it had been deleted"
+        );
+    }
+
+    #[test]
+    fn a_file_still_present_is_not_a_candidate() {
+        let root = scratch("offline/present");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_manifest(&root, &[("a.txt", "idA")]);
+        place(&root, "a.txt", "idA");
+        assert!(detect_offline_removals(&root).is_empty());
+    }
+
+    /// A disappearance larger than the cap is refused whole, not withdrawn.
+    ///
+    /// A hundred files gone at once is a large `rm -rf` the user should confirm
+    /// with the daemon running, or a wrong root the co-location did not catch.
+    /// Either way it is the one shape that must never be propagated unasked.
+    #[test]
+    fn a_disappearance_past_the_cap_is_refused() {
+        let root = scratch("offline/blast-radius");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let entries: Vec<(String, String)> = (0..REMOVAL_BATCH_LIMIT + 1)
+            .map(|i| (format!("f{i}.txt"), format!("id{i}")))
+            .collect();
+        let refs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(p, i)| (p.as_str(), i.as_str()))
+            .collect();
+        write_manifest(&root, &refs);
+        // None placed: every one recorded, every one gone.
+        assert!(
+            detect_offline_removals(&root).is_empty(),
+            "{} files gone at once were withdrawn without being asked",
+            REMOVAL_BATCH_LIMIT + 1
+        );
     }
 }
