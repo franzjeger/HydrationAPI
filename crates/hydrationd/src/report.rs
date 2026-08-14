@@ -107,6 +107,7 @@ impl Reporter {
         peer: Option<Arc<std::sync::atomic::AtomicI32>>,
         notifier: Notifier,
         batch_every: Duration,
+        peer_lost: Arc<std::sync::atomic::AtomicBool>,
     ) -> std::io::Result<Self> {
         // Starts out knowing it has missed something, so the very first batch
         // carries a `Resync`.
@@ -188,16 +189,23 @@ impl Reporter {
             // was taken is gone from the set, so the loss is recorded where it
             // belongs: `lost` goes back up, and the first batch after the line
             // heals opens with the `Resync` that tells the daemon to walk.
+            // A failed send raises `peer_lost` as well as re-arming `lost`. The
+            // fetch thread watches that flag and rebuilds the shared socket even
+            // when nothing is being read — which is the whole fix: before it, a
+            // send failure only waited for the fetch path to reconnect, and a
+            // restart with no reads in flight meant it never did.
             if lost && notifier.send(&FromHelper::Resync).is_err() {
                 if let Ok(mut d) = send.lock() {
                     d.lost = true;
                 }
+                peer_lost.store(true, std::sync::atomic::Ordering::SeqCst);
                 continue;
             }
             if !files.is_empty() && notifier.send(&FromHelper::Changed { files }).is_err() {
                 if let Ok(mut d) = send.lock() {
                     d.lost = true;
                 }
+                peer_lost.store(true, std::sync::atomic::Ordering::SeqCst);
                 continue;
             }
         });

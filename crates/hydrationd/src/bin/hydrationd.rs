@@ -302,6 +302,22 @@ fn main() -> io::Result<()> {
         // below keeps matching the process it is meant to ignore.
         let peer_pid = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(watched_pid));
 
+        // The change reporter's write handle, taken before `conn` moves into the
+        // fetch path below — they share one socket, and the reporter follows the
+        // fetch path's reconnects through it.
+        let notifier = conn.notifier();
+
+        // Reconnecting, because the peer is a user unit and restarting it is
+        // routine. Before this, its restart cost the mount: the helper's
+        // fetches failed on the dead socket until the worker gave up and the
+        // supervisor detached everything — measured on 2026-08-12, five
+        // minutes from `systemctl --user restart` to teardown. The uid check
+        // re-runs on every reconnect; see `remote` for why that is sufficient
+        // and what an impostor costs.
+        let fetch = SocketFetch::reconnecting(conn, &args.mount, &args.socket, args.peer_uid)
+            .with_peer_pid(std::sync::Arc::clone(&peer_pid));
+        let mut w = Worker::new(group, fetch, Policy::default(), worker_view);
+
         // Change detection, on its own threads so the event loop never waits on
         // the socket. Spawned after the fork, never before.
         //
@@ -311,12 +327,21 @@ fn main() -> io::Result<()> {
         // straight back. Pid filtering is an optimisation rather than the
         // correctness boundary — the daemon checks content before uploading —
         // but without it the loop is tight enough to matter.
+        //
+        // The worker's `peer_lost` flag ties the two together: a notification
+        // that cannot be sent raises it, and the fetch thread rebuilds the shared
+        // socket off the fetch path — so a daemon restart with no reads in flight
+        // no longer leaves local edits reported into a dead socket. Measured on a
+        // live account on 2026-08-14: without it, uploads stopped after a daemon
+        // restart until a placeholder happened to be read or the helper was
+        // restarted.
         match report::Reporter::spawn(
             &args.mount,
             vec![unsafe { libc::getpid() }],
-            Some(std::sync::Arc::clone(&peer_pid)),
-            conn.notifier(),
+            Some(peer_pid),
+            notifier,
             Duration::from_millis(250),
+            w.peer_lost(),
         ) {
             Ok(_) => eprintln!(
                 "[worker] watching {} for local changes",
@@ -327,16 +352,6 @@ fn main() -> io::Result<()> {
             Err(e) => eprintln!("[worker] change detection unavailable: {e}"),
         }
 
-        // Reconnecting, because the peer is a user unit and restarting it is
-        // routine. Before this, its restart cost the mount: the helper's
-        // fetches failed on the dead socket until the worker gave up and the
-        // supervisor detached everything — measured on 2026-08-12, five
-        // minutes from `systemctl --user restart` to teardown. The uid check
-        // re-runs on every reconnect; see `remote` for why that is sufficient
-        // and what an impostor costs.
-        let fetch = SocketFetch::reconnecting(conn, &args.mount, &args.socket, args.peer_uid)
-            .with_peer_pid(peer_pid);
-        let mut w = Worker::new(group, fetch, Policy::default(), worker_view);
         // No deadline on the loop itself: this is the service, not a test. The
         // per-event deadline is what bounds any single reader's wait.
         let _ = w.run(Instant::now() + Duration::from_secs(60 * 60 * 24 * 365 * 10));
