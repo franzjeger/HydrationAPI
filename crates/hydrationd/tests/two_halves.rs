@@ -140,6 +140,82 @@ fn content_crosses_the_boundary_and_reaches_the_reader() {
     let _ = std::fs::remove_file(&file);
 }
 
+/// Keep-on-Device groundwork (`docs/KEEP-ON-DEVICE-GROUNDWORK.md` §2.3/§2.5), probe
+/// P2: a third-party read to EOF does not only cross the boundary with the right
+/// bytes — it *clears the placeholder mark*.
+///
+/// That is the success condition the future `hydrate` verb rests on (after EOF,
+/// DEHYDRATED is gone), and it is the half
+/// [`content_crosses_the_boundary_and_reaches_the_reader`] does not check. The reader
+/// is a separate `cat` process — never the daemon and never the worker — so a passing
+/// run is also the §6a-ter measurement the design turned on: the deadlock-safe hydrate
+/// (a third-party read, the ninth disguise avoided) *fully* hydrates rather than
+/// hanging or serving zeros. If `cat` were the process that answers the event, this
+/// would be §6a-ter and it would hang; a read that returns is the proof it does not.
+#[test]
+fn a_third_party_read_to_eof_clears_the_dehydrated_mark() {
+    let Some(mnt) = mount() else {
+        skip("needs root and HYDRATIOND_TEST_MOUNT on a real filesystem");
+        return;
+    };
+    let file = seed(&mnt, "hydrate-clears.bin", BODY);
+    assert!(
+        placeholder::is_dehydrated(&file).unwrap(),
+        "a freshly seeded placeholder should start dehydrated"
+    );
+
+    let conn = start_daemon(
+        &mnt,
+        Fake {
+            body: BODY.to_vec(),
+            truncate_to: None,
+        },
+    );
+
+    let group = Group::new_pre_content().expect("group");
+    group.mark_mount(&mnt).expect("mark");
+    let mut worker = Worker::new(
+        group,
+        SocketFetch::new(conn, &mnt),
+        Policy::permissive(),
+        InFlight::new(),
+    );
+
+    let reader = std::process::Command::new("cat")
+        .arg(&file)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("reader");
+
+    let seen = worker
+        .run(Instant::now() + Duration::from_secs(5))
+        .expect("worker");
+    let out = reader.wait_with_output().expect("reader output");
+
+    assert!(
+        seen.iter().any(|h| matches!(h, Handled::Hydrated { .. })),
+        "nothing was hydrated across the socket: {seen:?}"
+    );
+    assert_eq!(
+        out.stdout, BODY,
+        "the reader got zeros, not the content — a read completed without a real fill"
+    );
+    // The half the sibling test does not assert, and the whole point of P2: the full
+    // read to EOF cleared the mark. Without this the `hydrate` verb cannot tell a
+    // finished download from a partial fill, and a kept file would stay `nodump`-
+    // excluded from backups (the mark is cleared only in `finish_hydration`, which
+    // runs only once every byte is present — daemon.rs `have.covers(Span::whole)`).
+    assert!(
+        !placeholder::is_dehydrated(&file).unwrap(),
+        "a full read to EOF left the file marked dehydrated — hydrate cannot report success"
+    );
+    assert!(
+        placeholder::holds_data(&file).expect("SEEK_DATA"),
+        "SEEK_DATA finds no data after a full hydrate"
+    );
+    let _ = std::fs::remove_file(&file);
+}
+
 /// §5.7, through the whole stack rather than at one layer.
 ///
 /// The provider lies about length. The daemon catches it, and so would the
