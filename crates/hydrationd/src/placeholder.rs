@@ -182,6 +182,12 @@ pub fn hydrate(path: &Path, content: &[u8], expected: u64) -> io::Result<()> {
     // The mark is the state, so filling the file has to clear it. Leaving it set
     // would leave a full file that every reader is told is empty.
     mark_dehydrated(path, false)?;
+    // The acquisition time for the auto-eviction ranking — recorded here too, so a
+    // completed fill through *any* of the three paths (this, `hydrate_fd`,
+    // `finish_hydration`) records it and the signal never disagrees between them.
+    // Through the fd we already hold, best-effort; a failed timestamp is not a
+    // failed hydration.
+    let _ = hydration_protocol::hydrated::write_fd(std::os::fd::AsFd::as_fd(&file));
     Ok(())
 }
 
@@ -280,6 +286,12 @@ pub fn hydrate_fd(
     // reader is entitled to it. It costs an unnecessary upload later, which is
     // the harmless direction.
     let _ = hydration_protocol::stamp::write_fd(fd);
+    // And *when* we brought it down, for the auto-eviction recency ranking. The
+    // acquisition moment is exactly here — the placeholder is now fully resident,
+    // both ways in (this and `finish_hydration`) so the signal does not disagree
+    // between them. Same best-effort, same fd, same no-event metadata write as
+    // the stamp above; a failed timestamp is not a failed hydration.
+    let _ = hydration_protocol::hydrated::write_fd(fd);
     Ok(())
 }
 
@@ -466,6 +478,11 @@ pub fn finish_hydration(fd: std::os::fd::BorrowedFd<'_>, expected: u64) -> io::R
         Err(e) => return Err(e),
     }
     let _ = hydration_protocol::stamp::write_fd(fd);
+    // The acquisition timestamp for the auto-eviction recency ranking — the
+    // streamed twin of the record in `hydrate_fd`, recorded only on the completed
+    // fill (`have.covers(whole)`), never in `settle_range`, which leaves the file
+    // a marked placeholder and so not an eviction candidate at all.
+    let _ = hydration_protocol::hydrated::write_fd(fd);
     Ok(())
 }
 
