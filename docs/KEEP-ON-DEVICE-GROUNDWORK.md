@@ -512,12 +512,14 @@ Ordered by how much rests on it.
   mechanism anywhere. (Still worth a one-line assertion that `setxattr` fires zero
   pre-content events when the pin verb is wired, so §1.2's no-deadlock claim is a test, not
   only a citation.)
-- **P4 — servicemenu `inode/directory` matching on this KIO build.** Still open — a product
-  packaging question, not a code gate. Re-run `probes/servicemenu-match.cpp` with
-  `MimeType=all/allfiles;inode/directory;`: does the entry reach directories, does it survive
-  a multi-file selection, what happens on a mixed file+directory selection. `all/allfiles`
-  was measured; `inode/directory` has not been. Needed before the §3.3 servicemenu entry
-  ships, not before the framework verbs.
+- **P4 — servicemenu `inode/directory` matching on this KIO build. DONE — measured on
+  KIO 6.28 with `probes/servicemenu-match.cpp` (in the OneDriveHydration product).**
+  `MimeType=inode/directory;` reaches a directory and **not** a regular file, survives a
+  multi-directory selection, and matches nothing for a mixed file+directory selection — the
+  mirror of `all/allfiles;` for files. Consequence for §3.3: the file and folder cases ship
+  as **two** menu entries, not one shared `all/allfiles;inode/directory;` entry, so that only
+  Keep on Device — never Free Up Space — reaches a folder. Verified against the real installed
+  menus: a file offers both actions, a directory offers only Keep on Device.
 
 ## 7. What this deliberately does not do
 
