@@ -724,7 +724,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // The upload driver keeps its own store: a held upload must never block a
     // status query behind a shared lock.
     {
-        let (q, stop, mount, access, resync, delta_busy, folder_refresh, folder_retry) = (
+        let (q, stop, mount, access, resync, delta_busy, folder_refresh, tracked, folder_retry) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             config.mount.clone(),
@@ -732,6 +732,10 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             Arc::clone(&resync),
             Arc::clone(&delta_busy),
             Arc::clone(&folder_refresh),
+            // The placeholder count, an always-current proxy for the tree size,
+            // so a removal batch is measured against the whole and a wrong root's
+            // total disappearance can be told from a folder's partial one.
+            Arc::clone(&excluded),
             std::cmp::max(config.debounce, Duration::from_secs(1)),
         );
         std::thread::spawn(move || {
@@ -963,7 +967,8 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     renames_pending.extend(local.renamed);
                     folders_gone_pending.extend(local.folders_gone);
                     if !local.gone.is_empty() {
-                        apply_removals(&mount, &local.gone, &recent, &mut sink);
+                        let known = tracked.load(Ordering::SeqCst) as usize;
+                        apply_removals(&mount, &local.gone, &recent, known, &mut sink);
                     }
                 }
                 if !delta_busy.load(Ordering::SeqCst) {
@@ -972,7 +977,8 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         renames_pending.clear();
                     }
                     if !folders_gone_pending.is_empty() {
-                        apply_folder_removals(&folders_gone_pending, &mut sink);
+                        let known = tracked.load(Ordering::SeqCst) as usize;
+                        apply_folder_removals(&folders_gone_pending, known, &mut sink);
                         folders_gone_pending.clear();
                     }
                     if !folders_pending.is_empty() && std::time::Instant::now() >= next_folder_retry
@@ -1446,7 +1452,34 @@ const POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 /// even then the content reconciliation in the Graph sink recovers it.
 const WALK_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
 
-const REMOVAL_BATCH_LIMIT: usize = 100;
+/// The floor on how many objects one batch may withdraw from the cloud before
+/// it is refused and the user asked, whatever the size of the tree.
+///
+/// The ratio below is the part that matters for trees; the floor only keeps a
+/// small account able to delete a handful without a fight.
+const REMOVAL_FLOOR: usize = 64;
+
+/// A batch larger than a tree's-worth over this is refused.
+///
+/// `known / 10`, so a tenth of the tree. This is `guard_blast_radius`'s shape,
+/// deliberately, because it defends the same thing from the other side: a wrong
+/// or rebuilt root makes *everything* "gone", and everything is far more than a
+/// tenth, so it is refused — while a real folder, thousands of files that are
+/// still a small fraction of a large account, is let through. The flat cap this
+/// replaces refused a folder of more than a hundred files outright, so a
+/// non-empty tree could not be deleted at all on any account big enough to have
+/// one.
+const REMOVAL_RATIO: usize = 10;
+
+/// The most one removal batch may withdraw, given the tree it is part of.
+///
+/// A whole-root disappearance is above it and a contained subtree is below it,
+/// which is the one distinction the flat cap could not make. See
+/// [`REMOVAL_FLOOR`] and [`REMOVAL_RATIO`], and `guard_blast_radius`, whose
+/// shape this is.
+fn removal_ceiling(known: usize) -> usize {
+    std::cmp::max(REMOVAL_FLOOR, known / REMOVAL_RATIO)
+}
 
 /// How many just-sent objects the upload driver remembers for the removal path.
 ///
@@ -1554,10 +1587,13 @@ impl Registers {
 /// Two guards beyond the co-location:
 ///   * an object still on disk under a *different* path moved rather than
 ///     vanished, and is not withdrawn — an offline `mv` inside the root;
-///   * a disappearance larger than [`REMOVAL_BATCH_LIMIT`] is refused whole and
-///     said out loud. A hundred files gone at once is a large `rm -rf` the user
-///     should confirm with the daemon running, or a residual wrong-root the
-///     co-location did not catch. Either way it is not withdrawn unasked.
+///   * a disappearance larger than [`removal_ceiling`] of the journal is refused
+///     whole and said out loud. The ceiling is proportional — a tenth of the
+///     tree, floored — so a deleted folder, thousands of files that are still a
+///     small fraction of a large account, is withdrawn, while a wrong or
+///     unmounted root, where *everything* is gone, is not. A flat cap could not
+///     tell those apart, and so a non-empty folder could not be deleted offline
+///     at all on any account big enough to have one.
 fn detect_offline_removals(root: &std::path::Path) -> Vec<(String, String)> {
     // The presence journal, both halves, co-located in the sync root.
     let mut journal: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -1570,6 +1606,10 @@ fn detect_offline_removals(root: &std::path::Path) -> Vec<(String, String)> {
     if journal.is_empty() {
         return Vec::new();
     }
+    // The tree the disappearance is measured against — the whole of what the
+    // last run recorded. A deleted folder is a fraction of it; a wrong root is
+    // all of it.
+    let known = journal.len();
 
     // What is here now, and which objects sit on any path, so an offline move is
     // not read as a deletion.
@@ -1582,10 +1622,12 @@ fn detect_offline_removals(root: &std::path::Path) -> Vec<(String, String)> {
         .collect();
     gone.sort();
 
-    if gone.len() > REMOVAL_BATCH_LIMIT {
+    let ceiling = removal_ceiling(known);
+    if gone.len() > ceiling {
         eprintln!(
-            "hydration-sync: {} files recorded here are gone since the daemon last ran — more \
-             than it will withdraw from the cloud without being asked ({REMOVAL_BATCH_LIMIT}). \
+            "hydration-sync: {} of {known} files recorded here are gone since the daemon last \
+             ran — more than the {ceiling} it will withdraw from the cloud without being asked, \
+             which is the shape of a wrong or unmounted root rather than a deleted folder. \
              Nothing was removed; they are still in the cloud and will return as placeholders. \
              If you deleted them on purpose, delete them again with the daemon running. First \
              few: {}",
@@ -1900,14 +1942,16 @@ fn apply_removals<S: Sink>(
     root: &std::path::Path,
     gone: &[crate::removals::Gone],
     recent: &std::collections::HashMap<String, String>,
+    known: usize,
     sink: &mut S,
 ) {
-    if gone.len() > REMOVAL_BATCH_LIMIT {
+    let ceiling = removal_ceiling(known);
+    if gone.len() > ceiling {
         eprintln!(
-            "hydration-sync: {} files were deleted here at once, which is more than this \
-             will remove from the cloud without being asked ({REMOVAL_BATCH_LIMIT}). \
-             Nothing was removed; the files are still in the cloud and will come back \
-             on the next delta pass. First few: {}",
+            "hydration-sync: {} files were deleted here at once, which is more than the \
+             {ceiling} this will remove from the cloud without being asked (a tenth of the \
+             {known} it is tracking). Nothing was removed; the files are still in the cloud \
+             and will come back on the next delta pass. First few: {}",
             gone.len(),
             gone.iter()
                 .take(5)
@@ -1970,12 +2014,17 @@ fn apply_removals<S: Sink>(
 
 /// Withdraw directories only through the provider's explicit empty-folder
 /// contract. A generic object delete is intentionally unavailable here.
-fn apply_folder_removals<S: Sink>(gone: &[crate::removals::FolderGone], sink: &mut S) {
-    if gone.len() > REMOVAL_BATCH_LIMIT {
+fn apply_folder_removals<S: Sink>(
+    gone: &[crate::removals::FolderGone],
+    known: usize,
+    sink: &mut S,
+) {
+    let ceiling = removal_ceiling(known);
+    if gone.len() > ceiling {
         eprintln!(
-            "hydration-sync: {} folders were deleted here at once, which is more than this \
-             will remove from the cloud without being asked ({REMOVAL_BATCH_LIMIT}). Nothing \
-             was removed; first few: {}",
+            "hydration-sync: {} folders were deleted here at once, which is more than the \
+             {ceiling} this will remove from the cloud without being asked (a tenth of the \
+             {known} it is tracking). Nothing was removed; first few: {}",
             gone.len(),
             gone.iter()
                 .take(5)
@@ -2504,6 +2553,7 @@ mod tests {
                 moved_out: false,
             }],
             &std::collections::HashMap::new(),
+            0,
             &mut sink,
         );
 
@@ -2536,6 +2586,7 @@ mod tests {
                     }),
                 },
             ],
+            0,
             &mut sink,
         );
 
@@ -2569,6 +2620,7 @@ mod tests {
                     }),
                 },
             ],
+            0,
             &mut sink,
         );
 
@@ -2579,7 +2631,8 @@ mod tests {
 
     #[test]
     fn an_oversized_folder_delete_batch_is_all_or_nothing() {
-        let gone: Vec<_> = (0..=REMOVAL_BATCH_LIMIT)
+        // One over the floor, with nothing tracked, so the ceiling is the floor.
+        let gone: Vec<_> = (0..=REMOVAL_FLOOR)
             .map(|index| crate::removals::FolderGone {
                 path: format!("folder-{index}"),
                 moved_out: false,
@@ -2591,7 +2644,7 @@ mod tests {
             .collect();
         let mut sink = DeleteSink::default();
 
-        apply_folder_removals(&gone, &mut sink);
+        apply_folder_removals(&gone, 0, &mut sink);
 
         assert!(sink.folders.is_empty());
         assert!(sink.known.is_empty());
@@ -2917,17 +2970,17 @@ mod tests {
         assert!(detect_offline_removals(&root).is_empty());
     }
 
-    /// A disappearance larger than the cap is refused whole, not withdrawn.
+    /// A whole-root disappearance is refused: everything gone is a wrong or
+    /// unmounted root, never a deleted folder.
     ///
-    /// A hundred files gone at once is a large `rm -rf` the user should confirm
-    /// with the daemon running, or a wrong root the co-location did not catch.
-    /// Either way it is the one shape that must never be propagated unasked.
+    /// The whole journal is gone here, which is above the ceiling however large
+    /// the tree — the one shape that must never be propagated unasked.
     #[test]
-    fn a_disappearance_past_the_cap_is_refused() {
-        let root = scratch("offline/blast-radius");
+    fn a_whole_root_disappearance_is_refused() {
+        let root = scratch("offline/whole-root");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let entries: Vec<(String, String)> = (0..REMOVAL_BATCH_LIMIT + 1)
+        let entries: Vec<(String, String)> = (0..REMOVAL_FLOOR * 2)
             .map(|i| (format!("f{i}.txt"), format!("id{i}")))
             .collect();
         let refs: Vec<(&str, &str)> = entries
@@ -2935,11 +2988,59 @@ mod tests {
             .map(|(p, i)| (p.as_str(), i.as_str()))
             .collect();
         write_manifest(&root, &refs);
-        // None placed: every one recorded, every one gone.
+        // Nothing placed: every recorded file is gone. That is the catastrophe
+        // shape, and it is refused whatever the tree size.
         assert!(
             detect_offline_removals(&root).is_empty(),
-            "{} files gone at once were withdrawn without being asked",
-            REMOVAL_BATCH_LIMIT + 1
+            "a whole-root disappearance was withdrawn without being asked"
+        );
+    }
+
+    /// The point of the proportional guard: a non-empty folder — many more files
+    /// than the old flat cap — is withdrawn, because it is a small fraction of
+    /// the tree rather than the whole of it.
+    ///
+    /// A two-thousand-file journal with a hundred and fifty gone under one
+    /// folder: past the hundred the flat cap refused, but under a tenth of the
+    /// tree, so the deletion propagates.
+    #[test]
+    fn a_large_folder_that_is_a_small_fraction_is_withdrawn() {
+        let root = scratch("offline/large-folder");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut journal: Vec<(String, String)> = Vec::new();
+        // 1850 files elsewhere, all present.
+        for i in 0..1850 {
+            journal.push((format!("Other/f{i}.txt"), format!("keep{i}")));
+        }
+        // 150 files under one folder, all deleted — more than the old cap of 100,
+        // but a fifteenth of the 2000-file tree.
+        for i in 0..150 {
+            journal.push((format!("Photos/2024/p{i}.jpg"), format!("gone{i}")));
+        }
+        let refs: Vec<(&str, &str)> = journal
+            .iter()
+            .map(|(p, i)| (p.as_str(), i.as_str()))
+            .collect();
+        write_manifest(&root, &refs);
+        // Place only the 1850 that were kept.
+        for i in 0..1850 {
+            place(&root, &format!("Other/f{i}.txt"), &format!("keep{i}"));
+        }
+
+        let candidates = detect_offline_removals(&root);
+        assert_eq!(
+            candidates.len(),
+            150,
+            "a 150-file folder, a fifteenth of a 2000-file tree, was not withdrawn — the flat \
+             cap that refused it is exactly what makes deleting a non-empty folder impossible"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|(p, _)| p.starts_with("Photos/2024/")),
+            "the withdrawal reached outside the deleted folder"
         );
     }
 }
