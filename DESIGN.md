@@ -583,7 +583,9 @@ it be silent.
 
 **5. No ready-made eviction policy.** The kernel does not tell us under disk pressure that it
 wants space back. We have to implement dehydration (`FALLOC_FL_PUNCH_HOLE` + removing the
-ignore mark) under our own policy — LRU, quota, or manual choice.
+ignore mark) under our own policy — LRU, quota, or manual choice. *Now built* (§6h,
+`docs/AUTO-EVICTION-GROUNDWORK.md`): a disk-pressure sweep ranked by last acquisition, since
+`noatime` leaves no last-use signal — off by default, honoring the pin.
 
 **What would kernel code have bought?** Realistically only points 1 and 5, and both are small
 gains. A new filesystem or a netfs extension would have given us `fs/netfs`'s subrequests and
@@ -1332,7 +1334,19 @@ The trigger lives in the running daemon, not in the tool, and that is the point:
 
 `pin <path>` / `unpin <path>` ride the same control socket as `evict`, for the same reason and with the same containment: a pin names a file, so §6b keeps it off the privileged side, and `reclaim::set_pin` resolves the untrusted path through `safe_join` and then the filesystem exactly as `reclaim` does — except it accepts a directory, because a folder pin protects its subtree. The pin is a single `user.hydration.pinned` xattr, presence-only like the dehydrated mark; setting it fires no pre-content event, so it is safe from any process — §6a-ter is about content, not metadata.
 
-Eviction honors it in one place — `reclaim`, the chokepoint both the manual path and any future auto-eviction policy pass through — as a refusal (`Refused::Pinned`) taken before the inode is swapped. A file is pinned if it, or any directory up to the sync root, carries the mark: the inheritance is an ancestor-walk at decision time, never a bit stamped on every child, so a file that arrives later under a pinned folder is covered with nothing written to it. Forging the mark is benign for the same reason the stamp's is — it can only make the framework *keep* content, never destroy it — so it must not be hardened into something that fails closed. The full design, and the §6a-ter measurement that a third-party read is the deadlock-safe way to hydrate on demand, is [`docs/KEEP-ON-DEVICE-GROUNDWORK.md`](docs/KEEP-ON-DEVICE-GROUNDWORK.md).
+Eviction honors it in one place — `reclaim`, the chokepoint both the manual path and the auto-eviction policy below pass through — as a refusal (`Refused::Pinned`) taken before the inode is swapped. A file is pinned if it, or any directory up to the sync root, carries the mark: the inheritance is an ancestor-walk at decision time, never a bit stamped on every child, so a file that arrives later under a pinned folder is covered with nothing written to it. Forging the mark is benign for the same reason the stamp's is — it can only make the framework *keep* content, never destroy it — so it must not be hardened into something that fails closed. The full design, and the §6a-ter measurement that a third-party read is the deadlock-safe way to hydrate on demand, is [`docs/KEEP-ON-DEVICE-GROUNDWORK.md`](docs/KEEP-ON-DEVICE-GROUNDWORK.md).
+
+### Auto-eviction: the sweep the pin protects against
+
+The counterpart to Keep on Device, and what §6 point 5 called for: when local disk falls under pressure the unprivileged daemon dehydrates the least-wanted unpinned files back to placeholders, re-hydrated on next read. It adds a *selector* above `reclaim` and no second eviction path — a fifth daemon thread loops `reclaim::reclaim`, so it inherits every refusal (`NotUploaded`, `ChangedSinceUpload`, `UploadPending`, `Pinned`) for free, and §6a-ter stays avoided because eviction is the anonymous-inode swap, not a punch.
+
+Three things are measured rather than assumed, and each shaped the design:
+
+- **There is no last-*use* signal.** The mount is `noatime`, and a resident file carries a surviving ignore mark, so re-reads fire no event. The best obtainable is last-*acquisition*: a per-device `user.hydration.hydrated_at` xattr written fd-only in `finish_hydration` beside the stamp (a metadata write, no event), ranked oldest-first with `mtime` as the fallback. The honest limit — a file fetched long ago and read daily looks identical to one fetched long ago and never touched — is bounded latency, not data loss: a mis-eviction re-hydrates on next read, and the pin is the escape hatch for the file the heuristic keeps guessing wrong about.
+- **`statvfs` is coarse and lags** (`probes/statvfs-lag.c`): on the live btrfs pool it reports the whole filesystem, moves only in ~1 GiB steps, and registers a delete on the transaction commit rather than the `unlink`. So the sweep is sized by `reclaim`'s block-accurate reclaimed bytes, and the `statvfs` re-read only re-arms the trigger between sweeps — chasing it per file would over-evict.
+- **The trigger is two watermarks with hysteresis**, so a single threshold cannot oscillate, with a grace floor (a just-acquired file is in use) and a per-sweep cap. Off by default: auto-destroying local availability is a surprising default, so the field is `None` until the product turns it on, and the thread does not exist while it is off.
+
+The full design, with the measurements and the verbatim critique, is [`docs/AUTO-EVICTION-GROUNDWORK.md`](docs/AUTO-EVICTION-GROUNDWORK.md).
 
 ---
 
@@ -1450,7 +1464,6 @@ One user, one account, one machine — but correct.
   removes a whole class of partial-content bugs. Range-based is an optimization for
   later, when there is measurement data that justifies it.
 - Multi-account, shared folders, bandwidth limits, encryption — as you said.
-- Automatic eviction on disk pressure.
 - Filesystems other than ext4/btrfs/xfs.
 
 ---
