@@ -111,6 +111,7 @@ fn main() -> io::Result<()> {
             mount: args.mount,
             socket: args.socket,
             debounce: args.debounce,
+            eviction: None,
         },
         access,
     )
