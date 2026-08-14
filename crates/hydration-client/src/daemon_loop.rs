@@ -506,6 +506,10 @@ impl Watchers {
 ///   fire no pre-content event, need no privilege, and never reach the helper.
 ///   The reply is `pinned` / `unpinned`, or `error: <why>` for a path outside
 ///   the sync directory.
+/// - `pending <dir>` — the dehydrated files under a directory, one relative
+///   path per line (empty if none), for a caller about to hydrate each. Reads
+///   no content: a directory walk and one `getxattr` per file, skipping the
+///   framework's own names and not following symlinks.
 /// - `watch` — one state line immediately, another every time the state
 ///   changes, and nothing else ever, until the peer disconnects. A state line
 ///   is `key=value` pairs joined by single spaces, newline-terminated,
@@ -579,6 +583,19 @@ fn control(
                     // request.
                     match reclaim::set_pin(&mount, arg, verb == "pin") {
                         Ok(Ok(())) => if verb == "pin" { "pinned" } else { "unpinned" }.to_string(),
+                        Ok(Err(why)) => format!("error: {why:?}"),
+                        Err(e) => format!("error: {e}"),
+                    }
+                }
+                "pending" => {
+                    // A content-free enumeration: the dehydrated files under a
+                    // directory, one relative path per line, for a caller about
+                    // to hydrate each in its own process — the reads must not
+                    // happen here (§6a-ter). An empty list is a valid answer;
+                    // `writeln!` below still sends a newline, so the client does
+                    // not read the reply as dropped.
+                    match reclaim::pending(&mount, arg) {
+                        Ok(Ok(paths)) => paths.join("\n"),
                         Ok(Err(why)) => format!("error: {why:?}"),
                         Err(e) => format!("error: {e}"),
                     }
@@ -2859,6 +2876,86 @@ mod tests {
             ask("pin ../../etc/passwd").starts_with("error:"),
             "pin obeyed a path outside the sync directory"
         );
+    }
+
+    /// `pending <dir>` lists the dehydrated files under a directory over the
+    /// socket, one relative path per line — the multi-line reply the folder
+    /// hydrate path reads whole. An empty subtree comes back empty, not as a
+    /// dropped connection.
+    #[test]
+    fn pending_lists_dehydrated_files_over_the_socket() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let dir = ctl_scratch("pending-socket");
+        let mount = dir.join("m");
+        let tree = mount.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        // The mark is what `pending` reads; two marked files and one plain one.
+        for name in ["a.bin", "b.bin"] {
+            let p = tree.join(name);
+            std::fs::write(&p, b"").unwrap();
+            crate::store::set_xattr(&p, hydration_protocol::xattr::DEHYDRATED, b"1").unwrap();
+        }
+        std::fs::write(tree.join("resident.txt"), b"here").unwrap();
+        let empty = mount.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let sock = dir.join("ctl");
+
+        let queue = Arc::new(Mutex::new(Queue::new(
+            Duration::from_secs(900),
+            SystemClock::default(),
+        )));
+        let exposures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let excluded = Arc::new(AtomicU64::new(0));
+        let watchers = Arc::new(Watchers::default());
+        {
+            let (s, m, q, e, x, w) = (
+                sock.clone(),
+                mount.clone(),
+                Arc::clone(&queue),
+                Arc::clone(&exposures),
+                Arc::clone(&excluded),
+                Arc::clone(&watchers),
+            );
+            std::thread::spawn(move || control(&s, m, q, e, x, w));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // Reads the *whole* reply, not one line — a `pending` answer is
+        // multi-line — by shutting down the write half first, exactly as the
+        // product's control_request does.
+        let ask = |line: &str| -> String {
+            let mut c = loop {
+                match UnixStream::connect(&sock) {
+                    Ok(c) => {
+                        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        break c;
+                    }
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(e) => panic!("could not connect: {e}"),
+                }
+            };
+            writeln!(c, "{line}").unwrap();
+            c.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut reply = String::new();
+            c.read_to_string(&mut reply).unwrap();
+            reply.trim_end_matches('\n').to_string()
+        };
+
+        let mut lines: Vec<String> = ask("pending tree")
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec!["tree/a.bin".to_string(), "tree/b.bin".to_string()]
+        );
+
+        assert_eq!(ask("pending empty"), "", "an empty subtree lists nothing");
     }
 
     /// The contract's quietest clause: an unchanged tuple emits nothing. A

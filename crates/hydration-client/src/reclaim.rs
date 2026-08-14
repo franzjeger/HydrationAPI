@@ -283,6 +283,72 @@ pub fn set_pin(root: &Path, rel: &str, on: bool) -> io::Result<Result<(), Refuse
     Ok(Ok(()))
 }
 
+/// List the dehydrated regular files under a confined directory, as paths
+/// relative to the sync root — the enumeration half of a folder "Keep on
+/// Device", kept in the daemon so the reads that follow can happen one at a time
+/// in a third-party process (§6a-ter), not here.
+///
+/// Content-free: it reads directory entries and one `getxattr` per file, and
+/// never opens a file — so listing a subtree does not hydrate any of it. The
+/// framework's own names are skipped at every depth (`names::is_internal`), and
+/// symlinks are not followed, so the walk cannot be led outside the subtree the
+/// confinement already fixed. A name a line cannot carry (one with a newline) is
+/// left off rather than corrupting the list; such a file stays hydratable on its
+/// own.
+pub fn pending(root: &Path, rel: &str) -> io::Result<Result<Vec<String>, Refused>> {
+    let Some(joined) = crate::delta::safe_join(root, rel) else {
+        return Ok(Err(Refused::NotEligible(format!(
+            "{rel:?} is not a path inside the sync directory"
+        ))));
+    };
+    let (Ok(real), Ok(real_root)) = (joined.canonicalize(), root.canonicalize()) else {
+        return Ok(Err(Refused::NotEligible(
+            "could not resolve the path".to_string(),
+        )));
+    };
+    if !real.starts_with(&real_root) {
+        return Ok(Err(Refused::NotEligible(
+            "resolves outside the sync directory".to_string(),
+        )));
+    }
+    if !real.is_dir() {
+        return Ok(Err(Refused::NotEligible("not a directory".to_string())));
+    }
+    let mut out = Vec::new();
+    collect_dehydrated(&real, &real_root, &mut out)?;
+    // Sorted so the order is a property of the tree, not of readdir: a caller
+    // hydrating top-down, and a test asserting on the list, both want it stable.
+    out.sort();
+    Ok(Ok(out))
+}
+
+/// Depth-first, skipping the framework's own files and not following symlinks.
+fn collect_dehydrated(dir: &Path, root: &Path, out: &mut Vec<String>) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if hydration_protocol::names::is_internal(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_dehydrated(&path, root, out)?;
+        } else if file_type.is_file()
+            && store::get_xattr(&path, hydration_protocol::xattr::DEHYDRATED)?.is_some()
+        {
+            if let Ok(rel) = path.strip_prefix(root) {
+                let rel = rel.to_string_lossy();
+                if !rel.contains(['\n', '\r']) {
+                    out.push(rel.into_owned());
+                }
+            }
+        }
+        // A symlink is neither `is_dir` nor `is_file` here, so it is skipped —
+        // the walk never leaves the subtree the confinement fixed.
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,5 +741,66 @@ mod tests {
                 "{arg:?} was not refused by set_pin: {out:?}"
             );
         }
+    }
+
+    /// A dehydrated placeholder, for `pending`'s purposes, is a file that carries
+    /// the mark — the mark is what "is a placeholder" means, and `pending` reads
+    /// it, never the block layout.
+    fn dehydrated(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, b"").unwrap();
+        store::set_xattr(&p, hydration_protocol::xattr::DEHYDRATED, b"1").unwrap();
+        p
+    }
+
+    /// `pending` lists the dehydrated regular files under a directory, relative
+    /// to the sync root and at any depth — and lists nothing else: not a hydrated
+    /// file, not a directory, and not the framework's own names *even when one is
+    /// marked* (the is_internal skip is by name, so it holds regardless).
+    #[test]
+    fn pending_lists_only_dehydrated_regular_files_and_skips_internal_names() {
+        let dir = scratch("pending-list");
+        let sub = dir.join("tree/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        dehydrated(&dir.join("tree"), "a.bin");
+        dehydrated(&sub, "b.bin");
+        // A hydrated file (no mark) must not appear...
+        std::fs::write(dir.join("tree/resident.txt"), b"present").unwrap();
+        // ...and an internal name must not appear even when it carries the mark.
+        let manifest = dehydrated(&dir.join("tree"), hydration_protocol::names::MANIFEST);
+        let _ = manifest;
+
+        let got = match pending(&dir, "tree").unwrap() {
+            Ok(v) => v,
+            other => panic!("pending refused a real directory: {other:?}"),
+        };
+        assert_eq!(
+            got,
+            vec!["tree/a.bin".to_string(), "tree/sub/b.bin".to_string()]
+        );
+    }
+
+    /// `pending` is confined exactly like the other verbs, and it takes a
+    /// directory — the escapes that cannot evict cannot enumerate, and a plain
+    /// file is refused rather than silently returning nothing.
+    #[test]
+    fn pending_confines_to_the_subtree_and_wants_a_directory() {
+        let dir = scratch("pending-confine");
+        for arg in ["../..", "/etc", "..", ".hydration-manifest", "\u{0}x"] {
+            let out = pending(&dir, arg);
+            assert!(
+                matches!(out, Ok(Err(Refused::NotEligible(_))) | Err(_)),
+                "{arg:?} was not refused by pending: {out:?}"
+            );
+        }
+        dehydrated(&dir, "lonely.bin");
+        assert!(
+            matches!(
+                pending(&dir, "lonely.bin"),
+                Ok(Err(Refused::NotEligible(_)))
+            ),
+            "pending accepted a file where it needs a directory"
+        );
     }
 }
