@@ -18,6 +18,7 @@
 //! *listener* can do is serve content for files it already had access to.
 
 use crate::delta::{self, Applied, Cursor, Discover};
+use crate::evict_policy::{Clock, EvictionConfig, FreeSpace, RealClock, StatvfsSpace};
 use crate::manifest::{BackupPolicy, Manifest};
 use crate::place::TmpfilePlacer;
 use crate::reclaim;
@@ -26,7 +27,7 @@ use crate::upload::{run_upload, Known, Outcome, Queue, Sink, SystemClock, Upload
 use crate::{Changes, Daemon, Provider};
 use hydration_protocol::transport::DaemonConn;
 use hydration_protocol::FileId;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -71,6 +72,12 @@ pub struct Config {
     pub socket: PathBuf,
     /// How long a file must sit still before it is sent.
     pub debounce: Duration,
+    /// Auto-eviction policy, or `None` to leave it off — the default, byte-for-
+    /// byte today's behaviour. When `Some`, a background thread dehydrates the
+    /// least-recently-acquired unpinned files under disk pressure. Off unless the
+    /// product turns it on, because auto-destroying local availability is a
+    /// surprising default; the pin is the user's opt-out for a file it keeps.
+    pub eviction: Option<crate::evict_policy::EvictionConfig>,
 }
 
 /// Hand out one role, without letting the factory itself become shared state.
@@ -646,6 +653,49 @@ fn control(
         }
     }
     Ok(())
+}
+
+/// One auto-eviction sweep: enumerate residents, plan under the current pressure,
+/// and reclaim the plan — skipping anything the queue is uploading. Returns bytes
+/// freed (a lower bound; `reclaim` measures each `st_blocks` delta).
+///
+/// The disk state (`available`/`total`), `now`, and the queue snapshot are read
+/// by the caller and passed in, so this stays a testable unit: a test drives a
+/// scratch mount, an explicit disk pressure, and an explicit `sending` set with
+/// no thread, no statvfs, and no real clock. `reclaim` stays the sole authority —
+/// a file that raced into the queue after the snapshot is still refused by its
+/// live `UploadPending`/`ChangedSinceUpload` checks, which is why this loops
+/// `reclaim` rather than trusting the enumerator's pre-filter.
+fn plan_and_reclaim(
+    mount: &std::path::Path,
+    cfg: &EvictionConfig,
+    available: u64,
+    total: u64,
+    now: u64,
+    waiting: &HashSet<FileId>,
+    sending: &HashSet<FileId>,
+) -> io::Result<u64> {
+    let (low, _) = cfg.marks(total);
+    if available >= low {
+        return Ok(0); // common path: no pressure, no walk beyond this.
+    }
+    let candidates = reclaim::evictable_candidates(mount)?;
+    let plan = crate::evict_policy::plan(candidates, available, total, cfg, now);
+
+    // One scanned Store reused across the batch — reclaim only uses it to forget
+    // the swapped-out inode.
+    let mut store = Store::new();
+    let _ = store.scan(mount);
+
+    let mut freed = 0u64;
+    for rel in plan {
+        // A refusal (raced upload, a fresh edit, a pin set mid-sweep) is a skip,
+        // not a failure: the point of looping reclaim is that it re-checks.
+        if let Ok(Ok(r)) = reclaim::reclaim(mount, &rel, &mut store, waiting, sending) {
+            freed = freed.saturating_add(r.bytes);
+        }
+    }
+    Ok(freed)
 }
 
 /// Run the daemon until the helper socket stops accepting.
@@ -1321,6 +1371,72 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
         std::thread::spawn(move || {
             if let Err(e) = control(&ctl, mount, q, ex, exc, ws) {
                 eprintln!("hydration-sync: control socket unavailable: {e}");
+            }
+        });
+    }
+
+    // Auto-eviction, only when the product turned it on. The thread does not even
+    // exist while the policy is off, so an "off" daemon never wakes to sample a
+    // disk it will never act on — "off" is off, not merely idle.
+    if let Some(evict_cfg) = config.eviction {
+        let (mount, stop, delta_busy, queue) = (
+            config.mount.clone(),
+            Arc::clone(&stop),
+            Arc::clone(&delta_busy),
+            Arc::clone(&queue),
+        );
+        std::thread::spawn(move || {
+            let free = StatvfsSpace {
+                mount: mount.clone(),
+            };
+            let clock = RealClock;
+            let interval = evict_cfg.min_interval_secs.max(1);
+            while !stop.load(Ordering::SeqCst) {
+                // The interval in one-second slices, so `stop` is prompt.
+                for _ in 0..interval {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                // Never fight a delta pass materialising placeholders over the
+                // same tree, exactly as the upload thread gates its writes.
+                if delta_busy.load(Ordering::SeqCst) {
+                    continue;
+                }
+                // Cheap unless something is happening: one `statvfs`, and only
+                // below the low mark do we walk and evict. P1 measured `f_bavail`
+                // coarse and lagging a delete until the commit, so the sweep sizes
+                // its batch by `reclaim`'s block-accurate bytes and this re-read
+                // only re-arms the trigger on the next tick.
+                let (Ok(available), Ok(total)) = (free.available(), free.total()) else {
+                    continue;
+                };
+                let (low, _) = evict_cfg.marks(total);
+                if available >= low {
+                    continue;
+                }
+                // Snapshot the queue as the evict verb does — lock only long
+                // enough to copy the two sets, never across the walk.
+                let (waiting, sending) = {
+                    let q = queue.lock().unwrap();
+                    (q.waiting_set(), q.sending_set())
+                };
+                match plan_and_reclaim(
+                    &mount,
+                    &evict_cfg,
+                    available,
+                    total,
+                    clock.now_secs(),
+                    &waiting,
+                    &sending,
+                ) {
+                    Ok(freed) if freed > 0 => {
+                        eprintln!("hydration-sync: auto-eviction freed {freed} bytes")
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("hydration-sync: auto-eviction sweep failed: {e}"),
+                }
             }
         });
     }
@@ -2956,6 +3072,95 @@ mod tests {
         );
 
         assert_eq!(ask("pending empty"), "", "an empty subtree lists nothing");
+    }
+
+    /// A pressure sweep evicts an evictable resident and — the safety line —
+    /// leaves alone a file the queue is uploading. The `sending` snapshot is how
+    /// the delete-during-upload hazard is closed: replacing an in-flight file's
+    /// inode would make the upload delete the object it just created.
+    #[test]
+    fn a_sweep_evicts_a_resident_but_skips_an_uploading_file() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = ctl_scratch("evict-sweep");
+        let mount = dir.join("m");
+        std::fs::create_dir_all(&mount).unwrap();
+
+        let synced = |name: &str, body: &[u8]| -> (std::path::PathBuf, FileId) {
+            let p = mount.join(name);
+            std::fs::write(&p, body).unwrap();
+            crate::store::set_xattr(&p, crate::store::XATTR_ID, b"cloud-1").unwrap();
+            hydration_protocol::stamp::write(&p).unwrap();
+            let md = std::fs::metadata(&p).unwrap();
+            (
+                p,
+                FileId {
+                    fsid: md.dev(),
+                    ino: md.ino(),
+                },
+            )
+        };
+        let (a, _) = synced("a.bin", &vec![b'a'; 8192]);
+        let (b, b_id) = synced("b.bin", &vec![b'b'; 8192]);
+
+        // Both are candidates; high is huge so plan wants both, and reclaim is
+        // left to refuse the one being uploaded.
+        let cfg = crate::evict_policy::EvictionConfig {
+            low_pct: 100,
+            low_abs: 100,
+            high_pct: 100,
+            high_abs: 1_000_000,
+            grace_secs: 0,
+            sweep_cap: 1_000_000,
+            min_interval_secs: 0,
+        };
+        let sending: HashSet<FileId> = std::iter::once(b_id).collect();
+        // available 0 < low 100 -> under pressure.
+        let freed =
+            plan_and_reclaim(&mount, &cfg, 0, 1000, 10_000, &HashSet::new(), &sending).unwrap();
+
+        let dehydrated = |p: &std::path::Path| {
+            crate::store::get_xattr(p, hydration_protocol::xattr::DEHYDRATED)
+                .unwrap()
+                .is_some()
+        };
+        assert!(dehydrated(&a), "the evictable resident was not dehydrated");
+        assert!(!dehydrated(&b), "a file being uploaded was evicted");
+        assert!(freed > 0, "the sweep reported no bytes freed");
+    }
+
+    /// Above the low mark there is no pressure, so the sweep is a single
+    /// `statvfs`-shaped no-op: it evicts nothing and does not even walk. This is
+    /// the common path, and the idempotence a second sweep at target must have.
+    #[test]
+    fn a_sweep_without_pressure_evicts_nothing() {
+        let dir = ctl_scratch("no-pressure");
+        let mount = dir.join("m");
+        std::fs::create_dir_all(&mount).unwrap();
+        let p = mount.join("resident.bin");
+        std::fs::write(&p, vec![b'r'; 8192]).unwrap();
+        crate::store::set_xattr(&p, crate::store::XATTR_ID, b"cloud-1").unwrap();
+        hydration_protocol::stamp::write(&p).unwrap();
+
+        // default_pressure: with total 1000, low = min(10% = 100, 10 GiB) = 100.
+        let cfg = crate::evict_policy::EvictionConfig::default_pressure();
+        let freed = plan_and_reclaim(
+            &mount,
+            &cfg,
+            500,
+            1000,
+            10_000,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert_eq!(freed, 0, "freed bytes without pressure");
+        assert!(
+            crate::store::get_xattr(&p, hydration_protocol::xattr::DEHYDRATED)
+                .unwrap()
+                .is_none(),
+            "a file was evicted without pressure"
+        );
     }
 
     /// The contract's quietest clause: an unchanged tuple emits nothing. A

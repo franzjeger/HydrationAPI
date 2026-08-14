@@ -52,6 +52,7 @@ fn main() -> io::Result<()> {
             mount,
             socket,
             debounce: Duration::from_secs(900),
+            eviction: None,
         },
         access,
     )
