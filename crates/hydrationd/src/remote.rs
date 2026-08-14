@@ -293,6 +293,21 @@ impl SocketFetch {
 }
 
 impl Fetch for SocketFetch {
+    /// Rebuild the connection when the change reporter, not a fetch, is what
+    /// noticed the daemon go away.
+    ///
+    /// Both the fetch path and the reporter write down the same shared stream,
+    /// so remaking it here — replacing the reader this side owns and, through
+    /// `HelperConn::replace`, the writer every `Notifier` holds — heals both at
+    /// once. Marks `dead` first so `revive` runs even if a fetch has not yet
+    /// failed on the stale socket; a fetcher with no path to reconnect to (the
+    /// anonymous pairs used by tests) reports the same `NotConnected` its fetch
+    /// path would, and the caller leaves the flag set to try again.
+    fn reconnect(&mut self) -> io::Result<()> {
+        self.dead = true;
+        self.revive()
+    }
+
     fn fetch_into(
         &mut self,
         file: FileId,

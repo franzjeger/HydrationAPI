@@ -42,6 +42,19 @@ pub trait Fetch: Send {
         dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
         progress: &mut dyn FnMut(u64),
     ) -> io::Result<()>;
+
+    /// Re-establish the connection to the source, off the fetch path.
+    ///
+    /// A no-op for a fetcher that has nothing to connect to. `SocketFetch`
+    /// overrides it so the connection can be rebuilt when nobody is fetching —
+    /// the change reporter shares the same socket, and before this the socket
+    /// was only ever remade *inside* a fetch, so a daemon that restarted while
+    /// no reads were in flight left every local edit writing into a dead socket
+    /// until a placeholder happened to be read. Measured on a live account on
+    /// 2026-08-14: uploads stopped for the rest of the worker's life.
+    fn reconnect(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// The simple case: a fetcher that has the whole object in hand.
@@ -302,7 +315,21 @@ struct Timed {
     /// The attempt *is* the recovery path: `SocketFetch` reconnects inside it.
     lost: u32,
     since: Option<std::time::Instant>,
+    /// Set by the change reporter when a notification could not be sent, which
+    /// means the shared socket to the daemon is gone. The fetch thread watches
+    /// it and reconnects off the fetch path, so a restart with no reads in
+    /// flight does not leave change reporting writing into a dead socket. See
+    /// [`Fetch::reconnect`].
+    peer_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// How often the fetch thread wakes to heal a connection the reporter flagged.
+///
+/// Only paid when idle — a pending fetch is served the instant it arrives — so
+/// this is the ceiling on how long a restart can keep local edits from being
+/// reported, not a poll of anything that moves. Half a second is well under the
+/// debounce every edit waits out anyway.
+const HEAL_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 
 struct Job {
     seq: u64,
@@ -369,24 +396,44 @@ impl Timed {
         // the right way round: the worker keeps its loop, and a provider that
         // reports faster than anyone can listen is slowed rather than believed.
         let (rep_tx, rep_rx) = std::sync::mpsc::sync_channel(64);
+        let peer_lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heal_flag = std::sync::Arc::clone(&peer_lost);
         std::thread::spawn(move || {
-            while let Ok(job) = req_rx.recv() {
-                let tx = rep_tx.clone();
-                use std::os::fd::AsFd;
-                let owned = job.fd;
-                let mut wrote = |buf: &[u8], off: u64| -> io::Result<()> {
-                    placeholder::write_at(owned.as_fd(), buf, off)
-                };
-                let mut tick = |total: u64| {
-                    let _ = tx.send((job.seq, Step::Progress(total)));
-                };
-                let outcome = fetch.fetch_into(job.file, job.size, job.span, &mut wrote, &mut tick);
-                let step = match outcome {
-                    Ok(()) => Step::Done,
-                    Err(e) => Step::Failed(e),
-                };
-                if rep_tx.send((job.seq, step)).is_err() {
-                    return;
+            use std::sync::atomic::Ordering;
+            loop {
+                match req_rx.recv_timeout(HEAL_EVERY) {
+                    Ok(job) => {
+                        let tx = rep_tx.clone();
+                        use std::os::fd::AsFd;
+                        let owned = job.fd;
+                        let mut wrote = |buf: &[u8], off: u64| -> io::Result<()> {
+                            placeholder::write_at(owned.as_fd(), buf, off)
+                        };
+                        let mut tick = |total: u64| {
+                            let _ = tx.send((job.seq, Step::Progress(total)));
+                        };
+                        let outcome =
+                            fetch.fetch_into(job.file, job.size, job.span, &mut wrote, &mut tick);
+                        let step = match outcome {
+                            Ok(()) => Step::Done,
+                            Err(e) => Step::Failed(e),
+                        };
+                        if rep_tx.send((job.seq, step)).is_err() {
+                            return;
+                        }
+                    }
+                    // No fetch to serve: heal a connection the reporter flagged,
+                    // so a daemon restart with no reads in flight is not invisible
+                    // until one happens. `swap` clears the flag as it reads it, so
+                    // a successful reconnect stops here; a failed one puts it back
+                    // and the next tick tries again, which cannot busy-loop because
+                    // the wait is the timeout, not the reconnect.
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if heal_flag.swap(false, Ordering::SeqCst) && fetch.reconnect().is_err() {
+                            heal_flag.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 }
             }
         });
@@ -398,7 +445,13 @@ impl Timed {
             abandoned: 0,
             lost: 0,
             since: None,
+            peer_lost,
         }
+    }
+
+    /// The flag the change reporter raises when the shared socket is gone.
+    fn peer_lost(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.peer_lost)
     }
 
     fn wedged(&self) -> bool {
@@ -769,6 +822,15 @@ impl<F: Fetch + 'static> Worker<F> {
     /// cannot recover on its own from here, and §6a-bis says it must come down.
     pub fn fetcher_wedged(&self) -> bool {
         self.fetch.wedged()
+    }
+
+    /// The flag the change reporter raises when it cannot reach the daemon, so
+    /// the fetch thread can rebuild the shared socket without waiting for a read.
+    ///
+    /// Handed to `report::Reporter` so a restart is noticed from the write side
+    /// too, not only when a placeholder is next read. See [`Fetch::reconnect`].
+    pub fn peer_lost(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.fetch.peer_lost()
     }
 
     /// The fetcher has been unresponsive long enough that this unit cannot
@@ -1607,4 +1669,111 @@ pub struct SuperviseReport {
     /// it itself and then exits non-zero, in that order — exiting first would
     /// close the group, and a marked mount with no group fails *open*.
     pub stalled: bool,
+}
+
+#[cfg(test)]
+mod heal_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A fetcher that only records whether it was asked to reconnect.
+    struct CountReconnect {
+        calls: Arc<AtomicUsize>,
+        succeed: bool,
+    }
+
+    impl Fetch for CountReconnect {
+        fn fetch_into(
+            &mut self,
+            _file: FileId,
+            _size: u64,
+            _span: Span,
+            _dest: &mut dyn FnMut(&[u8], u64) -> io::Result<()>,
+            _progress: &mut dyn FnMut(u64),
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn reconnect(&mut self) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.succeed {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "test: still down",
+                ))
+            }
+        }
+    }
+
+    /// The whole fix, at the seam it turns on: a peer loss the reporter flags is
+    /// healed by the fetch thread with no fetch to carry it.
+    ///
+    /// Before this, `reconnect` only ran inside a fetch, so a daemon that
+    /// restarted while nothing was being read left the shared socket dead for
+    /// the rest of the worker's life. Here nothing is ever fetched; the flag
+    /// alone must produce a reconnect.
+    #[test]
+    fn a_flagged_peer_loss_is_healed_with_no_fetch_in_flight() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let timed = Timed::new(CountReconnect {
+            calls: Arc::clone(&calls),
+            succeed: true,
+        });
+        timed.peer_lost().store(true, Ordering::SeqCst);
+        std::thread::sleep(HEAL_EVERY * 4);
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "a flagged peer loss was never healed off the fetch path"
+        );
+        assert!(
+            !timed.peer_lost().load(Ordering::SeqCst),
+            "the flag was not cleared after a successful reconnect"
+        );
+    }
+
+    /// A reconnect that fails is retried, not dropped — and does not busy-loop.
+    ///
+    /// The flag goes back up on failure, so the next tick tries again; the wait
+    /// is the heal interval, so a daemon that stays down does not spin. A couple
+    /// of intervals must show more than one attempt and the flag still up.
+    #[test]
+    fn a_failed_reconnect_is_retried_and_bounded() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let timed = Timed::new(CountReconnect {
+            calls: Arc::clone(&calls),
+            succeed: false,
+        });
+        timed.peer_lost().store(true, Ordering::SeqCst);
+        std::thread::sleep(HEAL_EVERY * 4);
+        let n = calls.load(Ordering::SeqCst);
+        assert!(n >= 2, "a failed reconnect was not retried (attempts: {n})");
+        assert!(
+            n <= 8,
+            "the retry busy-looped instead of waiting out the interval (attempts: {n})"
+        );
+        assert!(
+            timed.peer_lost().load(Ordering::SeqCst),
+            "a still-failing reconnect cleared the flag it should have re-armed"
+        );
+    }
+
+    /// With nothing flagged, the fetch thread never reconnects. The heal is a
+    /// response to a signalled loss, not a poll of a connection that is fine.
+    #[test]
+    fn an_unflagged_connection_is_left_alone() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _timed = Timed::new(CountReconnect {
+            calls: Arc::clone(&calls),
+            succeed: true,
+        });
+        std::thread::sleep(HEAL_EVERY * 4);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the fetch thread reconnected a connection nobody said was lost"
+        );
+    }
 }
