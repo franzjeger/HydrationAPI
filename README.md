@@ -4,10 +4,12 @@ A hydration framework for cloud files on Linux — the equivalent of macOS' File
 Provider and Windows' Cloud Files API. Files appear as ordinary local files with
 their real size and metadata; their content is fetched on first access.
 
-**Status: the framework is built and hardened. A Microsoft Graph provider is
-half written.** 395 tests, eight privileged suites against a real kernel, and an
-end-to-end smoke run with both real binaries. What is *not* done is the part that
-needs a real OneDrive account, and nothing here has met live Graph — see
+**Status: the framework is built and hardened; the Microsoft Graph provider on
+top of it is built but not yet hardened.** 582 tests by grep, 14 privileged
+suites against a real kernel, and an end-to-end smoke run with both real
+binaries. Its crates have now met a live OneDrive account — through the
+downstream product, not from any harness in this repository, which is still
+tested against scripted responses — see
 [Where this actually stands](#where-this-actually-stands).
 
 ## The finding
@@ -153,7 +155,7 @@ reports green. See `crates/test-scratch`.
 `.github/workflows/ci.yml` runs on every push: `cargo fmt --check`, clippy under
 `-D warnings` across all targets and again with `--all-features`, `cargo doc`
 under `-D warnings`, the full suite unprivileged, and then **the whole suite plus
-all eight privileged suites and the smoke run on four filesystems** — btrfs,
+all 14 privileged suites and the smoke run on four filesystems** — btrfs,
 ext4 with a 128-byte inode, ext4 with a 512-byte one, and xfs.
 
 Those four are not a preference. The kernel gates pre-content events on a
@@ -218,21 +220,56 @@ that have each bitten somebody.
 Honest, because the interesting number is not the test count.
 
 **Done and hardened.** The framework: seven adversarial review rounds, every
-finding fixed, 395 tests, 8/8 privileged suites against a real kernel. Two of the
-five Graph pieces.
+finding fixed; 582 test functions by grep across the crates (a raw count, not a
+`cargo test` pass total); 14 privileged suites on four filesystems against a
+real kernel; nine of nine conformance invariants — eight, plus §6a. All five
+Graph pieces now exist too — the mapping layer, the delta driver, the upload
+`Sink`, device-code authentication, and a real `GraphAccess` filling the
+`CloudAccess` seam in `hydration-client/src/daemon_loop.rs`, not the demo
+`FolderCloud`. But "exists" is not "hardened," and the next paragraph is why.
 
-**Not done.** The upload half — no Graph `Sink` exists. Authentication. The seam
-itself now exists — `CloudAccess` in `hydration-client/src/daemon_loop.rs`, and
-`hydration-sync` is a `main` that names one — but nothing except the demo
-`FolderCloud` has been run through it end to end.
+**First contact.** It has happened — not in this repository, but through it. The
+downstream **OneDriveHydration** product git-pins these crates (at `2fe8ac8`,
+this repository's current HEAD) and drives them against a live OneDrive for
+Business tenant, and that run found exactly the class of defect this paragraph
+used to only predict. An upload-direction cascade: the precondition tag never
+reached the `Sink`, so no update to an already-uploaded object had ever
+succeeded in production — and it sat behind a suite where, at the time,
+`record_tag` was called forty-three times and in no production path at all,
+forty-three green tests that could not fail for the reason they claimed. Then a
+cTag-versus-QuickXor tag mismatch that refused every conditional write; a
+`nameAlreadyExists` loop after an atomic save wiped an object's xattrs; an
+`EACCES` writing the recovery marker onto a read-only file; a retry storm on a
+conflicted upload. And a change-channel reconnect gap: after the sync daemon
+restarted, new files stopped uploading until something happened to read one.
+Every one of those fixes landed here, in the framework.
 
-**Not verifiable here.** Nothing in this repository has spoken to live Microsoft
-Graph. The provider layers are tested against scripted responses, which catches
-the logic and cannot catch the world. Three consecutive modules in this project
-shipped with blocking defects that only an adversarial review found — an infinite
-loop, a use-after-close that wrote one object's bytes into another file, a rename
-that failed all six of its own batch shapes. First contact with a real account
-will find things nobody predicted.
+**Still not verified here.** The repository itself carries no in-tree live
+harness — the provider layers are still tested against scripted responses, which
+catches the logic and cannot catch the world. First contact caught some of the
+world; it did not catch all of it. Not yet proven against a live account: soak
+beyond a single short endurance run; two-device conflicts (edit against edit,
+against rename, against delete); a restart in the middle of a fetch, an upload,
+or a delta apply; sustained 429 throttling; a full-content onboarding at scale
+rather than enumeration alone; a cross-folder move (the plumbing exists and is
+unit-tested, but no live run has exercised it, and the product's own acceptance
+matrix still lists it unresolved); and whole classes of item — OneNote packages,
+SharePoint document libraries — left unexercised, and shared folders, which v1
+does not target.
+
+**Still not built.** No authorization-code/PKCE enrollment: device-code auth and
+refresh-token rotation work, but a Conditional-Access tenant blocks device-code,
+so the initial live enrollment is currently done by an out-of-repo tool. No
+automatic eviction policy — the mechanism and a manual trigger are there, a
+disk-pressure/LRU/quota policy on top of them is not. The backup-exclusion
+policy is a mechanism with a default deny-list, not yet the product it needs to
+be: user-editable, with a visible log of what was denied. And the deliberate
+platform limits stand — fetches are serialized until pipelining lands (the
+protocol's `id` field is ready for it, the transport is not), a directory cannot
+be marked so the sync root must be its own mount, both processes dying at once
+still returns silent zeros, and Linux offers no "do not hydrate" hint the way
+Windows and macOS do, so bulk-read intent is guessed from the cgroup and never
+known.
 
 ## The contract
 
