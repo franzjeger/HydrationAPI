@@ -18,6 +18,7 @@
 //! was left out and where to get it.
 
 use crate::store::{self, Store};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -188,6 +189,48 @@ impl Manifest {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// Read the manifest back as `path → (cloud id, etag)`.
+///
+/// The counterpart to [`Manifest::render`], which produces the lines this
+/// parses — `path\tcloud-id\tsize\tetag`, comments starting with `#`. It exists
+/// for the offline-deletion reconciliation, which needs the whole *set* of
+/// placeholder paths the last run recorded, not a single lookup.
+///
+/// A missing or unreadable manifest is an empty map, never an error. A sync root
+/// that never wrote one — a fresh or rebuilt subvolume — has nothing to
+/// reconcile, and an empty map is exactly the answer that makes an offline pass
+/// over such a root delete nothing. That co-location, the record living in the
+/// same directory as the files it describes, is what makes the whole offline
+/// path safe: a wrong root carries no record and so produces no candidates.
+///
+/// `UNRECOVERABLE` lines are skipped along with every other comment: they name a
+/// dehydrated file with no cloud object, so there is nothing a deletion could
+/// withdraw for them.
+pub fn entries(root: &Path) -> HashMap<String, (String, Option<String>)> {
+    let raw = match std::fs::read_to_string(root.join(MANIFEST_NAME)) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    let mut out = HashMap::new();
+    for line in raw.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let mut f = line.split('\t');
+        if let (Some(p), Some(id), Some(_size), Some(tag)) =
+            (f.next(), f.next(), f.next(), f.next())
+        {
+            if !p.is_empty() && !id.is_empty() {
+                out.insert(
+                    p.to_string(),
+                    (id.to_string(), (tag != "-").then(|| tag.to_string())),
+                );
+            }
+        }
+    }
+    out
 }
 
 /// What to do about backups, chosen at setup. §6d.
