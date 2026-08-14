@@ -344,6 +344,90 @@ pub mod stamp {
     }
 }
 
+/// When the framework last brought this file's content to the device.
+///
+/// The recency signal the auto-eviction policy ranks by, and the honest best it
+/// can get. The sync mount is `noatime` and a resident file carries a surviving
+/// ignore mark, so re-reads fire no event — there is no *last-use* signal at all.
+/// This is *last-acquisition*: the wall-clock second at which a placeholder last
+/// became fully resident. A file fetched a year ago and read every day since is
+/// indistinguishable from one fetched a year ago and never touched; that is
+/// unavoidable, and the whole reason the pin exists as the user's escape hatch.
+///
+/// A property of the file, forge-benign like the stamp and the pin: a same-uid
+/// process can write any `user.*` attribute, but a forged value can only make the
+/// framework keep content longer (forged to "now") or evict a clean, uploaded,
+/// unpinned file a re-read would restore (forged old). It can never make a
+/// placeholder serve zeros or destroy data — `reclaim` still refuses
+/// NotUploaded/ChangedSinceUpload/UploadPending/Pinned. Do not "harden" it into
+/// something that fails closed. Like every `user.*` mark it is never uploaded, so
+/// it is correctly per-device — which is exactly right for a per-device
+/// disk-pressure policy.
+pub mod hydrated {
+    use std::io;
+    use std::path::Path;
+
+    pub const XATTR: &str = "user.hydration.hydrated_at";
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Record "now" as the acquisition time, **through the event fd** — never by
+    /// re-opening the path, which inside a marked mount is the §6a-ter trap the
+    /// whole design avoids (the same reason [`super::stamp::write_fd`] takes an
+    /// fd). It is a metadata `fsetxattr`, so it fires no pre-content event
+    /// (measured: `probes/nodump.c`, and the stamp does exactly this at the same
+    /// call site in production). Set right after the stamp in `finish_hydration`,
+    /// best-effort: a failed timestamp is not a failed hydration.
+    pub fn write_fd(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let v = now_secs().to_string();
+        let n = std::ffi::CString::new(XATTR).unwrap();
+        let rc = unsafe {
+            libc::fsetxattr(
+                fd.as_raw_fd(),
+                n.as_ptr(),
+                v.as_ptr() as *const libc::c_void,
+                v.len(),
+                0,
+            )
+        };
+        (rc == 0).then_some(()).ok_or_else(io::Error::last_os_error)
+    }
+
+    /// The recorded acquisition time in wall-clock seconds, or `None` if the file
+    /// has never been hydrated — a locally-authored resident, or one hydrated
+    /// before this shipped. The caller falls back to `mtime` for those, never
+    /// treating "absent" as "oldest".
+    pub fn at(path: &Path) -> io::Result<Option<u64>> {
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has an interior nul"))?;
+        let n = std::ffi::CString::new(XATTR).unwrap();
+        let mut buf = [0u8; 32];
+        let rc = unsafe {
+            libc::getxattr(
+                c.as_ptr(),
+                n.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if rc >= 0 {
+            return Ok(std::str::from_utf8(&buf[..rc as usize])
+                .ok()
+                .and_then(|s| s.parse().ok()));
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ENODATA) | Some(libc::ENOTSUP) | Some(libc::ERANGE) => Ok(None),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+}
+
 /// Files the framework puts in the user's sync directory, and the one rule about
 /// them.
 ///

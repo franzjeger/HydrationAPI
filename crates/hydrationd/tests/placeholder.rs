@@ -128,3 +128,62 @@ fn the_inode_survives_a_full_round_trip() {
          holding it saw it become a different file"
     );
 }
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A completed fill records when it happened, for the auto-eviction recency
+/// ranking. A fresh placeholder has no such time — the signal is set at
+/// acquisition, not creation — and the completed fill stamps it with now.
+#[test]
+fn a_completed_hydration_records_hydrated_at() {
+    let p = scratch("hydrated-at.bin");
+    create(&p, 4096, 0o644).expect("create");
+    assert!(
+        hydration_protocol::hydrated::at(&p).unwrap().is_none(),
+        "a placeholder that was never filled already carries a hydration time"
+    );
+
+    let before = now_secs();
+    hydrate(&p, &vec![b'h'; 4096], 4096).expect("hydrate");
+    let after = now_secs();
+
+    let at = hydration_protocol::hydrated::at(&p)
+        .expect("getxattr")
+        .expect("a completed fill must record hydrated_at");
+    assert!(
+        before <= at && at <= after,
+        "hydrated_at {at} is not within the fill window [{before}, {after}]"
+    );
+}
+
+/// A partial fill (`settle_range`) leaves the file a marked placeholder — still
+/// holes, not yet an eviction candidate — so it must NOT record a hydration
+/// time. Recording it there would let the selector treat a half-filled file as
+/// resident.
+#[test]
+fn a_partial_fill_records_no_hydrated_at() {
+    use std::os::fd::AsFd;
+    let p = scratch("partial-at.bin");
+    create(&p, 8192, 0o644).expect("create");
+
+    let f = fs::OpenOptions::new().write(true).open(&p).expect("open");
+    // Fill only the first half, then settle that range — the streamed-partial
+    // path, which deliberately keeps the placeholder mark.
+    write_at(f.as_fd(), &vec![b'p'; 4096], 0).expect("write range");
+    settle_range(f.as_fd()).expect("settle_range");
+    drop(f);
+
+    assert!(
+        is_dehydrated(&p).unwrap(),
+        "settle_range cleared the placeholder mark — that is finish_hydration's job"
+    );
+    assert!(
+        hydration_protocol::hydrated::at(&p).unwrap().is_none(),
+        "a partial fill recorded a hydration time; the file is still a placeholder"
+    );
+}
