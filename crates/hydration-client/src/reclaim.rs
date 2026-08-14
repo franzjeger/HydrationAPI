@@ -349,6 +349,104 @@ fn collect_dehydrated(dir: &Path, root: &Path, out: &mut Vec<String>) -> io::Res
     Ok(())
 }
 
+/// Every resident file the auto-eviction policy could dehydrate, as
+/// [`crate::evict_policy::Candidate`]s for `plan` to rank.
+///
+/// A content-free walk of the sync root — `read_dir` plus a few `getxattr`s per
+/// file, never a read, so enumerating never hydrates anything (the mirror of
+/// [`pending`], for the opposite population). It pre-filters to what `reclaim`
+/// would accept, so `plan` is not handed files the executor would only refuse:
+/// it skips placeholders (`DEHYDRATED`), pinned files and subtrees, files the
+/// cloud does not hold (`NotUploaded`), and files edited since upload
+/// (`stamp != Clean`). The pre-filter is an optimisation only —
+/// [`reclaim`] stays the sole authority when the driver acts on each `rel`.
+///
+/// The pin check is memoised down the walk: each directory's own pin is read
+/// once and the "an ancestor is pinned" verdict flows to its children, so a
+/// pressure sweep does not pay `depth` × `getxattr` per file — the cost the
+/// Keep-on-Device groundwork flagged for exactly this policy.
+pub fn evictable_candidates(root: &Path) -> io::Result<Vec<crate::evict_policy::Candidate>> {
+    let real_root = root.canonicalize()?;
+    let mut out = Vec::new();
+    collect_residents(&real_root, &real_root, false, &mut out)?;
+    Ok(out)
+}
+
+fn collect_residents(
+    dir: &Path,
+    root: &Path,
+    ancestor_pinned: bool,
+    out: &mut Vec<crate::evict_policy::Candidate>,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // One `getxattr` per directory: this directory's own pin, folded with the
+    // ancestors'. Children inherit the verdict, so the walk is `O(dirs)` pin
+    // reads, not `O(files × depth)`.
+    let dir_pinned = ancestor_pinned || store::is_pinned(dir)?;
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if hydration_protocol::names::is_internal(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_residents(&path, root, dir_pinned, out)?;
+            continue;
+        }
+        // A symlink is neither `is_dir` nor `is_file`, so it is skipped and the
+        // walk never leaves the tree.
+        if !file_type.is_file() {
+            continue;
+        }
+
+        // Cheapest skip first, because the tree is mostly placeholders: a
+        // dehydrated file is not a resident and holds no disk to reclaim.
+        if store::get_xattr(&path, hydration_protocol::xattr::DEHYDRATED)?.is_some() {
+            continue;
+        }
+        // Keep on Device wins: a pinned file, or one under a pinned directory.
+        if dir_pinned || store::is_pinned(&path)? {
+            continue;
+        }
+        // The cloud must hold it, or evicting it destroys the only copy.
+        let has_cloud_id = store::get_xattr(&path, store::XATTR_ID)?
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        if !has_cloud_id {
+            continue;
+        }
+        // And it must be unchanged since we sent it — the same `Clean` gate
+        // `reclaim` re-applies per file.
+        if hydration_protocol::stamp::state(&path)? != hydration_protocol::stamp::State::Clean {
+            continue;
+        }
+
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy();
+        if rel.contains(['\n', '\r']) {
+            continue;
+        }
+        let md = std::fs::symlink_metadata(&path)?;
+        // Recency: the last acquisition if the framework has one, else the file's
+        // own mtime — never treated as "oldest" when absent (see the `hydrated`
+        // module).
+        let recency =
+            hydration_protocol::hydrated::at(&path)?.unwrap_or_else(|| md.mtime().max(0) as u64);
+        out.push(crate::evict_policy::Candidate {
+            rel: rel.into_owned(),
+            // Measured, not logical: what the placeholder actually gives back.
+            reclaimable: md.blocks() * 512,
+            recency,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,6 +899,76 @@ mod tests {
                 Ok(Err(Refused::NotEligible(_)))
             ),
             "pending accepted a file where it needs a directory"
+        );
+    }
+
+    /// The enumerator proposes only what `reclaim` would accept: one evictable
+    /// resident here, and nothing for each of the reasons `reclaim` refuses — a
+    /// placeholder, a pinned file, an edited file, an un-uploaded file, and the
+    /// framework's own names.
+    #[test]
+    fn enumerate_lists_only_evictable_residents() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = scratch("enumerate");
+
+        // The one candidate: synced == uploaded, clean, resident, unpinned.
+        let good = synced(&dir, "keep-me-not.bin", &vec![b'g'; 8192]);
+
+        // None of these may appear:
+        dehydrated(&dir, "placeholder.bin"); // a placeholder, no disk to reclaim
+        let pinned = synced(&dir, "pinned.bin", &vec![b'p'; 8192]);
+        store::set_pinned(&pinned).unwrap(); // pinned
+        let dirty = synced(&dir, "dirty.bin", b"the version we sent");
+        std::fs::write(&dirty, b"a newer version, never sent").unwrap(); // edited since upload
+        let offline = dir.join("offline.bin");
+        std::fs::write(&offline, b"written offline, never uploaded").unwrap();
+        stamp::write(&offline).unwrap(); // clean but no cloud id
+        std::fs::write(dir.join(hydration_protocol::names::MANIFEST), b"# internal").unwrap();
+
+        let got = evictable_candidates(&dir).unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "expected only the one evictable resident, got {got:?}"
+        );
+        assert_eq!(got[0].rel, "keep-me-not.bin");
+        // No hydrated_at was recorded, so recency falls back to the file's mtime.
+        assert_eq!(
+            got[0].recency,
+            std::fs::metadata(&good).unwrap().mtime().max(0) as u64
+        );
+        assert!(
+            got[0].reclaimable >= 8192,
+            "reclaimable should reflect the resident's blocks: {}",
+            got[0].reclaimable
+        );
+    }
+
+    /// Nested residents are found with their nested rel path, and a resident
+    /// under a pinned directory is skipped by the memoised ancestor check — the
+    /// pin protects a whole subtree from the sweep, not just a named file.
+    #[test]
+    fn enumerate_finds_nested_residents_and_skips_a_pinned_subtree() {
+        let dir = scratch("enumerate-nested");
+        let deep = dir.join("a/b");
+        std::fs::create_dir_all(&deep).unwrap();
+        synced(&deep, "deep.bin", &vec![b'd'; 4096]);
+
+        let kept = dir.join("keep");
+        std::fs::create_dir_all(&kept).unwrap();
+        store::set_pinned(&kept).unwrap();
+        synced(&kept, "under-pin.bin", &vec![b'u'; 4096]);
+
+        let mut rels: Vec<String> = evictable_candidates(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.rel)
+            .collect();
+        rels.sort();
+        assert_eq!(
+            rels,
+            vec!["a/b/deep.bin".to_string()],
+            "listed a file under a pinned directory, or missed the nested one"
         );
     }
 }
