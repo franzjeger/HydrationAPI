@@ -500,6 +500,12 @@ impl Watchers {
 ///   surface. Machines get `watch`.
 /// - `evict <path>` — turn a file the cloud already holds back into a
 ///   placeholder.
+/// - `pin <path>` / `unpin <path>` — keep a file or directory on device, so
+///   eviction skips it (`pin`), or release it (`unpin`). A directory pin
+///   protects everything under it. Both are pure `user.*` metadata writes: they
+///   fire no pre-content event, need no privilege, and never reach the helper.
+///   The reply is `pinned` / `unpinned`, or `error: <why>` for a path outside
+///   the sync directory.
 /// - `watch` — one state line immediately, another every time the state
 ///   changes, and nothing else ever, until the peer disconnects. A state line
 ///   is `key=value` pairs joined by single spaces, newline-terminated,
@@ -557,6 +563,23 @@ fn control(
                     match reclaim::reclaim(&mount, arg, &mut store, &waiting, &sending) {
                         Ok(Ok(r)) => format!("reclaimed {} bytes", r.bytes),
                         Ok(Err(why)) => format!("kept: {why:?}"),
+                        Err(e) => format!("error: {e}"),
+                    }
+                }
+                "pin" | "unpin" => {
+                    // The same shape as evict — an untrusted path, confined by
+                    // `reclaim::set_pin` through the same `safe_join` — but it
+                    // touches no content: a pin is a `setxattr`/`removexattr`,
+                    // which fires no pre-content event and needs no privilege, so
+                    // nothing here crosses to the helper (§6b never comes into
+                    // it). Unlike evict it accepts a directory, because a folder
+                    // pin protects its subtree. A path that will not resolve
+                    // inside the sync directory is an `error:` rather than a
+                    // `kept:` — a pin keeps nothing back, it is a rejected
+                    // request.
+                    match reclaim::set_pin(&mount, arg, verb == "pin") {
+                        Ok(Ok(())) => if verb == "pin" { "pinned" } else { "unpinned" }.to_string(),
+                        Ok(Err(why)) => format!("error: {why:?}"),
                         Err(e) => format!("error: {e}"),
                     }
                 }
@@ -2753,6 +2776,88 @@ mod tests {
         assert!(
             !line.trim().is_empty(),
             "evict must answer something, even a refusal"
+        );
+    }
+
+    /// `pin`/`unpin` over the socket: a file round-trips (the xattr appears and
+    /// goes away), a directory can be pinned — the folder half of "Keep on
+    /// Device", which `evict` deliberately refuses — and a path that escapes the
+    /// sync directory is an `error:`, confined exactly like `evict`.
+    #[test]
+    fn pin_unpin_and_directories_over_the_socket() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        let dir = ctl_scratch("pin-socket");
+        let mount = dir.join("m");
+        std::fs::create_dir_all(&mount).unwrap();
+        let file = mount.join("keep.txt");
+        std::fs::write(&file, b"content").unwrap();
+        let sub = mount.join("keep-dir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sock = dir.join("ctl");
+
+        let queue = Arc::new(Mutex::new(Queue::new(
+            Duration::from_secs(900),
+            SystemClock::default(),
+        )));
+        let exposures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let excluded = Arc::new(AtomicU64::new(0));
+        let watchers = Arc::new(Watchers::default());
+        {
+            let (s, m, q, e, x, w) = (
+                sock.clone(),
+                mount.clone(),
+                Arc::clone(&queue),
+                Arc::clone(&exposures),
+                Arc::clone(&excluded),
+                Arc::clone(&watchers),
+            );
+            std::thread::spawn(move || control(&s, m, q, e, x, w));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let ask = |line: &str| -> String {
+            let c = loop {
+                match UnixStream::connect(&sock) {
+                    Ok(c) => {
+                        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        break c;
+                    }
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(e) => panic!("could not connect: {e}"),
+                }
+            };
+            writeln!(&c, "{line}").unwrap();
+            let mut reply = String::new();
+            BufReader::new(c).read_line(&mut reply).expect("no reply");
+            reply.trim().to_string()
+        };
+
+        // A file round-trips: the mark appears, then goes away.
+        assert_eq!(ask("pin keep.txt"), "pinned");
+        assert!(
+            crate::store::is_pinned(&file).unwrap(),
+            "the pin did not land"
+        );
+        assert_eq!(ask("unpin keep.txt"), "unpinned");
+        assert!(
+            !crate::store::is_pinned(&file).unwrap(),
+            "the pin did not clear"
+        );
+
+        // A directory can be pinned — evict cannot touch one.
+        assert_eq!(ask("pin keep-dir"), "pinned");
+        assert!(
+            crate::store::is_pinned(&sub).unwrap(),
+            "a directory pin did not land"
+        );
+
+        // Confined exactly like evict: an escape is refused, not obeyed.
+        assert!(
+            ask("pin ../../etc/passwd").starts_with("error:"),
+            "pin obeyed a path outside the sync directory"
         );
     }
 

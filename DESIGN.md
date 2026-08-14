@@ -1328,6 +1328,12 @@ The trigger lives in the running daemon, not in the tool, and that is the point:
 
 `hydrationd`'s own `evict` still exists, for a caller that *does* hold the group — the conformance adapter is one — and punches in place there.
 
+### Keep on Device: the same door, in reverse
+
+`pin <path>` / `unpin <path>` ride the same control socket as `evict`, for the same reason and with the same containment: a pin names a file, so §6b keeps it off the privileged side, and `reclaim::set_pin` resolves the untrusted path through `safe_join` and then the filesystem exactly as `reclaim` does — except it accepts a directory, because a folder pin protects its subtree. The pin is a single `user.hydration.pinned` xattr, presence-only like the dehydrated mark; setting it fires no pre-content event, so it is safe from any process — §6a-ter is about content, not metadata.
+
+Eviction honors it in one place — `reclaim`, the chokepoint both the manual path and any future auto-eviction policy pass through — as a refusal (`Refused::Pinned`) taken before the inode is swapped. A file is pinned if it, or any directory up to the sync root, carries the mark: the inheritance is an ancestor-walk at decision time, never a bit stamped on every child, so a file that arrives later under a pinned folder is covered with nothing written to it. Forging the mark is benign for the same reason the stamp's is — it can only make the framework *keep* content, never destroy it — so it must not be hardened into something that fails closed. The full design, and the §6a-ter measurement that a third-party read is the deadlock-safe way to hydrate on demand, is [`docs/KEEP-ON-DEVICE-GROUNDWORK.md`](docs/KEEP-ON-DEVICE-GROUNDWORK.md).
+
 ---
 
 ## 6i. A delta pass outlives the mount it started on

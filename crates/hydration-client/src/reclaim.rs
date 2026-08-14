@@ -36,7 +36,7 @@ use crate::store::{self, Store};
 use hydration_protocol::{stamp, FileId};
 use std::collections::HashSet;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Why a file was left alone.
 ///
@@ -55,6 +55,10 @@ pub enum Refused {
     ChangedSinceUpload,
     /// An edit is waiting out the debounce, or is being sent right now.
     UploadPending,
+    /// The user asked to keep this on device — directly, or through a pinned
+    /// ancestor directory. `via` names where the pin actually is, which is not
+    /// the file itself when a folder was pinned. Refusing is the whole point.
+    Pinned { via: PathBuf },
     /// Not a regular file, or not ours to touch.
     NotEligible(String),
 }
@@ -125,6 +129,18 @@ pub fn reclaim(
 
     if store::get_xattr(path, hydration_protocol::xattr::DEHYDRATED)?.is_some() {
         return Ok(Err(Refused::AlreadyDehydrated));
+    }
+
+    // Keep on Device wins over every reason to evict, and this is the place it is
+    // honored: the one chokepoint both the manual path and any future auto-
+    // eviction policy pass through to do the inode swap. Checked before the
+    // upload snapshot, the stamp read, and placement — a pinned file is simply
+    // not touched. The pin may live on an ancestor directory, so the whole chain
+    // up to the sync root is consulted; nothing is stamped on the child, so a
+    // file that arrived later under a pinned folder is covered with no write to
+    // it. See `docs/KEEP-ON-DEVICE-GROUNDWORK.md` §1.4 and §3.2.
+    if let Some(via) = pinned_self_or_ancestor(path, &real_root)? {
+        return Ok(Err(Refused::Pinned { via }));
     }
 
     use std::os::unix::fs::MetadataExt;
@@ -207,6 +223,64 @@ pub fn reclaim(
     Ok(Ok(Reclaimed {
         bytes: held_before.saturating_sub(held_after),
     }))
+}
+
+/// Is `path`, or any directory above it up to and including the sync root,
+/// pinned? Returns the pinning path so the refusal can name it.
+///
+/// The pin is stored only where the user set it; a folder pin is honored by this
+/// walk, not by a bit copied onto every child — so a file that arrives later
+/// under a pinned directory is protected with nothing written to it. Both `path`
+/// and `real_root` are already canonical (no `..`, no symlinks) when `reclaim`
+/// calls this, so the ancestor chain is the real one and the walk stops exactly
+/// at the root rather than climbing out of the sync directory toward `/`.
+fn pinned_self_or_ancestor(path: &Path, real_root: &Path) -> io::Result<Option<PathBuf>> {
+    for anc in path.ancestors() {
+        if store::is_pinned(anc)? {
+            return Ok(Some(anc.to_path_buf()));
+        }
+        if anc == real_root {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+/// Set or clear the "keep on device" pin on a file *or directory* named by an
+/// untrusted `rel`.
+///
+/// Confined exactly like [`reclaim`] — through [`crate::delta::safe_join`], then
+/// canonicalisation, then a prefix check on the resolved paths — but without its
+/// regular-file gate, because a pin is meaningful on a directory: it protects the
+/// subtree through the ancestor-walk `pinned_self_or_ancestor` does. Writing the
+/// mark fires no pre-content event and needs no privilege, so like eviction it
+/// stays wholly on the unprivileged side and §6b never comes into it.
+///
+/// A path that does not resolve inside the sync directory comes back as
+/// [`Refused::NotEligible`], so the caller surfaces it the way it surfaces an
+/// eviction refusal.
+pub fn set_pin(root: &Path, rel: &str, on: bool) -> io::Result<Result<(), Refused>> {
+    let Some(joined) = crate::delta::safe_join(root, rel) else {
+        return Ok(Err(Refused::NotEligible(format!(
+            "{rel:?} is not a path inside the sync directory"
+        ))));
+    };
+    let (Ok(real), Ok(real_root)) = (joined.canonicalize(), root.canonicalize()) else {
+        return Ok(Err(Refused::NotEligible(
+            "could not resolve the path".to_string(),
+        )));
+    };
+    if !real.starts_with(&real_root) {
+        return Ok(Err(Refused::NotEligible(
+            "resolves outside the sync directory".to_string(),
+        )));
+    }
+    if on {
+        store::set_pinned(&real)?;
+    } else {
+        store::clear_pinned(&real)?;
+    }
+    Ok(Ok(()))
 }
 
 #[cfg(test)]
@@ -479,5 +553,127 @@ mod tests {
             .unwrap(),
             Err(Refused::NotEligible(_))
         ));
+    }
+
+    /// The whole point of the pin: a file the user asked to keep is not a
+    /// candidate, even when it is otherwise perfectly evictable — synced, clean,
+    /// idle. The refusal names the file itself.
+    #[test]
+    fn a_pinned_file_is_never_evicted() {
+        let dir = scratch("pinned-file");
+        let p = synced(&dir, "keep.pdf", &vec![b'k'; 8192]);
+        store::set_pinned(&p).unwrap();
+
+        match run(&dir, "keep.pdf") {
+            Err(Refused::Pinned { via }) => assert_eq!(via, p.canonicalize().unwrap()),
+            other => panic!("a pinned file was not refused: {other:?}"),
+        }
+        assert!(holds_data(&p).unwrap(), "a pinned file lost its content");
+    }
+
+    /// A folder pin protects the files under it — including one created *after*
+    /// the pin, carrying no mark of its own. This is the test that tells the
+    /// ancestor-walk apart from stamping the bit onto every child: a stamping
+    /// design writes nothing to a child that did not exist when the folder was
+    /// pinned, so it would evict it. The refusal names the directory.
+    #[test]
+    fn a_file_under_a_pinned_directory_is_never_evicted() {
+        let dir = scratch("pinned-dir");
+        let sub = dir.join("keep-me");
+        std::fs::create_dir_all(&sub).unwrap();
+        store::set_pinned(&sub).unwrap();
+
+        // Created after the pin, and never marked itself.
+        let child = synced(&sub, "later.bin", &vec![b'c'; 4096]);
+        assert!(
+            !store::is_pinned(&child).unwrap(),
+            "the child should carry no pin of its own — inheritance is by walk"
+        );
+
+        match run(&dir, "keep-me/later.bin") {
+            Err(Refused::Pinned { via }) => assert_eq!(via, sub.canonicalize().unwrap()),
+            other => panic!("a file under a pinned directory was not refused: {other:?}"),
+        }
+        assert!(holds_data(&child).unwrap(), "a pinned subtree lost content");
+    }
+
+    /// The guard fires before placement: a pinned file's inode does not change,
+    /// because nothing was swapped in — while an unpinned control in the same
+    /// tree *is* evicted and its inode *does* change. Without the control the
+    /// first assertion cannot tell "guard fired" from "placement never ran for
+    /// some other reason".
+    #[test]
+    fn the_pin_check_runs_before_placement_and_a_control_is_still_evicted() {
+        let dir = scratch("pin-before-place");
+        let pinned = synced(&dir, "pinned.bin", &vec![b'p'; 8192]);
+        let control = synced(&dir, "control.bin", &vec![b'c'; 8192]);
+        store::set_pinned(&pinned).unwrap();
+
+        let ino_before = std::fs::metadata(&pinned).unwrap().ino();
+        assert!(matches!(
+            run(&dir, "pinned.bin"),
+            Err(Refused::Pinned { .. })
+        ));
+        assert_eq!(
+            std::fs::metadata(&pinned).unwrap().ino(),
+            ino_before,
+            "the inode was replaced — placement ran on a pinned file"
+        );
+
+        let ctrl_before = std::fs::metadata(&control).unwrap().ino();
+        assert!(run(&dir, "control.bin").is_ok());
+        assert_ne!(
+            std::fs::metadata(&control).unwrap().ino(),
+            ctrl_before,
+            "the control was not actually evicted, so the inode check proves nothing"
+        );
+    }
+
+    /// Un-pinning makes a file a candidate again — and does not itself evict
+    /// anything. "Keep on Device" and "Free Up Space" stay two deliberate acts,
+    /// and the inverse of the pin is the un-pin, not an eviction.
+    #[test]
+    fn unpinning_restores_eligibility_and_does_not_itself_evict() {
+        let dir = scratch("unpin");
+        let p = synced(&dir, "toggle.bin", &vec![b't'; 8192]);
+        store::set_pinned(&p).unwrap();
+        assert!(matches!(
+            run(&dir, "toggle.bin"),
+            Err(Refused::Pinned { .. })
+        ));
+
+        store::clear_pinned(&p).unwrap();
+        assert!(
+            holds_data(&p).unwrap(),
+            "clearing a pin evicted the file by itself"
+        );
+        assert!(
+            run(&dir, "toggle.bin").is_ok(),
+            "an unpinned file is a candidate again"
+        );
+    }
+
+    /// `set_pin` is confined exactly like `reclaim`: the escaping arguments that
+    /// cannot evict cannot pin either, and none of them panic. (Degenerate but
+    /// in-root arguments like `""` are a separate question — they name the root,
+    /// which is a legitimate if heavy thing to pin — so only genuine escapes are
+    /// asserted here.)
+    #[test]
+    fn set_pin_confines_like_evict() {
+        let dir = scratch("pin-hostile");
+        for arg in [
+            "../../../etc/hosts",
+            "/etc/passwd",
+            "..",
+            "a/../../b",
+            ".hydration-manifest",
+            "\u{0}weird",
+        ] {
+            let out = set_pin(&dir, arg, true);
+            assert!(
+                matches!(out, Ok(Err(Refused::NotEligible(_))) | Err(_)),
+                "{arg:?} was not refused by set_pin: {out:?}"
+            );
+        }
     }
 }

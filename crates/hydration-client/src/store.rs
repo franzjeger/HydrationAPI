@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 pub use hydration_protocol::xattr::ETAG as XATTR_ETAG;
 pub use hydration_protocol::xattr::MODE as XATTR_MODE;
+pub use hydration_protocol::xattr::PINNED as XATTR_PINNED;
 pub use hydration_protocol::xattr::{DEHYDRATED as XATTR_DEHYDRATED, ID as XATTR_ID};
 
 /// What the daemon knows about one file.
@@ -395,20 +396,47 @@ impl Store {
 /// A file left writable because recording its id failed is a permission change
 /// the user never made, on a file something else deliberately protected.
 fn write_xattr_even_if_read_only(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+    with_temporarily_writable(path, |p| set_xattr(p, name, value))
+}
+
+/// Run an inode-metadata write that the file's own mode may forbid — a `user.*`
+/// `setxattr` or `removexattr` — relaxing the mode only for the retry and
+/// restoring it whichever way the write goes.
+///
+/// Extracted so the id-adoption path and the pin's clear path share one careful
+/// implementation: the reasoning above about why a `0444` file must not be left
+/// writable applies identically to removing a mark as to setting one.
+fn with_temporarily_writable(path: &Path, op: impl Fn(&Path) -> io::Result<()>) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
-    match set_xattr(path, name, value) {
+    match op(path) {
         Err(e) if e.raw_os_error() == Some(libc::EACCES) => {}
         other => return other,
     }
     let mode = std::fs::metadata(path)?.permissions().mode();
-    let mut relaxed = std::fs::Permissions::from_mode(mode | 0o200);
-    std::fs::set_permissions(path, relaxed.clone())?;
-    let out = set_xattr(path, name, value);
-    relaxed.set_mode(mode);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o200))?;
+    let out = op(path);
     // Reported only if it is the only thing that went wrong. The caller is
     // owed the original failure ahead of this one.
-    let restored = std::fs::set_permissions(path, relaxed);
+    let restored = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
     out.and(restored)
+}
+
+/// Mark a file or directory "keep on device". A pinned file can be `0444` — a
+/// read-only cloud file, or a git pack — so it goes through the mode-defeating
+/// writer for the same reason `adopt_cloud_id` does.
+pub fn set_pinned(path: &Path) -> io::Result<()> {
+    write_xattr_even_if_read_only(path, XATTR_PINNED, b"1")
+}
+
+/// Clear the pin. Read-only-safe like [`set_pinned`], and absent-is-success like
+/// [`remove_xattr`]: un-pinning something already unpinned is not an error.
+pub fn clear_pinned(path: &Path) -> io::Result<()> {
+    with_temporarily_writable(path, |p| remove_xattr(p, XATTR_PINNED))
+}
+
+/// Presence-only, like every mark here — the value is not read.
+pub fn is_pinned(path: &Path) -> io::Result<bool> {
+    Ok(get_xattr(path, XATTR_PINNED)?.is_some())
 }
 
 pub fn get_xattr(path: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
