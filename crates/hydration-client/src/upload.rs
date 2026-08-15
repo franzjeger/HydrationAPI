@@ -229,6 +229,11 @@ pub enum Outcome {
     DeletedInstead,
     /// The file is gone and was never in the cloud: nothing to do at all.
     NothingToDo,
+    /// The path is sync-ignored (`.git/` or something `.hydration-ignore` names).
+    /// Nothing was sent and nothing needs removing; the file leaves the queue
+    /// without a Graph create, a collision refusal, or a retry — treated like
+    /// `NothingToDo` by the driver, but named so it is not mistaken for one.
+    Ignored,
     Failed(String),
 }
 
@@ -417,6 +422,16 @@ pub fn run_upload<S: Sink>(file: FileId, store: &mut Store, sink: &mut S) -> Out
             return Outcome::NothingToDo;
         };
         let path: PathBuf = entry.path.clone();
+        // Sync-ignore, SAFETY-CRITICAL: the one choke every queued upload passes,
+        // whatever fed it — live `changed(FileId)` (no path until here), resync
+        // `dirty_files`, or a retry. Drop it before `sink.upload`: no Graph
+        // create, no collision refusal, no `queue.failed`/backoff, no per-attempt
+        // log. The producer-side filters keep most ignored paths from ever being
+        // queued; this is the guarantee that one that slips through still never
+        // reaches the provider.
+        if store.path_is_ignored(&path) {
+            return Outcome::Ignored;
+        }
         let existing = entry.cloud_id.clone();
         // Read from the file, not from anything this process happens to
         // remember. A provider's own memory of a tag only covers objects its

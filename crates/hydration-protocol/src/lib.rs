@@ -457,6 +457,16 @@ pub mod names {
     /// cloud or any other device.
     pub const LINEAGE: &str = ".hydration-lineage";
 
+    /// The optional per-device sync-ignore rules, read from the sync root. Like
+    /// [`LINEAGE`], it is `is_internal` — so it is never uploaded, never listed
+    /// in the §6d manifest, and (the security-relevant part) a cloud object can
+    /// never claim this name and push an ignore file that silences uploads of
+    /// the user's own data. The framework reads it and never writes it: a
+    /// framework write inside the marked root by the process that answers its
+    /// own events is the §6a-ter trap, so the rules stay user-authored. See the
+    /// `ignore` module for the format.
+    pub const IGNORE: &str = ".hydration-ignore";
+
     /// True for anything the framework wrote for its own purposes.
     ///
     /// Matched on the file name alone, so it holds at any depth — scratch names
@@ -466,6 +476,7 @@ pub mod names {
             || name == concat!(".hydration-manifest", ".tmp")
             || name == LINEAGE
             || name == concat!(".hydration-lineage", ".tmp")
+            || name == IGNORE
             || is_scratch(name)
     }
 
@@ -485,6 +496,203 @@ pub mod names {
             return false;
         };
         !base.is_empty() && !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit())
+    }
+}
+
+/// Paths the framework never syncs, in either direction — the user's `.git/`
+/// repositories and whatever else a `.hydration-ignore` names.
+///
+/// A THIRD exclusion, distinct from [`names::is_internal`] (the framework's own
+/// files, a fixed invariant) and from the backup-exclusion policy (backup
+/// tools, by cgroup). This one is user/product policy about the user's own data:
+/// a matched path is a *benign skip*, quietly left alone — never a
+/// `PathRefused`, never uploaded, never materialised as a placeholder, and never
+/// withdrawn. It is deliberately not folded into `is_internal`, whose signature
+/// is a single leaf name and whose hits are security refusals; this matches a
+/// path *component* and its whole subtree, and lives in `Config`, never in the
+/// privileged helper.
+///
+/// The default is `.git`. Git rewrites `.git/index`, refs, and logs constantly
+/// via atomic rename, which strips the framework's xattrs, so each rewrite
+/// collides by name with the cloud copy and the upload is safely refused — but
+/// the queue keeps re-attempting and the tree fingerprint keeps moving. Syncing
+/// an active `.git/` is a cross-device corruption anti-pattern besides. So it is
+/// not synced at all.
+pub mod ignore {
+    use std::path::{Component, Path};
+
+    /// A loaded rule set. `.git` (a component rule) is always present and the
+    /// config cannot remove it — including through [`Default`], so a `Config`
+    /// that never loads a file still ignores `.git`.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct IgnoreSet {
+        /// Matched against any single path component, at any depth: `node_modules`
+        /// matches `a/node_modules/b`. `.git` is always here.
+        component: Vec<String>,
+        /// Matched anchored at the root: `build/out` ignores that subtree but not
+        /// `src/build/out`.
+        prefix: Vec<String>,
+    }
+
+    impl Default for IgnoreSet {
+        /// The built-in set — `.git`, always. Same as `from_config("")`, so the
+        /// default is never "ignore nothing": `.git` cannot be turned off.
+        fn default() -> Self {
+            Self::from_config("")
+        }
+    }
+
+    impl IgnoreSet {
+        /// The built-in set: just the `.git` component. Equivalent to
+        /// `from_config("")` and to [`IgnoreSet::default`].
+        pub fn builtin() -> IgnoreSet {
+            Self::default()
+        }
+
+        /// Parse `.hydration-ignore` text into a rule set. Pure: no I/O.
+        ///
+        /// One pattern per line. `#`-comment and blank lines are skipped, trailing
+        /// whitespace trimmed. A line with **no `/`** is a component rule (matched
+        /// at any depth); a line **with a `/`** is an anchored prefix rule
+        /// (root-relative). A pattern containing a `..` component is rejected —
+        /// dropped — because an ignore rule is never meant to reason about
+        /// escaping the root. This is deliberately **not** gitignore glob syntax:
+        /// no `*`/`?`/`**`, no `!` negation, no ordering. `.git` is seeded
+        /// unconditionally, so an empty or absent file still ignores `.git`.
+        pub fn from_config(contents: &str) -> IgnoreSet {
+            let mut component = vec![".git".to_string()];
+            let mut prefix = Vec::new();
+            for raw in contents.lines() {
+                let line = raw.trim_end();
+                let line = line.strip_prefix('\u{feff}').unwrap_or(line); // stray BOM
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                // A `..` anywhere is a rule that reasons about escaping the root;
+                // reject rather than normalise it later.
+                if line.split('/').any(|c| c == "..") {
+                    continue;
+                }
+                if line.contains('/') {
+                    // Anchored prefix. Strip leading/trailing slashes so `/build/`
+                    // and `build` mean the same subtree; an all-slash line is
+                    // empty and dropped.
+                    let p = line.trim_matches('/');
+                    if !p.is_empty() {
+                        prefix.push(p.to_string());
+                    }
+                } else {
+                    // Component rule, matched at any depth.
+                    component.push(line.to_string());
+                }
+            }
+            IgnoreSet { component, prefix }
+        }
+
+        /// True iff `rel` (root-relative, no leading `/`) is under an ignore rule:
+        /// any of its components equals a component rule, or it equals or is
+        /// under an anchored prefix rule. Byte-exact and case-sensitive — `.git`
+        /// and `.GIT` are different directories on a Linux fs, and a
+        /// case-insensitive match could silence a user's real `.GIT` data.
+        pub fn is_ignored(&self, rel: &Path) -> bool {
+            for c in rel.components() {
+                if let Component::Normal(os) = c {
+                    if os
+                        .to_str()
+                        .is_some_and(|s| self.component.iter().any(|r| r == s))
+                    {
+                        return true;
+                    }
+                }
+            }
+            if let Some(rs) = rel.to_str() {
+                for p in &self.prefix {
+                    if rs == p || rs.starts_with(p) && rs.as_bytes().get(p.len()) == Some(&b'/') {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn ign(p: &str) -> bool {
+            IgnoreSet::builtin().is_ignored(Path::new(p))
+        }
+
+        #[test]
+        fn git_component_matches_at_any_depth() {
+            assert!(ign(".git"));
+            assert!(ign(".git/HEAD"));
+            assert!(ign("a/.git/index"));
+            assert!(ign("a/b/.git/refs/heads/main"));
+        }
+
+        #[test]
+        fn basename_lookalikes_are_not_ignored() {
+            assert!(!ign(".gitignore"));
+            assert!(!ign(".gitattributes"));
+            assert!(!ign(".github/workflows/ci.yml"));
+            assert!(!ign("foo.gitconfig"));
+            // A bare-repo directory named `foo.git` is not the default `.git`.
+            assert!(!ign("foo.git/HEAD"));
+            assert!(!ign("src/git/thing"));
+        }
+
+        #[test]
+        fn a_gitlink_file_named_dot_git_is_ignored() {
+            // In a worktree/submodule `.git` is a regular file containing
+            // `gitdir: …`; the component name matches regardless of file type.
+            assert!(ign("submodule/.git"));
+        }
+
+        #[test]
+        fn case_sensitive_dot_git_is_not_ignored() {
+            assert!(!ign(".GIT/HEAD"));
+            assert!(!ign("a/.Git/index"));
+        }
+
+        #[test]
+        fn component_rule_matches_at_any_depth_prefix_rule_is_anchored() {
+            let set = IgnoreSet::from_config("node_modules\nbuild/out\n");
+            assert!(set.is_ignored(Path::new("node_modules/x")));
+            assert!(set.is_ignored(Path::new("a/node_modules/x")));
+            assert!(set.is_ignored(Path::new("build/out")));
+            assert!(set.is_ignored(Path::new("build/out/artifact")));
+            // Anchored: the same name deeper is NOT the prefix rule.
+            assert!(!set.is_ignored(Path::new("src/build/out")));
+            // And a prefix rule is not a substring: `build/outer` is not under it.
+            assert!(!set.is_ignored(Path::new("build/outer")));
+        }
+
+        #[test]
+        fn comments_blank_lines_and_trailing_ws_are_ignored_lines() {
+            let set = IgnoreSet::from_config("# a comment\n\n  \ntarget   \n");
+            assert!(set.is_ignored(Path::new("target/debug")));
+            assert!(set.is_ignored(Path::new("a/target/x")));
+            assert!(!set.is_ignored(Path::new("# a comment/x")));
+        }
+
+        #[test]
+        fn a_pattern_with_dotdot_is_rejected_at_parse() {
+            let set = IgnoreSet::from_config("../escape\nok/here\n..\n");
+            assert!(!set.is_ignored(Path::new("escape")));
+            assert!(set.is_ignored(Path::new("ok/here")));
+            // Only the built-in .git and the valid `ok/here` survived.
+            assert_eq!(set, IgnoreSet::from_config("ok/here\n"));
+        }
+
+        #[test]
+        fn empty_config_still_ignores_git() {
+            assert!(IgnoreSet::from_config("").is_ignored(Path::new("x/.git/y")));
+            // The default is the built-in, never "ignore nothing".
+            assert!(IgnoreSet::default().is_ignored(Path::new(".git")));
+            assert_eq!(IgnoreSet::default(), IgnoreSet::builtin());
+        }
     }
 }
 

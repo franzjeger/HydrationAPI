@@ -254,11 +254,20 @@ fn dirty_files(root: &std::path::Path) -> io::Result<Resync> {
     use std::os::unix::fs::MetadataExt;
 
     let mut found = Resync::default();
+    let ignore = crate::store::load_ignore(root);
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for e in std::fs::read_dir(&dir)?.flatten() {
             let path = e.path();
             let Ok(md) = e.metadata() else { continue };
+            // Sync-ignore: never queue a `.git/` file for resync — it is not
+            // synced, and its constant churn would otherwise refill the queue.
+            if path
+                .strip_prefix(root)
+                .is_ok_and(|rel| ignore.is_ignored(rel))
+            {
+                continue;
+            }
             if md.is_dir() {
                 stack.push(path);
                 continue;
@@ -1084,7 +1093,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     }
                     if !folders_gone_pending.is_empty() {
                         let known = tracked.load(Ordering::SeqCst) as usize;
-                        apply_folder_removals(&folders_gone_pending, known, &mut sink);
+                        apply_folder_removals(&mount, &folders_gone_pending, known, &mut sink);
                         folders_gone_pending.clear();
                     }
                     if !folders_pending.is_empty() && std::time::Instant::now() >= next_folder_retry
@@ -1780,6 +1789,19 @@ fn detect_offline_removals(root: &std::path::Path) -> Vec<(String, String)> {
     for (path, record) in crate::lineage::Lineage::load(root).entries() {
         journal.insert(path.to_string(), record.cloud_id.clone());
     }
+    // SAFETY-CRITICAL — the sync-ignore transition. Last run's journal was
+    // written before the ignore was switched on, so it still records every
+    // `.git/` path the old client uploaded (measured: 1,292 of them carry a
+    // recoverable cloud id). Without this line, the first start after the switch
+    // reads them all as offline deletions — the scan no longer records ignored
+    // paths, so they look "gone" — and, being under the removal ceiling, silently
+    // withdraws 1,292 real objects from the cloud. Dropping them from the journal
+    // here makes an ignored path unable to be a withdrawal candidate at all,
+    // whatever the present-scan sees. Going forward the lineage self-cleans
+    // (ignored paths stop being scanned/recorded); this covers the one-time
+    // read of a journal that predates the switch.
+    let ignore = crate::store::load_ignore(root);
+    journal.retain(|path, _| !ignore.is_ignored(std::path::Path::new(path)));
     if journal.is_empty() {
         return Vec::new();
     }
@@ -1886,6 +1908,7 @@ fn has_cloud_identity(path: &std::path::Path) -> bool {
 /// only be created after its parent has a stable identity.
 fn unidentified_folders(root: &std::path::Path) -> io::Result<BTreeSet<String>> {
     let mut found = BTreeSet::new();
+    let ignore = crate::store::load_ignore(root);
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir)? {
@@ -1904,6 +1927,16 @@ fn unidentified_folders(root: &std::path::Path) -> io::Result<BTreeSet<String>> 
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(hydration_protocol::names::is_internal)
+            {
+                continue;
+            }
+            // Sync-ignore: skip the whole subtree, before pushing or queueing it.
+            // This closes a real upload-side leak: a `.git` dir has leaf `.git`
+            // (is_internal false), so without this it is descended and every
+            // `.git/refs/...` is queued as a cloud folder-create.
+            if path
+                .strip_prefix(root)
+                .is_ok_and(|rel| ignore.is_ignored(rel))
             {
                 continue;
             }
@@ -1933,9 +1966,19 @@ fn apply_folder_creates<S: Sink>(
     use std::os::unix::fs::MetadataExt;
 
     let mut recorded = Vec::new();
+    let ignore = crate::store::load_ignore(root);
     let mut paths: Vec<_> = pending.iter().cloned().collect();
     paths.sort_by_key(|path| (path.matches('/').count(), path.clone()));
     for rel in paths {
+        // Sync-ignore: never create an ignored folder in the cloud.
+        // unidentified_folders already prunes these before they reach `pending`;
+        // this is belt-and-braces, and it drops the stale entry so it does not
+        // sit in `pending` forever.
+        if ignore.is_ignored(std::path::Path::new(&rel)) {
+            pending.remove(&rel);
+            committed.remove(&rel);
+            continue;
+        }
         let path = root.join(&rel);
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             pending.remove(&rel);
@@ -2051,6 +2094,7 @@ fn apply_renames<S: Sink>(
     renamed: &[crate::removals::Renamed],
     sink: &mut S,
 ) {
+    let ignore = crate::store::load_ignore(root);
     for item in renamed {
         let internal = |path: &str| {
             std::path::Path::new(path)
@@ -2058,7 +2102,14 @@ fn apply_renames<S: Sink>(
                 .and_then(|name| name.to_str())
                 .is_some_and(hydration_protocol::names::is_internal)
         };
-        if internal(&item.from) || internal(&item.to) {
+        // Sync-ignore beside is_internal: a rename touching an ignored path is
+        // not carried to the cloud — a `.git/` file renamed under its own repo
+        // is not a namespace move the cloud should hear about.
+        if internal(&item.from)
+            || internal(&item.to)
+            || ignore.is_ignored(std::path::Path::new(&item.from))
+            || ignore.is_ignored(std::path::Path::new(&item.to))
+        {
             continue;
         }
 
@@ -2140,7 +2191,16 @@ fn apply_removals<S: Sink>(
     }
 
     let mut registers = Registers::load(root);
+    let ignore = crate::store::load_ignore(root);
     for g in gone {
+        // Sync-ignore: a local `rm -rf .git` must not withdraw the cloud copies.
+        // An ignored path that was uploaded once still has a recoverable cloud
+        // id (measured: nearly all of them do), so without this the deletion
+        // would delete the cloud object. Ignore is prospective and sync-only —
+        // it leaves what is already in the cloud alone.
+        if ignore.is_ignored(std::path::Path::new(&g.path)) {
+            continue;
+        }
         let how = if g.moved_out {
             "moved out of"
         } else {
@@ -2192,10 +2252,12 @@ fn apply_removals<S: Sink>(
 /// Withdraw directories only through the provider's explicit empty-folder
 /// contract. A generic object delete is intentionally unavailable here.
 fn apply_folder_removals<S: Sink>(
+    root: &std::path::Path,
     gone: &[crate::removals::FolderGone],
     known: usize,
     sink: &mut S,
 ) {
+    let ignore = crate::store::load_ignore(root);
     let ceiling = removal_ceiling(known);
     if gone.len() > ceiling {
         eprintln!(
@@ -2220,6 +2282,11 @@ fn apply_folder_removals<S: Sink>(
         )
     });
     for folder in ordered {
+        // Sync-ignore: a deleted `.git/` folder must not withdraw its cloud
+        // copy. Prospective and sync-only — leave what is already in the cloud.
+        if ignore.is_ignored(std::path::Path::new(&folder.path)) {
+            continue;
+        }
         let how = if folder.moved_out {
             "moved out of"
         } else {
@@ -2745,6 +2812,7 @@ mod tests {
     fn folder_deletes_are_versioned_and_deepest_first() {
         let mut sink = DeleteSink::default();
         apply_folder_removals(
+            std::path::Path::new("/no/such/root"),
             &[
                 crate::removals::FolderGone {
                     path: "Work".into(),
@@ -2782,6 +2850,7 @@ mod tests {
     fn folder_delete_without_both_identity_and_version_never_reaches_the_sink() {
         let mut sink = DeleteSink::default();
         apply_folder_removals(
+            std::path::Path::new("/no/such/root"),
             &[
                 crate::removals::FolderGone {
                     path: "local-only".into(),
@@ -2821,7 +2890,7 @@ mod tests {
             .collect();
         let mut sink = DeleteSink::default();
 
-        apply_folder_removals(&gone, 0, &mut sink);
+        apply_folder_removals(std::path::Path::new("/no/such/root"), &gone, 0, &mut sink);
 
         assert!(sink.folders.is_empty());
         assert!(sink.known.is_empty());
@@ -3424,6 +3493,66 @@ mod tests {
         write_manifest(&root, &[("a.txt", "idA")]);
         place(&root, "a.txt", "idA");
         assert!(detect_offline_removals(&root).is_empty());
+    }
+
+    /// The highest-risk test in the sync-ignore feature: enabling the ignore must
+    /// withdraw nothing offline. Last run's journal — written before the switch —
+    /// still records every `.git/` path the old client uploaded (measured on the
+    /// live account: 1,292 with a recoverable cloud id). On the first start after
+    /// the switch the scan stops recording them, so by absence they look deleted,
+    /// and withdrawing them would delete real objects from the cloud.
+    /// `journal.retain` drops ignored paths before the gone-set is computed, so
+    /// not one becomes a candidate — while an ordinary offline deletion beside
+    /// them still is, proving the guard is selective, not "delete nothing".
+    #[test]
+    fn enabling_ignore_withdraws_nothing_offline() {
+        let root = scratch("offline/ignore-transition");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_manifest(
+            &root,
+            &[
+                ("Projects/Aurora/.git/index", "id1"),
+                ("Projects/Aurora/.git/HEAD", "id2"),
+                ("Projects/Aurora/.git/refs/heads/main", "id3"),
+                ("a/b/.git/config", "id4"),
+                ("submodule/.git", "id5"), // a gitlink file
+                ("Documents/report.txt", "idReal"),
+            ],
+        );
+        // Nothing is placed on disk, so every journal path looks gone. Without the
+        // retain, the .git/ paths would all be withdrawal candidates.
+        let gone: Vec<String> = detect_offline_removals(&root)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(
+            gone,
+            vec!["Documents/report.txt".to_string()],
+            "a .git/ path was an offline withdrawal candidate — the transition would \
+             mass-delete the user's cloud objects"
+        );
+    }
+
+    /// The folder-create leak, closed. A `.git` directory has leaf `.git`
+    /// (is_internal false), so before the sync-ignore it was descended and every
+    /// `.git/refs/...` was queued as a cloud folder-create. It must not be now.
+    #[test]
+    fn unidentified_folders_does_not_descend_git() {
+        let root = ctl_scratch("unidentified-git");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("repo/.git/refs/heads")).unwrap();
+        std::fs::create_dir_all(root.join("Projects/NewThing")).unwrap();
+
+        let found = unidentified_folders(&root).unwrap();
+        assert!(
+            found.iter().any(|p| p == "Projects/NewThing"),
+            "an ordinary new folder must be a folder-create candidate: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p.contains(".git")),
+            "a .git subtree was queued as cloud folder-creates (the leak): {found:?}"
+        );
     }
 
     /// A whole-root disappearance is refused: everything gone is a wrong or

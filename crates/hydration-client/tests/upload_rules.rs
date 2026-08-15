@@ -477,3 +477,39 @@ fn a_failing_upload_backs_off_instead_of_asking_every_quiet_period() {
         "an edit waited out the failure penalty rather than the quiet period: {waited:?}"
     );
 }
+
+/// A `.git/` file that reached the queue (via the live `changed(FileId)` path,
+/// before any scan gate) is dropped at the one path-resolving choke: no PUT, no
+/// Graph create, no collision refusal. Load-bearing, not belt-and-braces —
+/// ignored files ARE indexed (so an existing placeholder still hydrates on
+/// read), so this is where the live path actually drops an ignored upload.
+#[test]
+fn run_upload_of_an_ignored_path_touches_no_sink() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = scratch("ignored-no-upload");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("repo/.git")).unwrap();
+    let p = dir.join("repo/.git/index");
+    std::fs::write(&p, b"git index").unwrap();
+
+    let mut store = Store::new();
+    store.scan(&dir).unwrap();
+    let md = std::fs::metadata(&p).unwrap();
+    let id = FileId {
+        fsid: md.dev(),
+        ino: md.ino(),
+    };
+    assert!(
+        store.lookup(&id).is_some(),
+        "an ignored file must stay indexed so the fetch path can hydrate it"
+    );
+
+    let mut sink = Recorder::default();
+    let outcome = run_upload(id, &mut store, &mut sink);
+    assert!(matches!(outcome, Outcome::Ignored), "{outcome:?}");
+    assert!(
+        sink.ops().is_empty(),
+        "an ignored path reached the sink: {:?}",
+        sink.ops()
+    );
+}

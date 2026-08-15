@@ -290,6 +290,12 @@ pub struct Applied {
     /// Objects that arrived under a new path and were renamed locally rather
     /// than duplicated.
     pub moved: usize,
+    /// Changes skipped because their path is sync-ignored (`.git/` and whatever
+    /// `.hydration-ignore` names). A benign no-op with its own count — not a
+    /// failure, not a conflict, and never a `PathRefused`: nothing was created,
+    /// overwritten, or removed, and the pass still records its fingerprint so an
+    /// identical batch is skipped next round.
+    pub ignored: usize,
     /// Changes deliberately not applied because local content would have been
     /// lost. Not an error, and not silent: these are what a conflict UI is for.
     pub kept_local: Vec<Kept>,
@@ -402,6 +408,11 @@ pub fn apply_remembering<M: Materialise>(
         return Ok(out);
     }
 
+    // The sync-ignore rules the scan above already indexed by, cloned so the
+    // loop can consult them without holding a borrow of the store alongside
+    // `by_cloud_id`. `.git` is always in here (the built-in default).
+    let ignore = store.ignore().clone();
+
     // Cloud id -> local file, for the removal half. Built once rather than per
     // change, because a removal names an object and not a path.
     let mut by_cloud_id = store.by_cloud_id();
@@ -451,6 +462,25 @@ pub fn apply_remembering<M: Materialise>(
             }
         }
         let change = &change;
+        // Sync-ignore, SAFETY-CRITICAL: a path the framework never syncs is
+        // skipped here, before any arm can create, overwrite, or remove an
+        // on-disk object for it — before both `place()` calls and before
+        // `safe_join`. A benign skip with its own count, never a `PathRefused`
+        // (which several callers retry forever). The create/folder-remove arms
+        // carry the cloud-declared path; the file `Removed` arm has none (it
+        // resolves from the id) and is covered by the scan exclusion plus a
+        // resolved-path guard inside that arm. FolderRemoved ALSO resolves by id,
+        // so it carries its own resolved-path guard too.
+        let declared = match change {
+            Change::Upserted { path, .. }
+            | Change::FolderUpserted { path, .. }
+            | Change::FolderRemoved { path, .. } => Some(path.as_str()),
+            Change::Removed { .. } => None,
+        };
+        if declared.is_some_and(|p| ignore.is_ignored(std::path::Path::new(p))) {
+            out.ignored += 1;
+            continue;
+        }
         match change {
             Change::FolderUpserted {
                 cloud_id,
@@ -729,6 +759,20 @@ pub fn apply_remembering<M: Materialise>(
                     // wanted.
                     continue;
                 };
+                // Belt-and-braces to the scan/index gate: a `Removed` resolving to
+                // a real local file under an ignored path must never reach
+                // `mat.remove`. Ignored files ARE indexed (so the fetch path can
+                // still hydrate an existing placeholder), so `by_cloud_id` can
+                // contain them — this guard is what keeps a cloud echo from
+                // removing the user's real `.git/` file or withdrawing its id.
+                if entry
+                    .path
+                    .strip_prefix(root)
+                    .is_ok_and(|rel| ignore.is_ignored(rel))
+                {
+                    out.ignored += 1;
+                    continue;
+                }
                 let id = file_id(&match std::fs::metadata(&entry.path) {
                     Ok(md) => md,
                     Err(_) => continue,
@@ -768,6 +812,21 @@ pub fn apply_remembering<M: Materialise>(
                 let Some(existing) = folders.get(cloud_id) else {
                     continue;
                 };
+                // Sync-ignore, SAFETY-CRITICAL: a FolderRemoved locates its victim
+                // by cloud id, never by the declared `path`, so the top-of-loop
+                // skip (which tests `path`) does not protect it. `folders_by_cloud_id`
+                // walks the whole tree and picks up cloud ids stamped on `.git/`
+                // subdirectories before the ignore, so `existing` can be an ignored
+                // real directory. It must never be removed, nor its cloud identity
+                // stripped — that is the same cloud withdrawal the transition guards
+                // exist to prevent. Mirror the Removed arm's resolved-path guard.
+                if existing
+                    .strip_prefix(root)
+                    .is_ok_and(|rel| ignore.is_ignored(rel))
+                {
+                    out.ignored += 1;
+                    continue;
+                }
                 if existing == root {
                     // The provider rejects root deletion, but this boundary is
                     // destructive enough to defend independently.

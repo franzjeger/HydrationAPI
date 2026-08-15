@@ -1013,3 +1013,111 @@ fn a_pass_that_did_work_does_not_arm_the_skip_against_the_tree_it_started_from()
          been created yet"
     );
 }
+
+// --- sync-ignore: a path the framework never syncs is skipped before any arm ---
+
+#[test]
+fn an_ignored_upsert_creates_no_placeholder() {
+    let root = scratch("ignore-no-placeholder");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    let changes = vec![upserted("repo/.git/index", 4096, "cloud-git")];
+    let mut store = Store::new();
+    let mut rec = Recorder::default();
+    let applied: Applied =
+        apply(&root, &changes, &mut store, &Default::default(), &mut rec).unwrap();
+
+    assert_eq!(
+        applied.ignored, 1,
+        "the .git/ upsert was not counted as ignored"
+    );
+    assert_eq!(applied.created, 0);
+    assert!(
+        rec.placed.is_empty(),
+        "a placeholder was created for a .git/ path"
+    );
+    assert!(
+        !root.join("repo/.git/index").exists(),
+        "an ignored remote path was materialised on disk"
+    );
+    assert!(
+        applied.failed.is_empty(),
+        "an ignored skip must not be a failure"
+    );
+}
+
+#[test]
+fn an_ignored_upsert_never_overwrites_a_real_file() {
+    // The P1(b) data-loss state: a real .git/ file uploaded once (cloud id, clean
+    // stamp) whose cloud etag/size has since diverged. Without the ignore this
+    // falls through every guard in the Ok(md) branch to place() and becomes an
+    // un-hydratable placeholder over the user's real repo file.
+    let root = scratch("ignore-no-overwrite");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("repo/.git")).unwrap();
+    let p = root.join("repo/.git/index");
+    std::fs::write(&p, b"the user's real git index").unwrap();
+    store::set_xattr(&p, store::XATTR_ID, b"cloud-git").unwrap();
+    hydration_protocol::stamp::write(&p).unwrap();
+    let before_id = file_id(&p);
+    let before_bytes = std::fs::read(&p).unwrap();
+
+    let changes = vec![upserted("repo/.git/index", 999_999, "cloud-git")];
+    let mut store = Store::new();
+    let mut rec = Recorder::default();
+    let applied: Applied =
+        apply(&root, &changes, &mut store, &Default::default(), &mut rec).unwrap();
+
+    assert_eq!(applied.ignored, 1);
+    assert!(
+        rec.placed.is_empty(),
+        "place() was called on a real .git/ file"
+    );
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        before_bytes,
+        "the real .git file's content was changed"
+    );
+    assert_eq!(
+        file_id(&p),
+        before_id,
+        "the real .git file's inode was swapped"
+    );
+}
+
+#[test]
+fn an_ignored_folder_remove_never_removes_the_dir() {
+    // A FolderRemoved resolves its victim by cloud id, not the declared path, so
+    // it must be guarded on the RESOLVED path. On the live account, `.git/`
+    // subdirectories carry cloud ids stamped before the ignore; a remote
+    // FolderRemoved whose id resolves to one of them must not delete it or strip
+    // its identity (that is a cloud withdrawal).
+    let root = scratch("ignore-folder-remove");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("repo/.git/refs")).unwrap();
+    let refs = root.join("repo/.git/refs");
+    store::set_xattr(&refs, store::XATTR_ID, b"G-refs").unwrap();
+
+    // Declared path is innocuous ("notes"); the cloud id resolves to .git/refs.
+    let changes = vec![Change::FolderRemoved {
+        cloud_id: "G-refs".into(),
+        path: "notes".into(),
+    }];
+    let mut store = Store::new();
+    let mut rec = Recorder::default();
+    let applied: Applied =
+        apply(&root, &changes, &mut store, &Default::default(), &mut rec).unwrap();
+
+    assert!(
+        refs.is_dir(),
+        "an ignored .git/ directory was removed by a FolderRemoved"
+    );
+    assert_eq!(
+        store::get_xattr(&refs, store::XATTR_ID).unwrap().as_deref(),
+        Some(b"G-refs".as_ref()),
+        "the ignored directory's cloud identity was stripped (a withdrawal)"
+    );
+    assert_eq!(applied.removed, 0);
+    assert_eq!(applied.ignored, 1);
+}

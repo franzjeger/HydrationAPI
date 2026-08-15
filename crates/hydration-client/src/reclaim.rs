@@ -105,6 +105,17 @@ pub fn reclaim(
         ))));
     };
 
+    // Sync-ignore: an ignored path is never evicted, even by an explicit `evict`.
+    // Defence-in-depth to the enumerator's skip, and load-bearing where the file
+    // carries a cloud id — the no-cloud-id gate below would otherwise let a real
+    // `.git/` file be dehydrated into a placeholder. Loaded fresh so the answer
+    // matches the current `.hydration-ignore`, not a possibly-stale store.
+    if crate::store::load_ignore(root).is_ignored(std::path::Path::new(rel)) {
+        return Ok(Err(Refused::NotEligible(format!(
+            "{rel:?} is sync-ignored and is kept as a real local file"
+        ))));
+    }
+
     let md = match std::fs::metadata(&joined) {
         Ok(md) if md.is_file() => md,
         Ok(_) => return Ok(Err(Refused::NotEligible("not a regular file".to_string()))),
@@ -367,8 +378,9 @@ fn collect_dehydrated(dir: &Path, root: &Path, out: &mut Vec<String>) -> io::Res
 /// Keep-on-Device groundwork flagged for exactly this policy.
 pub fn evictable_candidates(root: &Path) -> io::Result<Vec<crate::evict_policy::Candidate>> {
     let real_root = root.canonicalize()?;
+    let ignore = crate::store::load_ignore(&real_root);
     let mut out = Vec::new();
-    collect_residents(&real_root, &real_root, false, &mut out)?;
+    collect_residents(&real_root, &real_root, false, &ignore, &mut out)?;
     Ok(out)
 }
 
@@ -376,6 +388,7 @@ fn collect_residents(
     dir: &Path,
     root: &Path,
     ancestor_pinned: bool,
+    ignore: &hydration_protocol::ignore::IgnoreSet,
     out: &mut Vec<crate::evict_policy::Candidate>,
 ) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -392,8 +405,19 @@ fn collect_residents(
         }
         let file_type = entry.file_type()?;
         let path = entry.path();
+        // Sync-ignore: an ignored subtree (`.git/` and anything a
+        // `.hydration-ignore` names) is never an eviction target. Load-bearing,
+        // not defence-in-depth: an already-uploaded `.git/` file carries a cloud
+        // id, so the no-cloud-id gate below does NOT protect it, and dehydrating a
+        // real repo file into a placeholder is exactly the corruption to avoid.
+        if path
+            .strip_prefix(root)
+            .is_ok_and(|rel| ignore.is_ignored(rel))
+        {
+            continue;
+        }
         if file_type.is_dir() {
-            collect_residents(&path, root, dir_pinned, out)?;
+            collect_residents(&path, root, dir_pinned, ignore, out)?;
             continue;
         }
         // A symlink is neither `is_dir` nor `is_file`, so it is skipped and the
@@ -517,6 +541,37 @@ mod tests {
 
         assert_eq!(run(&dir, "draft.md"), Err(Refused::NotUploaded));
         assert_eq!(std::fs::read(&p).unwrap(), b"written offline, never sent");
+    }
+
+    /// A resident `.git/` file that *was* uploaded — cloud id, clean stamp — is
+    /// never an eviction candidate. Load-bearing, not defence-in-depth: the
+    /// no-cloud-id gate does not protect it (it has one), so only the sync-ignore
+    /// keeps a real repo file from being dehydrated into a placeholder.
+    #[test]
+    fn an_ignored_never_uploaded_file_is_never_an_eviction_candidate() {
+        let dir = scratch("ignored-not-evictable");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("repo/.git")).unwrap();
+        synced(&dir.join("repo/.git"), "index", &vec![b'g'; 8192]); // cloud id + clean
+        synced(&dir, "report.pdf", &vec![b'x'; 8192]); // an ordinary resident
+
+        let candidates = evictable_candidates(&dir).unwrap();
+        let rels: Vec<&str> = candidates.iter().map(|c| c.rel.as_str()).collect();
+        assert!(
+            rels.contains(&"report.pdf"),
+            "an ordinary resident must still be a candidate: {rels:?}"
+        );
+        assert!(
+            !rels.iter().any(|r| r.contains(".git")),
+            "a resident .git/ file (with a cloud id) was an eviction candidate: {rels:?}"
+        );
+
+        // The explicit reclaim entry refuses it too, so an `evict` verb cannot
+        // dehydrate it either.
+        assert!(matches!(
+            run(&dir, "repo/.git/index"),
+            Err(Refused::NotEligible(_))
+        ));
     }
 
     /// Edited since it was sent: those bytes exist only here, and no
