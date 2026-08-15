@@ -328,6 +328,10 @@ struct WatchState {
     excluded: u64,
     /// How many other mounts expose the sync files (§6.4a).
     exposures: u64,
+    /// How many fetches are in flight right now — the count a tray shows as
+    /// "downloading N". A live number, not a walk-derived one: it is the length
+    /// of the set the fetch role is bumping, sampled each tick.
+    downloading: u64,
 }
 
 impl WatchState {
@@ -336,10 +340,11 @@ impl WatchState {
     /// Key order is fixed and new keys may only ever be appended: a reader is
     /// told to ignore keys it does not recognise, and that promise is only
     /// worth having if the keys it does recognise stay where they were.
+    /// `downloading` is the newest key, so it goes last.
     fn line(&self) -> String {
         format!(
-            "unsent={} excluded={} exposures={}",
-            self.unsent, self.excluded, self.exposures
+            "unsent={} excluded={} exposures={} downloading={}",
+            self.unsent, self.excluded, self.exposures, self.downloading
         )
     }
 }
@@ -355,6 +360,7 @@ fn watch_state(
     queue: &Mutex<Queue<SystemClock>>,
     excluded: &AtomicU64,
     exposures: &Mutex<Vec<String>>,
+    in_flight: &AtomicU64,
 ) -> WatchState {
     let unsent = queue.lock().unwrap().pending() as u64;
     let exposures = exposures.lock().unwrap().len() as u64;
@@ -362,6 +368,10 @@ fn watch_state(
         unsent,
         excluded: excluded.load(Ordering::SeqCst),
         exposures,
+        // Relaxed: a display counter with no ordering relationship to the other
+        // fields, read a moment after the guards that move it, and off by at
+        // most one in-flight fetch either way is invisible in a tray.
+        downloading: in_flight.load(Ordering::Relaxed),
     }
 }
 
@@ -520,17 +530,19 @@ impl Watchers {
 /// - `watch` — one state line immediately, another every time the state
 ///   changes, and nothing else ever, until the peer disconnects. A state line
 ///   is `key=value` pairs joined by single spaces, newline-terminated,
-///   currently `unsent=<u64> excluded=<u64> exposures=<u64>`: the upload
-///   queue's pending count, the manifest's file count as of its last build,
-///   and how many other mounts expose the sync files. Keys stay in that order
-///   and new keys are only ever appended, so a reader must ignore keys it does
-///   not recognise. An unchanged tuple is never re-sent.
+///   currently `unsent=<u64> excluded=<u64> exposures=<u64> downloading=<u64>`:
+///   the upload queue's pending count, the manifest's file count as of its last
+///   build, how many other mounts expose the sync files, and how many fetches
+///   are in flight right now. Keys stay in that order and new keys are only ever
+///   appended, so a reader must ignore keys it does not recognise. An unchanged
+///   tuple is never re-sent.
 fn control(
     socket: &std::path::Path,
     mount: PathBuf,
     queue: Arc<Mutex<Queue<SystemClock>>>,
     exposures: Arc<Mutex<Vec<String>>>,
     excluded: Arc<AtomicU64>,
+    in_flight: Arc<AtomicU64>,
     watchers: Arc<Watchers>,
 ) -> io::Result<()> {
     use std::io::{BufRead, BufReader, Write};
@@ -641,7 +653,7 @@ fn control(
                     // except that a watcher never times out on purpose — and
                     // thread-per-watcher would let a reconnect loop grow the
                     // daemon by one parked thread per attempt.
-                    watchers.adopt(out, watch_state(&queue, &excluded, &exposures));
+                    watchers.adopt(out, watch_state(&queue, &excluded, &exposures, &in_flight));
                     break;
                 }
                 "" => continue,
@@ -776,6 +788,10 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // own cadence anyway, and `status` refreshes the number for free whenever
     // it builds a manifest of its own.
     let excluded = Arc::new(AtomicU64::new(0));
+    // Fetches in flight, shared between whichever Daemon currently holds the
+    // helper connection (which bumps it) and the status thread (which reads it).
+    // Created here, before either exists, so both see the same counter.
+    let in_flight = Arc::new(AtomicU64::new(0));
     // Everyone who asked to be told when the numbers above move.
     let watchers = Arc::new(Watchers::default());
 
@@ -1360,16 +1376,17 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // asked for.
     {
         let ctl = config.socket.with_extension("ctl");
-        let (mount, q, ex, exc, ws) = (
+        let (mount, q, ex, exc, inf, ws) = (
             config.mount.clone(),
             Arc::clone(&queue),
             Arc::clone(&exposures),
             Arc::clone(&excluded),
+            Arc::clone(&in_flight),
             Arc::clone(&watchers),
         );
         eprintln!("hydration-sync: control socket at {}", ctl.display());
         std::thread::spawn(move || {
-            if let Err(e) = control(&ctl, mount, q, ex, exc, ws) {
+            if let Err(e) = control(&ctl, mount, q, ex, exc, inf, ws) {
                 eprintln!("hydration-sync: control socket unavailable: {e}");
             }
         });
@@ -1444,12 +1461,13 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // Status, the manifest that makes a backup honest — and the `watch`
     // broadcasts, which ride this thread rather than getting one of their own.
     {
-        let (q, stop, mount, exposures, excluded, watchers) = (
+        let (q, stop, mount, exposures, excluded, in_flight, watchers) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             config.mount.clone(),
             Arc::clone(&exposures),
             Arc::clone(&excluded),
+            Arc::clone(&in_flight),
             Arc::clone(&watchers),
         );
         std::thread::spawn(move || {
@@ -1518,7 +1536,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     }
                 }
                 tick = (tick + 1) % TICKS_PER_MANIFEST;
-                watchers.broadcast(watch_state(&q, &excluded, &exposures));
+                watchers.broadcast(watch_state(&q, &excluded, &exposures, &in_flight));
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
@@ -1547,6 +1565,9 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     resync: Arc::clone(&resync),
                     exposures: Arc::clone(&exposures),
                 }));
+                // Bump the shared counter, so this connection's fetches show up
+                // in the same "downloading" number the status thread broadcasts.
+                daemon.track_fetches(Arc::clone(&in_flight));
                 let mut c = DaemonConn::new(conn)?;
                 if let Err(e) = daemon.serve(&mut c) {
                     eprintln!("hydration-sync: helper connection ended: {e}");
@@ -2825,6 +2846,7 @@ mod tests {
             unsent,
             excluded,
             exposures,
+            downloading: 0,
         }
     }
 
@@ -2851,15 +2873,16 @@ mod tests {
         let excluded = Arc::new(AtomicU64::new(7));
         let watchers = Arc::new(Watchers::default());
         {
-            let (s, m, q, e, x, w) = (
+            let (s, m, q, e, x, inf, w) = (
                 sock.clone(),
                 mount.clone(),
                 Arc::clone(&queue),
                 Arc::clone(&exposures),
                 Arc::clone(&excluded),
+                Arc::new(AtomicU64::new(0)),
                 Arc::clone(&watchers),
             );
-            std::thread::spawn(move || control(&s, m, q, e, x, w));
+            std::thread::spawn(move || control(&s, m, q, e, x, inf, w));
         }
         // The listener comes up on another thread; connecting retries until it
         // has. Deadlines are generous because the test machines run gates
@@ -2887,7 +2910,7 @@ mod tests {
         BufReader::new(watcher.try_clone().unwrap())
             .read_line(&mut first)
             .expect("watch was not answered with an immediate state line");
-        assert_eq!(first, "unsent=0 excluded=7 exposures=0\n");
+        assert_eq!(first, "unsent=0 excluded=7 exposures=0 downloading=0\n");
 
         // The watcher stays connected and says nothing more. Both other verbs
         // must still be answered on fresh connections, inside the read timeout
@@ -2938,15 +2961,16 @@ mod tests {
         let excluded = Arc::new(AtomicU64::new(0));
         let watchers = Arc::new(Watchers::default());
         {
-            let (s, m, q, e, x, w) = (
+            let (s, m, q, e, x, inf, w) = (
                 sock.clone(),
                 mount.clone(),
                 Arc::clone(&queue),
                 Arc::clone(&exposures),
                 Arc::clone(&excluded),
+                Arc::new(AtomicU64::new(0)),
                 Arc::clone(&watchers),
             );
-            std::thread::spawn(move || control(&s, m, q, e, x, w));
+            std::thread::spawn(move || control(&s, m, q, e, x, inf, w));
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let ask = |line: &str| -> String {
@@ -3026,15 +3050,16 @@ mod tests {
         let excluded = Arc::new(AtomicU64::new(0));
         let watchers = Arc::new(Watchers::default());
         {
-            let (s, m, q, e, x, w) = (
+            let (s, m, q, e, x, inf, w) = (
                 sock.clone(),
                 mount.clone(),
                 Arc::clone(&queue),
                 Arc::clone(&exposures),
                 Arc::clone(&excluded),
+                Arc::new(AtomicU64::new(0)),
                 Arc::clone(&watchers),
             );
-            std::thread::spawn(move || control(&s, m, q, e, x, w));
+            std::thread::spawn(move || control(&s, m, q, e, x, inf, w));
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         // Reads the *whole* reply, not one line — a `pending` answer is
@@ -3206,7 +3231,7 @@ mod tests {
 
         let mut line = String::new();
         peer.read_line(&mut line).unwrap();
-        assert_eq!(line, "unsent=3 excluded=1 exposures=0\n");
+        assert_eq!(line, "unsent=3 excluded=1 exposures=0 downloading=0\n");
 
         // The same tuple, twice. `broadcast` writes synchronously, so had a
         // line been written it would already be in our buffer — the timeout
@@ -3230,7 +3255,7 @@ mod tests {
         watchers.broadcast(state(2, 1, 0));
         line.clear();
         peer.read_line(&mut line).unwrap();
-        assert_eq!(line, "unsent=2 excluded=1 exposures=0\n");
+        assert_eq!(line, "unsent=2 excluded=1 exposures=0 downloading=0\n");
     }
 
     /// A watcher that hangs up during a quiet stretch must be noticed without
