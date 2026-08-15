@@ -60,12 +60,23 @@ impl Manifest {
         let mut entries = Vec::new();
         let mut unrecoverable = Vec::new();
         let mut stack = vec![root.to_path_buf()];
+        // Sync-ignored paths are not part of the synced set this manifest
+        // describes, so they are not listed as "missing from the backup". For
+        // consistency with the scan, not as a silencer — a bug that dehydrated an
+        // ignored path is prevented upstream (the delta skip), never hidden here.
+        let ignore = crate::store::load_ignore(root);
 
         while let Some(dir) = stack.pop() {
             for e in std::fs::read_dir(&dir)? {
                 let e = e?;
                 let path = e.path();
                 let Ok(md) = e.metadata() else { continue };
+                if path
+                    .strip_prefix(root)
+                    .is_ok_and(|rel| ignore.is_ignored(rel))
+                {
+                    continue;
+                }
                 if md.is_dir() {
                     stack.push(path);
                     continue;

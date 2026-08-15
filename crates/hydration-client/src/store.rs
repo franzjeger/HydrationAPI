@@ -59,11 +59,49 @@ pub struct Store {
     /// driver has another — and two of them writing the same file would each
     /// overwrite the other's view with its own. Exactly one writes.
     lineage_writes: bool,
+    /// Paths this store never indexes — the sync-ignore rules. Defaults to the
+    /// built-in `.git`; the daemon replaces it with the rules loaded from
+    /// `.hydration-ignore`. Held here because the scan, the upload driver, and
+    /// the delta pass all reach the store and must agree on the same answer.
+    ignore: hydration_protocol::ignore::IgnoreSet,
+}
+
+/// Load the sync-ignore rules from `<root>/.hydration-ignore`. A missing or
+/// unreadable file is the empty config — which still ignores `.git`. The one
+/// place the rules are read, so the scan, eviction, and the manifest builder all
+/// see the same file. Read-only: the framework never writes this file (§6a-ter —
+/// a framework write inside the marked root by the process that answers its own
+/// events is the deadlock), so the rules stay user-authored.
+pub fn load_ignore(root: &Path) -> hydration_protocol::ignore::IgnoreSet {
+    let path = root.join(hydration_protocol::names::IGNORE);
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    hydration_protocol::ignore::IgnoreSet::from_config(&contents)
 }
 
 impl Store {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The sync-ignore rules this store applies — refreshed from
+    /// `.hydration-ignore` by each [`Store::scan`], so the delta pass, the upload
+    /// driver, and eviction all read the same answer the scan indexed by, and a
+    /// change to the file takes effect on the next pass rather than a restart.
+    pub fn ignore(&self) -> &hydration_protocol::ignore::IgnoreSet {
+        &self.ignore
+    }
+
+    /// Whether an absolute path under the sync root is sync-ignored. Strips the
+    /// root the last scan recorded, so both component rules (`.git` at any depth)
+    /// and anchored-prefix rules match against the root-relative form. A path
+    /// with no known root, or outside it, is not ignored.
+    pub fn path_is_ignored(&self, abs: &Path) -> bool {
+        match self.root.as_deref() {
+            Some(root) => abs
+                .strip_prefix(root)
+                .is_ok_and(|rel| self.ignore.is_ignored(rel)),
+            None => false,
+        }
     }
 
     /// Maintain, across scans, the record of what each path's extended
@@ -136,6 +174,11 @@ impl Store {
         if self.lineage.is_some() {
             self.lineage = Some(crate::lineage::Lineage::load(root));
         }
+        // Refresh the sync-ignore rules from the root each scan, so editing
+        // `.hydration-ignore` takes effect on the next pass, not a restart — and
+        // so the delta/upload/eviction reads of `ignore()` match what this scan
+        // just indexed by.
+        self.ignore = load_ignore(root);
         self.root = Some(root.to_path_buf());
         self.index.clear();
         // Order-independent, because a directory walk is not ordered and two
@@ -186,7 +229,22 @@ impl Store {
                 {
                     continue;
                 }
-                if keeping_lineage {
+                // Sync-ignore is applied to the DECISIONS, not to the index. An
+                // ignored file (a `.git/` placeholder) is still indexed, because
+                // the fetch path resolves a FileId to a cloud id through this
+                // index (`Daemon::resolve`), and an existing placeholder must keep
+                // hydrating on read — ignore means "stop syncing", never "serve
+                // zeros" or "make local". What ignoring changes here is only that
+                // the file does not contribute to the tree fingerprint (so git's
+                // constant `.git/` rewrites cannot defeat the delta no-op skip)
+                // and is not recorded in the lineage (which would churn with it).
+                // The upload driver and the delta pass gate on `ignore`
+                // separately, so an indexed ignored file is still never uploaded
+                // or materialised over.
+                let ignored = path
+                    .strip_prefix(root)
+                    .is_ok_and(|rel| self.ignore.is_ignored(rel));
+                if keeping_lineage && !ignored {
                     if let Some(rel) = crate::lineage::relative(root, &path) {
                         // Placeholders are left out, and the reason is size.
                         //
@@ -227,7 +285,10 @@ impl Store {
                         }
                     }
                 }
-                {
+                // Ignored files are indexed (above/below) but never fingerprinted:
+                // this is what keeps git's `.git/index` churn from moving the
+                // number the delta pass skips on.
+                if !ignored {
                     use std::hash::{Hash, Hasher};
                     let mut h = std::collections::hash_map::DefaultHasher::new();
                     path.hash(&mut h);
@@ -514,4 +575,88 @@ pub fn remembered_mode(path: &Path) -> Option<u32> {
 
 pub fn remember_mode(path: &Path, mode: u32) -> io::Result<()> {
     set_xattr(path, XATTR_MODE, mode.to_string().as_bytes())
+}
+
+#[cfg(test)]
+mod ignore_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = test_scratch::scratch(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+            &format!("store-ignore/{name}"),
+        );
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn id(p: &Path) -> FileId {
+        let md = std::fs::metadata(p).unwrap();
+        FileId {
+            fsid: md.dev(),
+            ino: md.ino(),
+        }
+    }
+
+    /// Ignore is applied to the decisions, not the index. An ignored `.git/`
+    /// file stays indexed — the fetch path resolves a FileId to a cloud id
+    /// through this index, and an existing `.git/` placeholder must keep
+    /// hydrating on read (ignore stops syncing, it never serves zeros). What it
+    /// must NOT do is move the fingerprint; that is the sibling test.
+    #[test]
+    fn an_ignored_file_stays_indexed_for_the_fetch_path() {
+        let root = scratch("indexed");
+        std::fs::create_dir_all(root.join("repo/.git/refs/heads")).unwrap();
+        std::fs::write(root.join("repo/.git/index"), b"x").unwrap();
+        std::fs::write(root.join("repo/.git/refs/heads/main"), b"x").unwrap();
+        std::fs::write(root.join("repo/README.md"), b"real").unwrap();
+
+        let git_index = id(&root.join("repo/.git/index"));
+        let git_ref = id(&root.join("repo/.git/refs/heads/main"));
+        let readme = id(&root.join("repo/README.md"));
+
+        let mut store = Store::new();
+        store.scan(&root).unwrap();
+
+        assert!(
+            store.lookup(&git_index).is_some(),
+            "a .git/ placeholder must stay indexed so a read can still hydrate it"
+        );
+        assert!(store.lookup(&git_ref).is_some());
+        assert!(store.lookup(&readme).is_some());
+    }
+
+    #[test]
+    fn git_churn_does_not_move_the_tree_fingerprint() {
+        let root = scratch("churn");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/index"), b"one").unwrap();
+        std::fs::write(root.join("doc.txt"), b"real").unwrap();
+
+        let mut store = Store::new();
+        store.scan(&root).unwrap();
+        let before = store.fingerprint();
+
+        // Git rewrites .git/index constantly. Because .git is never indexed, the
+        // fingerprint that lets a settled delta pass skip must not move — the
+        // churn that used to defeat the no-op skip is now invisible to it.
+        std::fs::write(root.join(".git/index"), b"two, a different length").unwrap();
+        store.scan(&root).unwrap();
+        assert_eq!(
+            store.fingerprint(),
+            before,
+            ".git churn moved the tree fingerprint"
+        );
+
+        // But a real change still moves it.
+        std::fs::write(root.join("doc.txt"), b"edited").unwrap();
+        store.scan(&root).unwrap();
+        assert_ne!(
+            store.fingerprint(),
+            before,
+            "a real edit must move the fingerprint"
+        );
+    }
 }
