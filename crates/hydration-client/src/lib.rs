@@ -27,6 +27,8 @@ use hydration_protocol::transport::{Body, DaemonConn};
 use hydration_protocol::{FetchResponse, FileId, FromHelper, Span};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub use daemon_loop::CloudAccess;
 pub use store::{Entry, Store};
@@ -129,6 +131,34 @@ pub struct Daemon<P: Provider> {
     /// reported by the helper. §6.4a: we cannot prevent these, only surface them.
     exposures: Vec<String>,
     changes: Option<Box<dyn Changes>>,
+    /// How many fetches are in flight right now. Bumped by a guard around each
+    /// `provider.fetch` and read by the status broadcaster, so a tray can show
+    /// "downloading N". Defaults to this daemon's own counter; the run loop
+    /// replaces it with one shared with the broadcaster via [`Daemon::track_fetches`].
+    in_flight: Arc<AtomicU64>,
+}
+
+/// Raises the in-flight fetch count for as long as it is alive.
+///
+/// One is constructed per fetch, immediately before the reply body is opened,
+/// and dropped when the fetch finishes, aborts, or the body could not be opened
+/// at all. Because the decrement rides `Drop`, the `?` early return on
+/// `conn.begin` cannot strand the count above zero — the number a tray reads is
+/// always the fetches actually in progress, never a leak from a fetch that
+/// failed to start.
+struct FetchGuard(Arc<AtomicU64>);
+
+impl FetchGuard {
+    fn new(counter: &Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for FetchGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// What to do about a local edit the helper noticed.
@@ -161,7 +191,17 @@ impl<P: Provider> Daemon<P> {
             root: root.to_path_buf(),
             changes: None,
             exposures: Vec::new(),
+            in_flight: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Share the in-flight fetch counter with the status broadcaster, so the
+    /// "downloading" number a watcher is told is the same object `serve` bumps.
+    /// Set after construction like [`Daemon::on_change`], so `new` stays a
+    /// two-argument public constructor and a standalone `Daemon` still counts
+    /// its own fetches into a counter nobody happens to read.
+    pub fn track_fetches(&mut self, counter: Arc<AtomicU64>) {
+        self.in_flight = counter;
     }
 
     pub fn store(&self) -> &Store {
@@ -221,6 +261,13 @@ impl<P: Provider> Daemon<P> {
                             })?;
                             continue;
                         }
+                        // In flight from here until the body is finished or
+                        // aborted below. Raised before `conn.begin` so the count
+                        // covers the whole fetch including its `?` early return,
+                        // and after the `span.end() > size` refusal above, which
+                        // `continue`s without ever fetching — so a refused range
+                        // is not counted as a download.
+                        let _fetch = FetchGuard::new(&self.in_flight);
                         // The length is declared from the span the helper asked
                         // for — never from something the provider has yet to
                         // deliver. `Body` then holds it to that.
@@ -304,5 +351,54 @@ impl<P: Provider> Daemon<P> {
     pub fn rescan(&mut self) -> io::Result<usize> {
         let root = self.root.clone();
         self.store.scan(&root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fetch_guard_raises_the_count_and_clears_it_on_drop() {
+        let c = Arc::new(AtomicU64::new(0));
+        {
+            let _g = FetchGuard::new(&c);
+            assert_eq!(c.load(Ordering::Relaxed), 1, "raised while alive");
+            {
+                let _g2 = FetchGuard::new(&c);
+                assert_eq!(c.load(Ordering::Relaxed), 2, "two fetches, count of two");
+            }
+            assert_eq!(
+                c.load(Ordering::Relaxed),
+                1,
+                "the inner guard's drop cleared its one, not both"
+            );
+        }
+        assert_eq!(
+            c.load(Ordering::Relaxed),
+            0,
+            "every guard dropped, back to zero"
+        );
+    }
+
+    /// The property the display depends on: a guard held across an early return
+    /// — the `?` on `conn.begin` inside `serve` — still decrements, because the
+    /// decrement rides `Drop`. A hand-written inc/dec would leak a stuck
+    /// "downloading=1" the first time a fetch failed to start.
+    #[test]
+    fn an_early_return_still_clears_the_count() {
+        let c = Arc::new(AtomicU64::new(0));
+        fn fails_after_raising(c: &Arc<AtomicU64>) -> Result<(), ()> {
+            let _g = FetchGuard::new(c);
+            assert_eq!(c.load(Ordering::Relaxed), 1);
+            Err(())?; // the shape of `conn.begin(req.id, span.len)?`
+            unreachable!("the ? above returns")
+        }
+        assert!(fails_after_raising(&c).is_err());
+        assert_eq!(
+            c.load(Ordering::Relaxed),
+            0,
+            "the early return dropped the guard and cleared the count"
+        );
     }
 }
