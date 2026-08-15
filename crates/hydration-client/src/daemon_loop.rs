@@ -3102,8 +3102,24 @@ mod tests {
         let (a, _) = synced("a.bin", &vec![b'a'; 8192]);
         let (b, b_id) = synced("b.bin", &vec![b'b'; 8192]);
 
-        // Both are candidates; high is huge so plan wants both, and reclaim is
-        // left to refuse the one being uploaded.
+        // The point of this test is that reclaim — not plan — is what spares the
+        // file being uploaded, so plan must want BOTH files: if it stops after
+        // one, the outcome turns on which of a and b sorts first, and that order
+        // is not stable. plan ranks by recency (hydrated_at, mtime fallback), and
+        // on ext4 with a 128-byte inode mtime has only second granularity — the
+        // nanosecond fields live past the 128th byte — so a.bin and b.bin written
+        // back to back tie, and the tie falls through to readdir hash order, which
+        // is per-filesystem-instance. Measured: one CI ext4-128 runner yielded b
+        // first, so plan (which stops at the high mark) selected only b, reclaim
+        // refused it, and nothing was evicted; the same test passed on btrfs, xfs,
+        // ext4-512, and other ext4-128 instances where a happened to sort first.
+        //
+        // The fix is to make plan genuinely want both, as the test always claimed:
+        // high = min(total, high_abs) must exceed what these two ~8 KiB files can
+        // free, so a large `total` (below) leaves high at high_abs = 1 MiB, far
+        // above ~16 KiB. plan then selects both regardless of order, and reclaim
+        // is left to refuse b. low stays 100 (min(total, low_abs)), so available 0
+        // is still under pressure.
         let cfg = crate::evict_policy::EvictionConfig {
             low_pct: 100,
             low_abs: 100,
@@ -3114,9 +3130,17 @@ mod tests {
             min_interval_secs: 0,
         };
         let sending: HashSet<FileId> = std::iter::once(b_id).collect();
-        // available 0 < low 100 -> under pressure.
-        let freed =
-            plan_and_reclaim(&mount, &cfg, 0, 1000, 10_000, &HashSet::new(), &sending).unwrap();
+        // available 0 < low 100 -> under pressure; total huge so high = high_abs.
+        let freed = plan_and_reclaim(
+            &mount,
+            &cfg,
+            0,
+            10_000_000,
+            10_000,
+            &HashSet::new(),
+            &sending,
+        )
+        .unwrap();
 
         let dehydrated = |p: &std::path::Path| {
             crate::store::get_xattr(p, hydration_protocol::xattr::DEHYDRATED)
