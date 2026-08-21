@@ -46,6 +46,12 @@ fn usage() -> ! {
     std::process::exit(2)
 }
 
+fn parse_peer_uid(raw: Option<String>) -> Result<u32, String> {
+    let raw = raw.ok_or_else(|| "--peer-uid requires a value".to_string())?;
+    raw.parse::<u32>()
+        .map_err(|_| format!("--peer-uid must be an unsigned 32-bit integer, got {raw:?}"))
+}
+
 fn parse() -> Args {
     let (mut mount, mut socket, mut peer_uid) = (None, None, None);
     let mut it = std::env::args().skip(1);
@@ -53,7 +59,12 @@ fn parse() -> Args {
         match a.as_str() {
             "--mount" => mount = it.next().map(PathBuf::from),
             "--socket" => socket = it.next().map(PathBuf::from),
-            "--peer-uid" => peer_uid = it.next().and_then(|v| v.parse().ok()),
+            "--peer-uid" => {
+                peer_uid = Some(parse_peer_uid(it.next()).unwrap_or_else(|e| {
+                    eprintln!("hydrationd: {e}");
+                    usage()
+                }))
+            }
             _ => usage(),
         }
     }
@@ -544,4 +555,31 @@ fn main() -> io::Result<()> {
         }
     }
     std::process::exit(if stalled { 75 } else { 1 });
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::parse_peer_uid;
+
+    #[test]
+    fn a_valid_peer_uid_is_accepted() {
+        assert_eq!(parse_peer_uid(Some("1000".into())), Ok(1000));
+        assert_eq!(parse_peer_uid(Some(u32::MAX.to_string())), Ok(u32::MAX));
+    }
+
+    #[test]
+    fn an_invalid_peer_uid_is_not_silently_treated_as_absent() {
+        for raw in ["root", "-1", "4294967296", ""] {
+            let error = parse_peer_uid(Some(raw.into())).expect_err("invalid uid was accepted");
+            assert!(error.contains("unsigned 32-bit integer"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_peer_uid_without_a_value_is_refused() {
+        assert_eq!(
+            parse_peer_uid(None),
+            Err("--peer-uid requires a value".into())
+        );
+    }
 }
