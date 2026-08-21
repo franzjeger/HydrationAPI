@@ -416,7 +416,10 @@ pub fn apply_remembering<M: Materialise>(
     // Cloud id -> local file, for the removal half. Built once rather than per
     // change, because a removal names an object and not a path.
     let mut by_cloud_id = store.by_cloud_id();
-    let mut folders = folders_by_cloud_id(root)?;
+    let FolderIndex {
+        synced: mut folders,
+        ignored: ignored_folders,
+    } = folders_by_cloud_id(root, &ignore)?;
 
     // At most one change per object, last one winning.
     //
@@ -809,17 +812,20 @@ pub fn apply_remembering<M: Materialise>(
                 }
             }
             Change::FolderRemoved { cloud_id, path } => {
+                // Ignored folders still need their identities indexed: the
+                // provider locates a removal by id and its declared path is not
+                // authoritative. They live in a separate, duplicate-tolerant
+                // set so fixture/build trees cannot corrupt the synced index.
+                if ignored_folders.contains(cloud_id) {
+                    out.ignored += 1;
+                    continue;
+                }
                 let Some(existing) = folders.get(cloud_id) else {
                     continue;
                 };
-                // Sync-ignore, SAFETY-CRITICAL: a FolderRemoved locates its victim
-                // by cloud id, never by the declared `path`, so the top-of-loop
-                // skip (which tests `path`) does not protect it. `folders_by_cloud_id`
-                // walks the whole tree and picks up cloud ids stamped on `.git/`
-                // subdirectories before the ignore, so `existing` can be an ignored
-                // real directory. It must never be removed, nor its cloud identity
-                // stripped — that is the same cloud withdrawal the transition guards
-                // exist to prevent. Mirror the Removed arm's resolved-path guard.
+                // Belt-and-braces: the separate ignored index above is the
+                // primary guard, but a FolderRemoved is destructive enough to
+                // verify the resolved path again before touching it.
                 if existing
                     .strip_prefix(root)
                     .is_ok_and(|rel| ignore.is_ignored(rel))
@@ -999,10 +1005,22 @@ fn folder_path(root: &Path, rel: &str) -> Option<PathBuf> {
     }
 }
 
-fn folders_by_cloud_id(root: &Path) -> io::Result<std::collections::HashMap<String, PathBuf>> {
-    let mut found = std::collections::HashMap::new();
+struct FolderIndex {
+    synced: std::collections::HashMap<String, PathBuf>,
+    ignored: std::collections::HashSet<String>,
+}
+
+fn folders_by_cloud_id(
+    root: &Path,
+    ignore: &hydration_protocol::ignore::IgnoreSet,
+) -> io::Result<FolderIndex> {
+    let mut synced = std::collections::HashMap::new();
+    let mut ignored = std::collections::HashSet::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        let is_ignored = dir
+            .strip_prefix(root)
+            .is_ok_and(|rel| !rel.as_os_str().is_empty() && ignore.is_ignored(rel));
         if let Some(raw) = crate::store::get_xattr(&dir, crate::store::XATTR_ID)? {
             let id = String::from_utf8(raw).map_err(|_| {
                 io::Error::new(
@@ -1011,13 +1029,28 @@ fn folders_by_cloud_id(root: &Path) -> io::Result<std::collections::HashMap<Stri
                 )
             })?;
             if !id.is_empty() {
-                if found.contains_key(&id) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("folder cloud identity {id:?} is claimed more than once"),
-                    ));
+                if is_ignored {
+                    // More than one ignored build/test fixture may deliberately
+                    // carry the same synthetic id. We only need membership to
+                    // protect a matching remote removal, so duplicates here are
+                    // harmless and must not stop the entire delta pass.
+                    ignored.insert(id);
+                } else {
+                    match synced.entry(id) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(dir.clone());
+                        }
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "folder cloud identity {:?} is claimed more than once",
+                                    entry.key()
+                                ),
+                            ));
+                        }
+                    }
                 }
-                found.insert(id, dir.clone());
             }
         }
         for entry in std::fs::read_dir(&dir)? {
@@ -1027,7 +1060,15 @@ fn folders_by_cloud_id(root: &Path) -> io::Result<std::collections::HashMap<Stri
             }
         }
     }
-    Ok(found)
+    if let Some(id) = synced.keys().find(|id| ignored.contains(*id)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "folder cloud identity {id:?} is claimed by both a synced and an ignored folder"
+            ),
+        ));
+    }
+    Ok(FolderIndex { synced, ignored })
 }
 
 fn file_id(md: &std::fs::Metadata) -> FileId {
@@ -1082,6 +1123,34 @@ pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        test_scratch::scratch(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+            &format!("delta-unit/{name}"),
+        )
+    }
+
+    #[test]
+    fn ignored_subtrees_cannot_poison_the_folder_identity_index() {
+        let root = scratch("ignored-folder-identities");
+        let real = root.join("Projects");
+        let fixture_a = root.join("target/fixture-a");
+        let fixture_b = root.join("target/fixture-b");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&fixture_a).unwrap();
+        std::fs::create_dir_all(&fixture_b).unwrap();
+        crate::store::set_xattr(&real, crate::store::XATTR_ID, b"drive|real").unwrap();
+        crate::store::set_xattr(&fixture_a, crate::store::XATTR_ID, b"b!mine|01PARENT").unwrap();
+        crate::store::set_xattr(&fixture_b, crate::store::XATTR_ID, b"b!mine|01PARENT").unwrap();
+        let ignore = hydration_protocol::ignore::IgnoreSet::from_config("target\n");
+
+        let found = folders_by_cloud_id(&root, &ignore).unwrap();
+
+        assert_eq!(found.synced.get("drive|real"), Some(&real));
+        assert!(!found.synced.contains_key("b!mine|01PARENT"));
+        assert!(found.ignored.contains("b!mine|01PARENT"));
+    }
 
     #[test]
     fn a_path_that_would_escape_the_sync_root_is_refused() {
