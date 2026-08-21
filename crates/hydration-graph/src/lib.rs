@@ -2450,6 +2450,28 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         let completed = round.finish().map_err(|(e, _)| Fault::Escalated(e))?;
         let diff = match diff {
             Some(Ok(gone)) => gone,
+            Some(Err(Escalation::BlastRadius { removals, known })) => {
+                // A complete enumeration that is missing a large fraction of the
+                // stored tree is almost always a real mass deletion (user cleanup,
+                // OneDrive policy, a permission change) rather than a mistake —
+                // the truncated-enumeration case is already caught by the
+                // incomplete-round guard and never reaches `deletions_since`.
+                // Refusing here used to be a one-shot alarm, but the token is
+                // never advanced, so the next round re-enumerates the whole drive
+                // and refuses again: a permanent livelock that costs a full
+                // enumeration of CPU and memory every seven minutes.
+                //
+                // The round completes: the tree is updated to the new enumeration
+                // (which does not include the missing items), the token advances,
+                // and the local placeholders for the deleted items become
+                // local-only files the user can review and delete. The count is
+                // logged so the event is visible in the journal.
+                eprintln!(
+                    "hydration-graph: deferred {removals} deletions \
+                     (known {known}); the round completes without applying them"
+                );
+                Vec::new()
+            }
             Some(Err(e)) => return Err(Fault::Escalated(e)),
             None => Vec::new(),
         };

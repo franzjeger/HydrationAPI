@@ -3844,16 +3844,16 @@ fn a_re_enumeration_that_did_not_finish_is_never_diffed_for_deletions() {
     assert_eq!(rig.store.token_bytes(), Some(token_before));
 }
 
-/// An escalation that overwrites its own evidence is a one-shot alarm.
-///
-/// Persisting the one-item tree before deciding to refuse means the next round
-/// starts from a tree that agrees the drive is empty — the guard cannot fire a
-/// second time because `known` is now 1, and the 500 placeholders are unknown to
-/// the provider forever. "Write the tree first, then the token" read as "always
-/// write the tree, then decide about the token" satisfies every call-order
-/// assertion and destroys the state the refusal was protecting.
+/// A blast-radius refusal used to be a one-shot alarm, but the token was never
+/// advanced, so the next round re-enumerated the whole drive and refused again:
+/// a permanent livelock that cost a full enumeration of CPU and memory every
+/// seven minutes. The guard now defers the deletions instead of refusing the
+/// round: the tree is updated to the new enumeration, the token advances, and
+/// the local placeholders for the deleted items become local-only files the
+/// user can review and delete. The count is logged so the event is visible in
+/// the journal.
 #[test]
-fn a_round_the_blast_guard_refused_does_not_overwrite_the_tree_it_refused_to_trust() {
+fn a_round_the_blast_guard_deferred_completes_and_advances_the_token() {
     let rig = Rig::new();
     let mut items = vec![root_item(MINE, ROOT)];
     for i in 0..500 {
@@ -3867,8 +3867,6 @@ fn a_round_the_blast_guard_refused_does_not_overwrite_the_tree_it_refused_to_tru
         ));
     }
     rig.store.preload(primed(&items, Some("DELTA-1")));
-    let tree_before = rig.store.tree_bytes().expect("a tree");
-    let token_before = rig.store.token_bytes().expect("a token");
 
     rig.script(
         resume_req("DELTA-1"),
@@ -3885,21 +3883,40 @@ fn a_round_the_blast_guard_refused_does_not_overwrite_the_tree_it_refused_to_tru
     );
 
     let mut d = rig.provider();
+    let (changes, cursor) = d
+        .changes(&Cursor::default())
+        .expect("a blast-radius refusal defers the deletions, it does not refuse the round");
+
     assert!(
-        d.changes(&Cursor::default()).is_err(),
-        "500 removals in one batch is a bug, not an instruction"
+        removed(&changes).is_empty(),
+        "the deferred deletions must not appear in the batch: {:?}",
+        removed(&changes)
     );
-    assert!(
-        d.last_escalation().is_some(),
-        "the refusal must be nameable"
-    );
+    assert_eq!(upsert_count(&changes), 0);
+
+    // Nothing is written until the framework acknowledges the batch.
     assert!(
         rig.journal.writes().is_empty(),
         "{:?}",
         rig.journal.writes()
     );
-    assert_eq!(rig.store.tree_bytes(), Some(tree_before));
-    assert_eq!(rig.store.token_bytes(), Some(token_before));
+
+    ack(&mut d, &cursor);
+
+    // The tree is updated to the new enumeration (just the root) and the token
+    // advances, so the next round resumes rather than re-enumerating.
+    assert_eq!(
+        tree_ids(&rig.store.stored_tree().unwrap()),
+        set(&[cloud(MINE, ROOT)]),
+        "the tree must reflect the new enumeration"
+    );
+    assert_eq!(
+        rig.store
+            .stored_token()
+            .map(|t| t.get(&drive_id(MINE)).map(str::to_string)),
+        Some(Some(lnk("DELTA-2"))),
+        "the token must advance so the livelock is broken"
+    );
 }
 
 // ===========================================================================
