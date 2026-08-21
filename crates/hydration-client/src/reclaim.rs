@@ -30,8 +30,7 @@
 //! `hydrationd`'s own `evict` still exists for a caller that *does* hold the
 //! fanotify group — the conformance adapter is one — and punches in place there.
 
-use crate::delta::Materialise;
-use crate::place::TmpfilePlacer;
+use crate::place::{ConditionalPlace, ReplacementGuard, TmpfilePlacer};
 use crate::store::{self, Store};
 use hydration_protocol::{stamp, FileId};
 use std::collections::HashSet;
@@ -88,6 +87,22 @@ pub fn reclaim(
     store: &mut Store,
     waiting: &HashSet<FileId>,
     sending: &HashSet<FileId>,
+) -> io::Result<Result<Reclaimed, Refused>> {
+    reclaim_with(root, rel, store, waiting, sending, |_| {})
+}
+
+/// The eviction decision with one seam at the race boundary.
+///
+/// Production passes a no-op. The regression test replaces the target here,
+/// after every eligibility check but before the atomic conditional exchange,
+/// so the data-loss interleaving is deterministic rather than scheduler luck.
+fn reclaim_with(
+    root: &Path,
+    rel: &str,
+    store: &mut Store,
+    waiting: &HashSet<FileId>,
+    sending: &HashSet<FileId>,
+    before_replace: impl FnOnce(&Path),
 ) -> io::Result<Result<Reclaimed, Refused>> {
     // Confinement is structural, not checked.
     //
@@ -218,8 +233,18 @@ pub fn reclaim(
     // contained a `..` or a symlink, which is what `crates/…/../../target` in
     // the test harness is. Refusing was the right response to being given two
     // paths that do not agree; agreeing is better.
+    let guard = ReplacementGuard::from_metadata(&md);
     let mut placer = TmpfilePlacer::new(&real_root)?;
-    placer.place(path, md.len(), &cloud_id, etag.as_deref())?;
+    before_replace(path);
+    match placer.place_if_unchanged(path, md.len(), &cloud_id, etag.as_deref(), guard)? {
+        ConditionalPlace::Placed => {}
+        ConditionalPlace::TargetChanged => {
+            // The file at the name is not the inode/content state approved above.
+            // In particular, an editor's atomic save landed after the queue
+            // snapshot and clean-stamp check. The exchange already put it back.
+            return Ok(Err(Refused::ChangedSinceUpload));
+        }
+    }
 
     // Measured rather than assumed, for the same reason §5.8 probes for the
     // floor instead of hard-coding it: the answer depends on the filesystem,
@@ -527,6 +552,81 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "the placeholder is unmarked and would never be intercepted"
+        );
+    }
+
+    /// The target name is not a lock.
+    ///
+    /// Editors normally save by renaming a new inode over the old one. If that
+    /// lands after eviction's queue/stamp checks, a plain `rename` of the
+    /// placeholder deletes the only copy of the edit. The hook puts that exact
+    /// interleaving under test without depending on thread scheduling.
+    #[test]
+    fn an_atomic_save_after_the_clean_check_is_preserved() {
+        let dir = scratch("atomic-save-during-eviction");
+        let path = synced(&dir, "report.docx", b"the version already in the cloud");
+        let replacement = dir.join("report.docx.new");
+        let new_body = b"the user's new version, not uploaded anywhere";
+        std::fs::write(&replacement, new_body).unwrap();
+
+        let mut store = Store::new();
+        store.scan(&dir).unwrap();
+        let outcome = reclaim_with(
+            &dir,
+            "report.docx",
+            &mut store,
+            &HashSet::new(),
+            &HashSet::new(),
+            |target| std::fs::rename(&replacement, target).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, Err(Refused::ChangedSinceUpload));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            new_body,
+            "the atomic save was replaced by the eviction placeholder"
+        );
+        assert!(
+            store::get_xattr(&path, hydration_protocol::xattr::DEHYDRATED)
+                .unwrap()
+                .is_none(),
+            "the restored edit was left marked as a placeholder"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                hydration_protocol::names::is_scratch(&entry.file_name().to_string_lossy())
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "eviction left scratch names behind");
+    }
+
+    #[test]
+    fn an_in_place_write_after_the_clean_check_is_preserved() {
+        let dir = scratch("in-place-write-during-eviction");
+        let path = synced(&dir, "notes.txt", b"sent");
+        let new_body = b"an in-place edit which exists only here";
+
+        let mut store = Store::new();
+        store.scan(&dir).unwrap();
+        let outcome = reclaim_with(
+            &dir,
+            "notes.txt",
+            &mut store,
+            &HashSet::new(),
+            &HashSet::new(),
+            |target| std::fs::write(target, new_body).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, Err(Refused::ChangedSinceUpload));
+        assert_eq!(std::fs::read(&path).unwrap(), new_body);
+        assert!(
+            store::get_xattr(&path, hydration_protocol::xattr::DEHYDRATED)
+                .unwrap()
+                .is_none()
         );
     }
 

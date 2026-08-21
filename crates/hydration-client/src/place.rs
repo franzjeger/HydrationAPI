@@ -120,6 +120,66 @@ pub struct TmpfilePlacer {
     seq: u64,
 }
 
+/// The inode state eviction approved before it started building a replacement.
+///
+/// An inode number alone is not enough. An editor can write in place while an
+/// eviction is being prepared, keeping the inode and changing the only copy of
+/// the bytes. Size and nanosecond mtime make that write a mismatch too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplacementGuard {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConditionalPlace {
+    Placed,
+    TargetChanged,
+}
+
+impl ReplacementGuard {
+    pub(crate) fn from_metadata(md: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: md.dev(),
+            ino: md.ino(),
+            size: md.size(),
+            mtime: md.mtime(),
+            mtime_nsec: md.mtime_nsec(),
+        }
+    }
+
+    fn at(dir: BorrowedFd<'_>, path: &Path) -> io::Result<Self> {
+        let path = cstr(path)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                path.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            dev: st.st_dev,
+            ino: st.st_ino,
+            size: st.st_size as u64,
+            mtime: st.st_mtime,
+            mtime_nsec: st.st_mtime_nsec,
+        })
+    }
+
+    fn same_inode(self, other: Self) -> bool {
+        self.dev == other.dev && self.ino == other.ino
+    }
+}
+
 impl TmpfilePlacer {
     /// Open the sync root and pin it.
     ///
@@ -201,8 +261,17 @@ impl TmpfilePlacer {
                 let name = name.to_string_lossy();
                 if e.file_type().is_ok_and(|t| t.is_dir()) {
                     stack.push(e.path());
-                } else if is_scratch(&name) && std::fs::remove_file(e.path()).is_ok() {
-                    removed += 1;
+                } else if is_scratch(&name) {
+                    let path = e.path();
+                    // A scratch inode is linked only after the placeholder is
+                    // complete, so it always carries this mark. An unmarked
+                    // occupant can be user content preserved by conditional
+                    // eviction and must survive even though its name has our
+                    // shape.
+                    let ours = matches!(store::get_xattr(&path, xattr::DEHYDRATED), Ok(Some(_)));
+                    if ours && std::fs::remove_file(path).is_ok() {
+                        removed += 1;
+                    }
                 }
             }
         }
@@ -246,6 +315,24 @@ impl TmpfilePlacer {
             });
         }
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// A complete placeholder which is still anonymous.
+    fn placeholder(&self, size: u64, cloud_id: &str, etag: Option<&str>) -> io::Result<OwnedFd> {
+        let fd = self.anonymous()?;
+
+        // Order is load-bearing. Every xattr goes on before the file has a size
+        // and long before it has a name; see `Materialise::place` below.
+        Self::set(&fd, xattr::DEHYDRATED, b"1")?;
+        Self::set(&fd, store::XATTR_ID, cloud_id.as_bytes())?;
+        if let Some(e) = etag {
+            Self::set(&fd, store::XATTR_ETAG, e.as_bytes())?;
+        }
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _ = hydration_protocol::stamp::write_fd(fd.as_fd());
+        Ok(fd)
     }
 
     fn set(fd: &OwnedFd, name: &str, value: &[u8]) -> io::Result<()> {
@@ -293,6 +380,82 @@ impl TmpfilePlacer {
         })
     }
 
+    /// Replace `path` only if the name still refers to the state the caller
+    /// approved.
+    ///
+    /// `renameat` alone overwrites whatever is at the name when it runs. That is
+    /// wrong for eviction: an editor may have atomically saved a new, unsent file
+    /// after the caller's clean check. `RENAME_EXCHANGE` retains the actual old
+    /// occupant at `scratch`, where it can be inspected. A mismatch is exchanged
+    /// back before the anonymous placeholder is discarded, so the newer file is
+    /// never unlinked.
+    pub(crate) fn place_if_unchanged(
+        &mut self,
+        path: &Path,
+        size: u64,
+        cloud_id: &str,
+        etag: Option<&str>,
+        expected: ReplacementGuard,
+    ) -> io::Result<ConditionalPlace> {
+        let rel = self.relative(path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not below the sync root {}",
+                    path.display(),
+                    self.root.display()
+                ),
+            )
+        })?;
+        self.make_parents(rel)?;
+        let fd = self.placeholder(size, cloud_id, etag)?;
+        let placeholder = guard_of_fd(fd.as_fd())?;
+
+        let dir = rel.parent().unwrap_or(Path::new(""));
+        let base = rel.file_name().and_then(|n| n.to_str()).unwrap_or("f");
+        let proc = format!("/proc/self/fd/{}", fd.as_raw_fd());
+        let scratch = loop {
+            self.seq += 1;
+            let candidate = dir.join(format!(".{base}.hydration-{}", self.seq));
+            match linkat_into(&proc, self.dir.as_fd(), &candidate) {
+                Ok(()) => break candidate,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        };
+
+        if let Err(e) = renameat_exchange(self.dir.as_fd(), &scratch, rel) {
+            discard_placeholder(self.dir.as_fd(), &scratch, placeholder)?;
+            // The target disappearing is a concurrent change, not an inability
+            // to build a placeholder.
+            if e.kind() == io::ErrorKind::NotFound {
+                return Ok(ConditionalPlace::TargetChanged);
+            }
+            return Err(e);
+        }
+
+        let found = match ReplacementGuard::at(self.dir.as_fd(), &scratch) {
+            Ok(found) => found,
+            Err(inspect) => {
+                restore_target(self.dir.as_fd(), &scratch, rel, placeholder)?;
+                return Err(inspect);
+            }
+        };
+        if found == expected {
+            // The exact inode and content/metadata clocks the caller approved
+            // were exchanged out. Only now may its last name be removed.
+            unlinkat(self.dir.as_fd(), &scratch)?;
+            return Ok(ConditionalPlace::Placed);
+        }
+
+        // Restore the occupant we found, atomically. The ordinary race has the
+        // placeholder at `rel`, so this puts the new user file straight back.
+        // If a second writer raced this rollback, never unlink what it left at
+        // scratch unless it is demonstrably our placeholder.
+        restore_target(self.dir.as_fd(), &scratch, rel, placeholder)?;
+        Ok(ConditionalPlace::TargetChanged)
+    }
+
     /// Create every directory on the way to `rel`'s parent, under the root.
     ///
     /// `mkdirat` a component at a time rather than `create_dir_all`, which takes
@@ -326,6 +489,20 @@ use hydration_protocol::names::is_scratch;
 fn cstr(p: &Path) -> io::Result<std::ffi::CString> {
     std::ffi::CString::new(p.as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
+}
+
+fn guard_of_fd(fd: BorrowedFd<'_>) -> io::Result<ReplacementGuard> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ReplacementGuard {
+        dev: st.st_dev,
+        ino: st.st_ino,
+        size: st.st_size as u64,
+        mtime: st.st_mtime,
+        mtime_nsec: st.st_mtime_nsec,
+    })
 }
 
 fn open_dir(path: &Path) -> io::Result<OwnedFd> {
@@ -367,6 +544,56 @@ fn renameat(dir: BorrowedFd<'_>, from: &Path, to: &Path) -> io::Result<()> {
     (r == 0).then_some(()).ok_or_else(io::Error::last_os_error)
 }
 
+fn renameat_exchange(dir: BorrowedFd<'_>, from: &Path, to: &Path) -> io::Result<()> {
+    let (f, t) = (cstr(from)?, cstr(to)?);
+    let r = unsafe {
+        libc::renameat2(
+            dir.as_raw_fd(),
+            f.as_ptr(),
+            dir.as_raw_fd(),
+            t.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    (r == 0).then_some(()).ok_or_else(io::Error::last_os_error)
+}
+
+fn discard_placeholder(
+    dir: BorrowedFd<'_>,
+    scratch: &Path,
+    placeholder: ReplacementGuard,
+) -> io::Result<()> {
+    let found = ReplacementGuard::at(dir, scratch)?;
+    if !found.same_inode(placeholder) {
+        return Err(io::Error::other(format!(
+            "the eviction scratch name changed; the occupant was preserved at {}",
+            scratch.display()
+        )));
+    }
+    unlinkat(dir, scratch)
+}
+
+fn restore_target(
+    dir: BorrowedFd<'_>,
+    scratch: &Path,
+    target: &Path,
+    placeholder: ReplacementGuard,
+) -> io::Result<()> {
+    renameat_exchange(dir, scratch, target).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "the eviction target changed and could not be restored; its bytes remain at {}: {e}",
+                scratch.display()
+            ),
+        )
+    })?;
+    // A second atomic save may have replaced the placeholder while the first
+    // replacement was being inspected. The second exchange preserves that
+    // occupant at `scratch`; it must never be mistaken for our disposable inode.
+    discard_placeholder(dir, scratch, placeholder)
+}
+
 fn unlinkat(dir: BorrowedFd<'_>, rel: &Path) -> io::Result<()> {
     let c = cstr(rel)?;
     let r = unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) };
@@ -394,8 +621,6 @@ impl Materialise for TmpfilePlacer {
         })?;
         self.make_parents(rel)?;
 
-        let fd = self.anonymous()?;
-
         // Order is load-bearing. Every xattr goes on before the file has a size
         // and long before it has a name, so the inode is never observable in a
         // half-built state: it is either anonymous and incomplete, or named and
@@ -407,25 +632,7 @@ impl Materialise for TmpfilePlacer {
         // `linkat` into the sync directory and produces a placeholder that is
         // silently never intercepted again. That is this project's recurring
         // trap (§6a-ter) in its sixth disguise.
-        Self::set(&fd, xattr::DEHYDRATED, b"1")?;
-        Self::set(&fd, store::XATTR_ID, cloud_id.as_bytes())?;
-        if let Some(e) = etag {
-            Self::set(&fd, store::XATTR_ETAG, e.as_bytes())?;
-        }
-
-        // The one event. The worker allows it because the inode is nameless and
-        // still empty — the event precedes the truncate — and an empty file has
-        // no content anyone could be served instead of the real thing.
-        if unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Stamped while still anonymous, so the file has never existed under a
-        // name in an unstamped state. A placeholder with no stamp reads as
-        // "content the framework has never touched", which is what protects a
-        // user's own files from being replaced — so a placeholder that arrived
-        // without one would be protected from the very refresh it needs.
-        let _ = hydration_protocol::stamp::write_fd(fd.as_fd());
+        let fd = self.placeholder(size, cloud_id, etag)?;
 
         self.seq += 1;
         let seq = self.seq;
@@ -575,8 +782,12 @@ mod tests {
     fn scratch_names_left_by_a_crash_are_swept() {
         let dir = scratch("sweep");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::write(dir.join(".a.bin.hydration-3"), b"").unwrap();
-        std::fs::write(dir.join("sub/.b.bin.hydration-9"), b"").unwrap();
+        let first = dir.join(".a.bin.hydration-3");
+        let second = dir.join("sub/.b.bin.hydration-9");
+        std::fs::write(&first, b"").unwrap();
+        std::fs::write(&second, b"").unwrap();
+        store::set_xattr(&first, xattr::DEHYDRATED, b"1").unwrap();
+        store::set_xattr(&second, xattr::DEHYDRATED, b"1").unwrap();
         std::fs::write(dir.join("keep.txt"), b"x").unwrap();
         std::fs::write(dir.join(".hydration-manifest"), b"x").unwrap();
 
@@ -586,6 +797,16 @@ mod tests {
             dir.join(".hydration-manifest").exists(),
             "the sweep took the manifest, which is not scratch"
         );
+    }
+
+    #[test]
+    fn an_unmarked_file_with_a_scratch_shaped_name_is_preserved() {
+        let dir = scratch("sweep-preserves-race");
+        let raced = dir.join(".report.docx.hydration-1");
+        std::fs::write(&raced, b"a concurrent atomic save").unwrap();
+
+        assert_eq!(TmpfilePlacer::sweep_scratch(&dir).unwrap(), 0);
+        assert_eq!(std::fs::read(&raced).unwrap(), b"a concurrent atomic save");
     }
 
     #[test]
