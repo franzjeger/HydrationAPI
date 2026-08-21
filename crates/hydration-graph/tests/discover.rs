@@ -3844,16 +3844,16 @@ fn a_re_enumeration_that_did_not_finish_is_never_diffed_for_deletions() {
     assert_eq!(rig.store.token_bytes(), Some(token_before));
 }
 
-/// An escalation that overwrites its own evidence is a one-shot alarm.
-///
-/// Persisting the one-item tree before deciding to refuse means the next round
-/// starts from a tree that agrees the drive is empty — the guard cannot fire a
-/// second time because `known` is now 1, and the 500 placeholders are unknown to
-/// the provider forever. "Write the tree first, then the token" read as "always
-/// write the tree, then decide about the token" satisfies every call-order
-/// assertion and destroys the state the refusal was protecting.
+/// A blast-radius refusal used to be a one-shot alarm, but the token was never
+/// advanced, so the next round re-enumerated the whole drive and refused again:
+/// a permanent livelock that cost a full enumeration of CPU and memory every
+/// seven minutes. The guard now defers the deletions instead of refusing the
+/// round: the tree is updated to the new enumeration, the token advances, and
+/// the local placeholders for the deleted items become local-only files the
+/// user can review and delete. The count is logged so the event is visible in
+/// the journal.
 #[test]
-fn a_round_the_blast_guard_refused_does_not_overwrite_the_tree_it_refused_to_trust() {
+fn a_round_the_blast_guard_deferred_completes_and_advances_the_token() {
     let rig = Rig::new();
     let mut items = vec![root_item(MINE, ROOT)];
     for i in 0..500 {
@@ -3867,8 +3867,6 @@ fn a_round_the_blast_guard_refused_does_not_overwrite_the_tree_it_refused_to_tru
         ));
     }
     rig.store.preload(primed(&items, Some("DELTA-1")));
-    let tree_before = rig.store.tree_bytes().expect("a tree");
-    let token_before = rig.store.token_bytes().expect("a token");
 
     rig.script(
         resume_req("DELTA-1"),
@@ -3885,21 +3883,151 @@ fn a_round_the_blast_guard_refused_does_not_overwrite_the_tree_it_refused_to_tru
     );
 
     let mut d = rig.provider();
+    let (changes, cursor) = d
+        .changes(&Cursor::default())
+        .expect("a blast-radius refusal defers the deletions, it does not refuse the round");
+
     assert!(
-        d.changes(&Cursor::default()).is_err(),
-        "500 removals in one batch is a bug, not an instruction"
+        removed(&changes).is_empty(),
+        "the deferred deletions must not appear in the batch: {:?}",
+        removed(&changes)
     );
-    assert!(
-        d.last_escalation().is_some(),
-        "the refusal must be nameable"
-    );
+    assert_eq!(upsert_count(&changes), 0);
+
+    // Nothing is written until the framework acknowledges the batch.
     assert!(
         rig.journal.writes().is_empty(),
         "{:?}",
         rig.journal.writes()
     );
-    assert_eq!(rig.store.tree_bytes(), Some(tree_before));
-    assert_eq!(rig.store.token_bytes(), Some(token_before));
+
+    ack(&mut d, &cursor);
+
+    // The tree is updated to the new enumeration (just the root) and the token
+    // advances, so the next round resumes rather than re-enumerating.
+    assert_eq!(
+        tree_ids(&rig.store.stored_tree().unwrap()),
+        set(&[cloud(MINE, ROOT)]),
+        "the tree must reflect the new enumeration"
+    );
+    assert_eq!(
+        rig.store
+            .stored_token()
+            .map(|t| t.get(&drive_id(MINE)).map(str::to_string)),
+        Some(Some(lnk("DELTA-2"))),
+        "the token must advance so the livelock is broken"
+    );
+}
+
+/// The blast-radius livelock was a two-round disease: a *single* round that
+/// defers the deletions is not the fix by itself, because a driver that
+/// re-enumerated after every restart would pay a full-drive read and a fresh
+/// `deferred` alarm on every one of them. This test proves the two halves are
+/// joined — that the round which deferred the deletions is also the round that
+/// persisted the state a restarted instance must resume from, not re-enumerate.
+///
+/// The restart is modelled the way the daemon runs: a fresh `Provider` over the
+/// same state directory that never saw the previous round's in-memory state,
+/// handed an empty cursor. It must load the persisted token and resume the
+/// delta feed from it. The teeth are the request log: a regression that dropped
+/// the resume would issue a `first()`/`next()` alongside the `resume()`, and the
+/// assertion that the round made exactly one request — carrying the persisted
+/// token — is the one that fails.
+#[test]
+fn a_deferred_round_advances_past_restart_without_reenumerating() {
+    let rig = Rig::new();
+    let mut items = vec![root_item(MINE, ROOT)];
+    for i in 0..500 {
+        items.push(file_item(
+            MINE,
+            &format!("01F{i:03}"),
+            ROOT,
+            &format!("f{i:03}.txt"),
+            1,
+            &format!("c:{{G}},{i}"),
+        ));
+    }
+    rig.store.preload(primed(&items, Some("DELTA-1")));
+
+    // First round: the feed is gone, the guard refuses to trust an enumeration
+    // that is missing the whole tree, defers the deletions, and — the fix —
+    // completes the round and advances the token.
+    rig.script(
+        resume_req("DELTA-1"),
+        vec![Reply::status(410, r#"{"error":{"code":"resyncRequired"}}"#)],
+    );
+    rig.script(
+        first_req(MINE),
+        vec![Reply::ok(body_delta(
+            &[root_json(MINE, ROOT)],
+            &lnk("DELTA-2"),
+        ))],
+    );
+
+    let mut d = rig.provider();
+    let (changes, cursor) = d
+        .changes(&Cursor::default())
+        .expect("a blast-radius refusal defers the deletions, it does not refuse the round");
+    assert!(
+        removed(&changes).is_empty(),
+        "the deferred deletions must not appear in the batch: {:?}",
+        removed(&changes)
+    );
+    assert_eq!(upsert_count(&changes), 0);
+    ack(&mut d, &cursor);
+
+    // The state the restarted instance will read: the tree is the new
+    // enumeration (the deferred items are gone from it) and the token has
+    // advanced, so a resume is possible at all.
+    assert_eq!(
+        tree_ids(&rig.store.stored_tree().unwrap()),
+        set(&[cloud(MINE, ROOT)]),
+        "the tree must reflect the new enumeration before the restart reads it"
+    );
+    assert_eq!(
+        rig.store
+            .stored_token()
+            .map(|t| t.get(&drive_id(MINE)).map(str::to_string)),
+        Some(Some(lnk("DELTA-2"))),
+        "the deferred round must persist the advanced token"
+    );
+
+    // Restart: a fresh provider that never held the previous round in memory,
+    // handed an empty cursor exactly as the daemon constructs one. The drive is
+    // unchanged, so a correct round resumes the feed and is a quiet no-op. Note
+    // that `first()` is still scripted (the resync path above put it there), so
+    // the guard against a regressive re-enumeration is the one-request log
+    // assertion below, not an unscripted-request failure.
+    rig.script(
+        resume_req("DELTA-2"),
+        vec![Reply::ok(body_delta(
+            &[root_json(MINE, ROOT)],
+            &lnk("DELTA-3"),
+        ))],
+    );
+    rig.journal.clear();
+
+    let mut restarted = rig.provider();
+    let (changes, cursor) = restarted
+        .changes(&Cursor::default())
+        .expect("a restart after a deferred round resumes the feed instead of re-enumerating");
+
+    assert_eq!(
+        rig.journal.calls(),
+        [resume_req("DELTA-2")],
+        "the restarted round must issue exactly one request, carrying the \
+         persisted token byte for byte — no full-drive enumeration"
+    );
+    assert!(
+        removed(&changes).is_empty(),
+        "the deferred deletions must not re-surface on the restart, since the \
+         tree no longer holds them: {:?}",
+        removed(&changes)
+    );
+    assert!(
+        cursor.0.is_some(),
+        "a completed restart round issues a cursor"
+    );
 }
 
 // ===========================================================================

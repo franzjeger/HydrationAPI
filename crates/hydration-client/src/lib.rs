@@ -22,6 +22,7 @@ pub mod reclaim;
 pub mod removals;
 pub mod store;
 pub mod upload;
+pub mod wire;
 
 use hydration_protocol::transport::{Body, DaemonConn};
 use hydration_protocol::{FetchResponse, FileId, FromHelper, Span};

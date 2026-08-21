@@ -27,7 +27,7 @@ use crate::upload::{run_upload, Known, Outcome, Queue, Sink, SystemClock, Upload
 use crate::{Changes, Daemon, Provider};
 use hydration_protocol::transport::DaemonConn;
 use hydration_protocol::FileId;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -328,7 +328,7 @@ fn dirty_files(root: &std::path::Path) -> io::Result<Resync> {
 /// `PartialEq` *is* the contract's change test — a line goes out when this
 /// tuple differs from the last one written to that connection, so equality here
 /// is the definition of "nothing changed".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct WatchState {
     /// What [`Queue::pending`] returned: waiting and in flight.
     unsent: u64,
@@ -347,6 +347,12 @@ struct WatchState {
     /// for a pass worth showing (a first sync, a large cloud change) is invisible,
     /// and a pass shorter than a tick was never going to be worth a line anyway.
     scanning: bool,
+    /// The relative paths of uploads in flight right now — the tray's
+    /// per-file "uploading" list. A live read, off by at most one tick, like
+    /// `downloading`. Empty when nothing is being sent. Carried as a single
+    /// whitespace-free token (each path escaped, paths joined by a space) so it
+    /// is one value on the line rather than many.
+    uploading: Vec<String>,
 }
 
 impl WatchState {
@@ -355,12 +361,24 @@ impl WatchState {
     /// Key order is fixed and new keys may only ever be appended: a reader is
     /// told to ignore keys it does not recognise, and that promise is only
     /// worth having if the keys it does recognise stay where they were.
-    /// `scanning` is the newest key, so it goes last; `scanning=0`/`1` because a
-    /// value is `<u64>` to a reader that does not special-case the key.
+    /// `uploading` is the newest key, so it goes last: its value is a list of
+    /// escaped paths, which is not `<u64>`, and a reader that predates it
+    /// simply does not recognise the key and ignores it.
     fn line(&self) -> String {
+        let uploading = self
+            .uploading
+            .iter()
+            .map(|p| crate::wire::encode_path(p))
+            .collect::<Vec<_>>()
+            .join(" ");
         format!(
-            "unsent={} excluded={} exposures={} downloading={} scanning={}",
-            self.unsent, self.excluded, self.exposures, self.downloading, self.scanning as u8
+            "unsent={} excluded={} exposures={} downloading={} scanning={} uploading={}",
+            self.unsent,
+            self.excluded,
+            self.exposures,
+            self.downloading,
+            self.scanning as u8,
+            uploading
         )
     }
 }
@@ -378,9 +396,15 @@ fn watch_state(
     exposures: &Mutex<Vec<String>>,
     in_flight: &AtomicU64,
     scanning: bool,
+    active_uploads: &Mutex<HashMap<FileId, String>>,
 ) -> WatchState {
     let unsent = queue.lock().unwrap().pending() as u64;
     let exposures = exposures.lock().unwrap().len() as u64;
+    // Sorted, so the line is deterministic for a given set: the broadcast
+    // compares whole lines, and a set that has not changed must not re-send
+    // itself just because its insertion order moved.
+    let mut uploading: Vec<String> = active_uploads.lock().unwrap().values().cloned().collect();
+    uploading.sort();
     WatchState {
         unsent,
         excluded: excluded.load(Ordering::SeqCst),
@@ -394,6 +418,7 @@ fn watch_state(
         // pass to report and hands `false` — corrected within a tick by the next
         // broadcast, the same freshness the other sampled fields carry.
         scanning,
+        uploading,
     }
 }
 
@@ -446,7 +471,7 @@ fn peer_gone(conn: &UnixStream) -> bool {
     rc > 0 && (p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
 }
 
-fn write_line(conn: &mut UnixStream, state: WatchState) -> io::Result<()> {
+fn write_line(conn: &mut UnixStream, state: &WatchState) -> io::Result<()> {
     use std::io::Write;
     writeln!(conn, "{}", state.line())
 }
@@ -461,7 +486,7 @@ impl Watchers {
     /// that costs at most one extra line on the next tick, never a missed final
     /// state, because a broadcast compares against what each connection was
     /// actually told.
-    fn adopt(&self, conn: UnixStream, state: WatchState) {
+    fn adopt(&self, mut conn: UnixStream, state: WatchState) {
         let Ok(mut conns) = self.conns.lock() else {
             return;
         };
@@ -482,9 +507,10 @@ impl Watchers {
         // dropping it is then the answer, at worst costing the peer a torn
         // final line before the EOF that tells it to reconnect.
         let _ = conn.set_write_timeout(Some(Duration::from_secs(1)));
-        let mut w = Watcher { conn, last: state };
-        if write_line(&mut w.conn, state).is_ok() {
-            conns.push(w);
+        // Write before taking ownership of `state`, so the move into the
+        // registry entry is the last thing that touches it.
+        if write_line(&mut conn, &state).is_ok() {
+            conns.push(Watcher { conn, last: state });
         }
     }
 
@@ -504,10 +530,10 @@ impl Watchers {
             if w.last == state {
                 return true;
             }
-            if write_line(&mut w.conn, state).is_err() {
+            if write_line(&mut w.conn, &state).is_err() {
                 return false;
             }
-            w.last = state;
+            w.last = state.clone();
             true
         });
     }
@@ -552,12 +578,15 @@ impl Watchers {
 /// - `watch` — one state line immediately, another every time the state
 ///   changes, and nothing else ever, until the peer disconnects. A state line
 ///   is `key=value` pairs joined by single spaces, newline-terminated,
-///   currently `unsent=<u64> excluded=<u64> exposures=<u64> downloading=<u64> scanning=<0|1>`:
+///   currently `unsent=<u64> excluded=<u64> exposures=<u64> downloading=<u64> scanning=<0|1> uploading=<paths>`:
 ///   the upload queue's pending count, the manifest's file count as of its last
 ///   build, how many other mounts expose the sync files, how many fetches are in
-///   flight right now, and whether a delta pass is applying. Keys stay in that order and new keys are only ever
+///   flight right now, whether a delta pass is applying, and the relative paths
+///   of uploads in flight right now (each escaped, space-joined, empty when
+///   nothing is being sent). Keys stay in that order and new keys are only ever
 ///   appended, so a reader must ignore keys it does not recognise. An unchanged
 ///   tuple is never re-sent.
+#[allow(clippy::too_many_arguments)]
 fn control(
     socket: &std::path::Path,
     mount: PathBuf,
@@ -565,6 +594,7 @@ fn control(
     exposures: Arc<Mutex<Vec<String>>>,
     excluded: Arc<AtomicU64>,
     in_flight: Arc<AtomicU64>,
+    active_uploads: Arc<Mutex<HashMap<FileId, String>>>,
     watchers: Arc<Watchers>,
 ) -> io::Result<()> {
     use std::io::{BufRead, BufReader, Write};
@@ -680,7 +710,14 @@ fn control(
                     // thread's next tick corrects it if a pass is in fact running.
                     watchers.adopt(
                         out,
-                        watch_state(&queue, &excluded, &exposures, &in_flight, false),
+                        watch_state(
+                            &queue,
+                            &excluded,
+                            &exposures,
+                            &in_flight,
+                            false,
+                            &active_uploads,
+                        ),
                     );
                     break;
                 }
@@ -820,6 +857,14 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // helper connection (which bumps it) and the status thread (which reads it).
     // Created here, before either exists, so both see the same counter.
     let in_flight = Arc::new(AtomicU64::new(0));
+    // The relative paths of uploads in flight right now, shared between the
+    // upload driver (which adds a path when it claims a file and removes it
+    // when the transfer ends) and the status thread (which reads it into the
+    // watch line). Keyed by `FileId`, not by name, so a file that is re-queued
+    // while a stale finish for its old inode lands cannot be removed by the
+    // wrong event — the inode is the only address that is stable across a
+    // rename, which is the same reason the queue itself is keyed by it.
+    let active_uploads: Arc<Mutex<HashMap<FileId, String>>> = Arc::new(Mutex::new(HashMap::new()));
     // Everyone who asked to be told when the numbers above move.
     let watchers = Arc::new(Watchers::default());
 
@@ -858,7 +903,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // The upload driver keeps its own store: a held upload must never block a
     // status query behind a shared lock.
     {
-        let (q, stop, mount, access, resync, delta_busy, folder_refresh, tracked, folder_retry) = (
+        let (q, stop, mount, access, resync, delta_busy, folder_refresh, tracked, folder_retry, au) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             config.mount.clone(),
@@ -871,6 +916,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // total disappearance can be told from a folder's partial one.
             Arc::clone(&excluded),
             std::cmp::max(config.debounce, Duration::from_secs(1)),
+            Arc::clone(&active_uploads),
         );
         std::thread::spawn(move || {
             // Same reasoning as the delta thread below: a queue that grows and
@@ -1043,6 +1089,13 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     let sent_path = store
                         .lookup(&file)
                         .and_then(|e| crate::lineage::relative(&mount, &e.path));
+                    // The tray's per-file "uploading" list: the path is present
+                    // for the whole transfer and gone once it settles. A file
+                    // that is gone by the time we resolve it is not listed —
+                    // there is nothing to show for it either way.
+                    if let Some(rel) = &sent_path {
+                        au.lock().unwrap().insert(file, rel.clone());
+                    }
                     let outcome = run_upload(file, &mut store, &mut sink);
                     // What this thread just created, so a file deleted before the
                     // delta pass next scans can still be withdrawn.
@@ -1061,6 +1114,8 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     {
                         let mut queue = q.lock().unwrap();
                         queue.finish(file);
+                        // The transfer is over, so the tray's list loses it.
+                        au.lock().unwrap().remove(&file);
                         // A failure has to go back in the queue.
                         //
                         // `begin` takes the file out and `finish` releases the
@@ -1404,17 +1459,18 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // asked for.
     {
         let ctl = config.socket.with_extension("ctl");
-        let (mount, q, ex, exc, inf, ws) = (
+        let (mount, q, ex, exc, inf, au, ws) = (
             config.mount.clone(),
             Arc::clone(&queue),
             Arc::clone(&exposures),
             Arc::clone(&excluded),
             Arc::clone(&in_flight),
+            Arc::clone(&active_uploads),
             Arc::clone(&watchers),
         );
         eprintln!("hydration-sync: control socket at {}", ctl.display());
         std::thread::spawn(move || {
-            if let Err(e) = control(&ctl, mount, q, ex, exc, inf, ws) {
+            if let Err(e) = control(&ctl, mount, q, ex, exc, inf, au, ws) {
                 eprintln!("hydration-sync: control socket unavailable: {e}");
             }
         });
@@ -1489,7 +1545,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // Status, the manifest that makes a backup honest — and the `watch`
     // broadcasts, which ride this thread rather than getting one of their own.
     {
-        let (q, stop, mount, exposures, excluded, in_flight, delta_busy, watchers) = (
+        let (q, stop, mount, exposures, excluded, in_flight, delta_busy, au, watchers) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             config.mount.clone(),
@@ -1497,6 +1553,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             Arc::clone(&excluded),
             Arc::clone(&in_flight),
             Arc::clone(&delta_busy),
+            Arc::clone(&active_uploads),
             Arc::clone(&watchers),
         );
         std::thread::spawn(move || {
@@ -1571,6 +1628,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     &exposures,
                     &in_flight,
                     delta_busy.load(Ordering::SeqCst),
+                    &au,
                 ));
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -2943,6 +3001,7 @@ mod tests {
             exposures,
             downloading: 0,
             scanning: false,
+            uploading: Vec::new(),
         }
     }
 
@@ -2969,16 +3028,17 @@ mod tests {
         let excluded = Arc::new(AtomicU64::new(7));
         let watchers = Arc::new(Watchers::default());
         {
-            let (s, m, q, e, x, inf, w) = (
+            let (s, m, q, e, x, inf, au, w) = (
                 sock.clone(),
                 mount.clone(),
                 Arc::clone(&queue),
                 Arc::clone(&exposures),
                 Arc::clone(&excluded),
                 Arc::new(AtomicU64::new(0)),
+                Arc::new(Mutex::new(HashMap::new())),
                 Arc::clone(&watchers),
             );
-            std::thread::spawn(move || control(&s, m, q, e, x, inf, w));
+            std::thread::spawn(move || control(&s, m, q, e, x, inf, au, w));
         }
         // The listener comes up on another thread; connecting retries until it
         // has. Deadlines are generous because the test machines run gates
@@ -3008,7 +3068,7 @@ mod tests {
             .expect("watch was not answered with an immediate state line");
         assert_eq!(
             first,
-            "unsent=0 excluded=7 exposures=0 downloading=0 scanning=0\n"
+            "unsent=0 excluded=7 exposures=0 downloading=0 scanning=0 uploading=\n"
         );
 
         // The watcher stays connected and says nothing more. Both other verbs
@@ -3060,16 +3120,17 @@ mod tests {
         let excluded = Arc::new(AtomicU64::new(0));
         let watchers = Arc::new(Watchers::default());
         {
-            let (s, m, q, e, x, inf, w) = (
+            let (s, m, q, e, x, inf, au, w) = (
                 sock.clone(),
                 mount.clone(),
                 Arc::clone(&queue),
                 Arc::clone(&exposures),
                 Arc::clone(&excluded),
                 Arc::new(AtomicU64::new(0)),
+                Arc::new(Mutex::new(HashMap::new())),
                 Arc::clone(&watchers),
             );
-            std::thread::spawn(move || control(&s, m, q, e, x, inf, w));
+            std::thread::spawn(move || control(&s, m, q, e, x, inf, au, w));
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let ask = |line: &str| -> String {
@@ -3149,16 +3210,17 @@ mod tests {
         let excluded = Arc::new(AtomicU64::new(0));
         let watchers = Arc::new(Watchers::default());
         {
-            let (s, m, q, e, x, inf, w) = (
+            let (s, m, q, e, x, inf, au, w) = (
                 sock.clone(),
                 mount.clone(),
                 Arc::clone(&queue),
                 Arc::clone(&exposures),
                 Arc::clone(&excluded),
                 Arc::new(AtomicU64::new(0)),
+                Arc::new(Mutex::new(HashMap::new())),
                 Arc::clone(&watchers),
             );
-            std::thread::spawn(move || control(&s, m, q, e, x, inf, w));
+            std::thread::spawn(move || control(&s, m, q, e, x, inf, au, w));
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         // Reads the *whole* reply, not one line — a `pending` answer is
@@ -3332,7 +3394,7 @@ mod tests {
         peer.read_line(&mut line).unwrap();
         assert_eq!(
             line,
-            "unsent=3 excluded=1 exposures=0 downloading=0 scanning=0\n"
+            "unsent=3 excluded=1 exposures=0 downloading=0 scanning=0 uploading=\n"
         );
 
         // The same tuple, twice. `broadcast` writes synchronously, so had a
@@ -3359,7 +3421,7 @@ mod tests {
         peer.read_line(&mut line).unwrap();
         assert_eq!(
             line,
-            "unsent=2 excluded=1 exposures=0 downloading=0 scanning=0\n"
+            "unsent=2 excluded=1 exposures=0 downloading=0 scanning=0 uploading=\n"
         );
     }
 
