@@ -94,6 +94,26 @@ fn role<C, T>(access: &Mutex<C>, make: impl FnOnce(&C) -> io::Result<T>) -> io::
     }
 }
 
+/// Replace the local namespace watcher only after a complete watcher for the
+/// path's current tree has been built.
+///
+/// A helper restart can detach and remount the sync root while this process
+/// stays alive. Inotify watches belong to inodes, not path strings, so the old
+/// watcher then remains perfectly valid while watching the hidden, detached
+/// tree. Keeping it would make local renames and deletions disappear until the
+/// next cloud delta restored the old namespace. Build first and swap second so
+/// a transient failure leaves the previous (possibly still useful) watcher in
+/// place rather than creating a wholly unwatched interval.
+fn replace_removal_watch(
+    root: &std::path::Path,
+    watcher: &mut Option<crate::removals::Removals>,
+) -> io::Result<usize> {
+    let fresh = crate::removals::Removals::watch(root)?;
+    let count = fresh.watched();
+    *watcher = Some(fresh);
+    Ok(count)
+}
+
 /// Local edits, from the helper into the upload queue.
 ///
 /// Deliberately does almost nothing: this runs on the thread that answers
@@ -839,6 +859,13 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // Set when the helper says its change channel has a hole in it, so the
     // upload driver walks instead of trusting what it was told.
     let resync = Arc::new(AtomicBool::new(true));
+    // Which helper incarnation currently owns the fanotify mark. A reconnect
+    // may follow an ordinary socket restart, or it may follow the helper
+    // detaching and remounting the sync root. The upload-side inotify watcher
+    // cannot tell those cases apart and must be rebuilt for both: a watch on
+    // the old vfsmount stays alive but sees none of the user's new namespace
+    // operations.
+    let helper_generation = Arc::new(AtomicU64::new(0));
     // Folder events produced by the delta applier are indistinguishable from
     // local mkdir/rename events at the inotify boundary. The upload side waits
     // until a whole delta batch has settled before deciding which directories
@@ -903,12 +930,25 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // The upload driver keeps its own store: a held upload must never block a
     // status query behind a shared lock.
     {
-        let (q, stop, mount, access, resync, delta_busy, folder_refresh, tracked, folder_retry, au) = (
+        let (
+            q,
+            stop,
+            mount,
+            access,
+            resync,
+            helper_gen,
+            delta_busy,
+            folder_refresh,
+            tracked,
+            folder_retry,
+            au,
+        ) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             config.mount.clone(),
             Arc::clone(&access),
             Arc::clone(&resync),
+            Arc::clone(&helper_generation),
             Arc::clone(&delta_busy),
             Arc::clone(&folder_refresh),
             // The placeholder count, an always-current proxy for the tree size,
@@ -980,6 +1020,12 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             let mut folders_gone_pending = Vec::new();
             let mut folders_seeded = false;
             let mut next_folder_retry = std::time::Instant::now();
+            // Capture the generation *before* the walk. On the live 26k-folder
+            // tree the helper replaced the mount while this walk was in flight;
+            // loading afterwards would have labelled that mixed, stale watcher
+            // as current and no later reconnect would repair it.
+            let mut watched_helper = helper_gen.load(Ordering::SeqCst);
+            let mut next_watch_retry = std::time::Instant::now();
             let mut removals = match crate::removals::Removals::watch(&mount) {
                 Ok(w) => {
                     eprintln!(
@@ -1158,6 +1204,36 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     if !local.gone.is_empty() {
                         let known = tracked.load(Ordering::SeqCst) as usize;
                         apply_removals(&mount, &local.gone, &recent, known, &mut sink);
+                    }
+                }
+                let connected_helper = helper_gen.load(Ordering::SeqCst);
+                if connected_helper != watched_helper
+                    && std::time::Instant::now() >= next_watch_retry
+                {
+                    match replace_removal_watch(&mount, &mut removals) {
+                        Ok(count) => {
+                            eprintln!(
+                                "hydration-sync: rebuilt the deletion/rename watch after helper \
+                                 connection; watching {count} directories"
+                            );
+                            watched_helper = connected_helper;
+                            // Folder identities captured by the old watcher name
+                            // the old tree. The fresh walk recorded the current
+                            // tree's identities, so no separate refresh is needed.
+                            folder_refresh.store(false, Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "hydration-sync: could not rebuild the deletion/rename watch \
+                                 after helper connection ({e}); local namespace changes may stay \
+                                 in the cloud until the retry"
+                            );
+                            // Keep the generation outstanding so a transient
+                            // walk failure heals without requiring another
+                            // helper restart, but bound both work and logs.
+                            next_watch_retry =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        }
                     }
                 }
                 if !delta_busy.load(Ordering::SeqCst) {
@@ -1652,6 +1728,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 // Every new connection is a resync point. The helper may have
                 // been restarted, and anything edited while it was gone produced
                 // no event at all.
+                helper_generation.fetch_add(1, Ordering::SeqCst);
                 resync.store(true, Ordering::SeqCst);
                 daemon.on_change(Box::new(QueueChanges {
                     queue: Arc::clone(&queue),
@@ -2799,6 +2876,42 @@ mod tests {
                 Some("et:folder-before".into()),
             )]
         );
+    }
+
+    #[test]
+    fn rebuilding_the_namespace_watch_after_root_replacement_observes_the_new_tree() {
+        let dir = scratch("rewatch-replaced-root");
+        std::fs::create_dir(dir.join("from")).unwrap();
+        std::fs::create_dir(dir.join("destination")).unwrap();
+        let stale = crate::removals::Removals::watch(&dir).unwrap();
+
+        // Model hydrationd's fail-closed detach followed by systemd mounting a
+        // new incarnation at the same path. The old inotify descriptor remains
+        // valid and quiet on `detached`; only a rebuilt watcher can see changes
+        // below the path named by `dir` now.
+        let detached = dir.with_extension("detached");
+        let _ = std::fs::remove_dir_all(&detached);
+        std::fs::rename(&dir, &detached).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(dir.join("from")).unwrap();
+        std::fs::create_dir(dir.join("destination")).unwrap();
+
+        let mut watcher = Some(stale);
+        assert_eq!(replace_removal_watch(&dir, &mut watcher).unwrap(), 3);
+        std::fs::rename(dir.join("from"), dir.join("destination/from")).unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+
+        let batch = watcher.as_mut().unwrap().take();
+        assert_eq!(
+            batch.renamed,
+            [crate::removals::Renamed {
+                from: "from".into(),
+                to: "destination/from".into(),
+                is_dir: true,
+            }],
+            "the replacement watcher stayed attached to the detached tree"
+        );
+        std::fs::remove_dir_all(detached).unwrap();
     }
 
     #[test]
