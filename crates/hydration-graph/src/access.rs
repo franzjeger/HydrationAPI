@@ -220,14 +220,20 @@ impl Provider for GraphProvider {
                     Some(expected) => {
                         let mut verified = crate::QuickXorWriter::new(out);
                         self.http.download_span(&key, span, size, &mut verified)?;
-                        verified.verify(&expected)?;
-                        // Metadata and content are separate Graph requests. A
-                        // matching hash proves the bytes, while this second
-                        // version read proves they still belong to the cTag the
-                        // placeholder names rather than a newer version with
-                        // identical content.
-                        self.quickxor_for(&key, expected_version)?;
-                        Ok(())
+                        // No closing metadata read in this arm. The read above
+                        // proved the cTag current and named the hash of exactly
+                        // that version, so matching bytes *are* that version's
+                        // content: a concurrent change with different content
+                        // fails the hash, and a newer version with identical
+                        // content is byte-identical — there is no second fact
+                        // for a second read to establish, only a Graph round
+                        // trip to pay on every small-file hydration (measured
+                        // 2026-08-25: the closing read was a third of the
+                        // ~450 ms a sequential bulk pull paid per file). The
+                        // hashless arm below keeps its closing read: with no
+                        // hash, the cTag bracket is the only integrity there
+                        // is, and there it is load-bearing.
+                        verified.verify(&expected)
                     }
                     // Not every Graph-backed library reports hashes. The cTag
                     // is checked on both sides of the download so a same-sized

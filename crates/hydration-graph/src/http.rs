@@ -34,9 +34,10 @@
 //! network.
 
 use hydration_protocol::Span;
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use ureq::http::header::{HeaderName, HeaderValue};
 
@@ -260,6 +261,69 @@ fn auth_failure(e: AuthError) -> io::Error {
 pub struct GraphHttp<T: TokenSource> {
     agent: ureq::Agent,
     token: T,
+    locations: ContentLocations,
+}
+
+/// How long a remembered pre-authorized content location is trusted.
+///
+/// Deliberately far below the service's own lifetime (~1 h, measured on
+/// tempauth links): a stale entry costs one wasted request and a fresh
+/// resolve, a generous one extends how long a revoked link keeps being tried.
+const CONTENT_LOCATION_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Pre-authorized content locations, remembered across the ranged windows of
+/// one object's hydration.
+///
+/// Graph answers `/content` with a redirect to a pre-authorized URL, and a
+/// large object hydrates as dozens of sequential ranged windows. Measured
+/// 2026-08-25 on a 700 Mbit line: every 8 MiB window paid the Graph round
+/// trip and the redirect again — ~400 ms of a ~500 ms window — to learn a
+/// location that had not changed. The location is therefore remembered,
+/// briefly, keyed by the `/content` URL it resolved from.
+///
+/// Only ranged requests consult it: a whole-object download is one request,
+/// and it stays on the plain-GET road that has been exercised live.
+///
+/// The remembered URL is trusted exactly as far as the redirect it came
+/// from: it passed [`safe_download_url`] then, it is never sent the account
+/// token, and the caller drops it the moment it answers anything a ranged
+/// request does not expect.
+struct ContentLocations {
+    entries: HashMap<String, (String, Instant)>,
+}
+
+impl ContentLocations {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// The remembered location for this `/content` URL, if it is still young
+    /// enough to trust. An expired entry is removed on the way out.
+    fn fresh(&mut self, graph_url: &str, now: Instant) -> Option<String> {
+        match self.entries.get(graph_url) {
+            Some((location, learned))
+                if now.duration_since(*learned) < CONTENT_LOCATION_TTL =>
+            {
+                Some(location.clone())
+            }
+            Some(_) => {
+                self.entries.remove(graph_url);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn learned(&mut self, graph_url: &str, location: &str, now: Instant) {
+        self.entries
+            .insert(graph_url.to_owned(), (location.to_owned(), now));
+    }
+
+    fn forget(&mut self, graph_url: &str) {
+        self.entries.remove(graph_url);
+    }
 }
 
 impl<T: TokenSource> GraphHttp<T> {
@@ -305,6 +369,7 @@ impl<T: TokenSource> GraphHttp<T> {
         Self {
             agent: agent(),
             token,
+            locations: ContentLocations::new(),
         }
     }
 }
@@ -768,8 +833,36 @@ impl<T: TokenSource> GraphHttp<T> {
                 if ranged {
                     headers.push(("range".to_string(), format!("bytes={from}-{last}")));
                 }
-                let mut response =
-                    self.send_response(Method::Get, &graph_url, &headers, &[], true)?;
+                // The ranged windows of one object share a pre-authorized
+                // location; ask Graph for it only when none is remembered.
+                // See [`ContentLocations`].
+                let remembered = if ranged {
+                    self.locations.fresh(&graph_url, Instant::now())
+                } else {
+                    None
+                };
+                let mut response = match &remembered {
+                    Some(location) => {
+                        self.send_response(Method::Get, location, &headers, &[], false)?
+                    }
+                    None => self.send_response(Method::Get, &graph_url, &headers, &[], true)?,
+                };
+                if remembered.is_some() {
+                    let status = response.status().as_u16();
+                    let retryable =
+                        status == 429 || status == 408 || (500..=599).contains(&status);
+                    // A throttle is the service speaking and takes the normal
+                    // retry road below. Anything else that is not the 206 a
+                    // ranged request expects means the pre-authorization went
+                    // stale early: forget it and resolve fresh, once, so a
+                    // revoked link degrades to the old cost rather than an
+                    // error.
+                    if status != 206 && !retryable {
+                        self.locations.forget(&graph_url);
+                        response =
+                            self.send_response(Method::Get, &graph_url, &headers, &[], true)?;
+                    }
+                }
 
                 if response.status().is_redirection() {
                     let location = response
@@ -784,6 +877,9 @@ impl<T: TokenSource> GraphHttp<T> {
                                 "Graph returned an unsafe content redirect; it was not followed",
                             )
                         })?;
+                    if ranged {
+                        self.locations.learned(&graph_url, &location, Instant::now());
+                    }
                     response = self.send_response(Method::Get, &location, &headers, &[], false)?;
                 }
 
@@ -1150,6 +1246,40 @@ mod tests {
     // Where a real upload session lives: a host this crate never composed.
     const SESSION: &str = "https://up.1drv.com/upload.aspx?token=abc";
     const CLIENT: &str = "11111111-2222-3333-4444-555555555555";
+
+    #[test]
+    fn a_remembered_location_is_served_until_it_ages_out() {
+        let mut locations = ContentLocations::new();
+        let now = Instant::now();
+        let url = "https://graph.microsoft.com/v1.0/drives/d/items/i/content";
+        assert_eq!(locations.fresh(url, now), None);
+
+        locations.learned(url, "https://public.dm.files.1drv.com/c?tempauth=t", now);
+        assert_eq!(
+            locations.fresh(url, now).as_deref(),
+            Some("https://public.dm.files.1drv.com/c?tempauth=t")
+        );
+        // Just inside the lifetime it still answers; at the lifetime it is
+        // gone — and gone durably, not merely declined: the expired entry is
+        // removed so the map cannot grow one dead link per object forever.
+        let almost = now + CONTENT_LOCATION_TTL - Duration::from_secs(1);
+        assert!(locations.fresh(url, almost).is_some());
+        let expired = now + CONTENT_LOCATION_TTL;
+        assert_eq!(locations.fresh(url, expired), None);
+        assert!(locations.entries.is_empty());
+    }
+
+    #[test]
+    fn a_forgotten_location_is_not_served_again() {
+        let mut locations = ContentLocations::new();
+        let now = Instant::now();
+        locations.learned("a", "https://x.example/1", now);
+        locations.learned("b", "https://x.example/2", now);
+        locations.forget("a");
+        assert_eq!(locations.fresh("a", now), None);
+        // Forgetting one object's link must not take another's with it.
+        assert_eq!(locations.fresh("b", now).as_deref(), Some("https://x.example/2"));
+    }
 
     #[test]
     fn content_redirect_must_be_https_without_userinfo() {
