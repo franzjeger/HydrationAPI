@@ -22,7 +22,7 @@ use crate::evict_policy::{Clock, EvictionConfig, FreeSpace, RealClock, StatvfsSp
 use crate::manifest::{BackupPolicy, Manifest};
 use crate::place::TmpfilePlacer;
 use crate::reclaim;
-use crate::store::Store;
+use crate::store::{self, Store};
 use crate::upload::{run_upload, Known, Outcome, Queue, Sink, SystemClock, Uploaded};
 use crate::{Changes, Daemon, Provider};
 use hydration_protocol::transport::DaemonConn;
@@ -595,6 +595,15 @@ impl Watchers {
 ///   path per line (empty if none), for a caller about to hydrate each. Reads
 ///   no content: a directory walk and one `getxattr` per file, skipping the
 ///   framework's own names and not following symlinks.
+/// - `prefetch <dir>` — announce that the dehydrated files under a directory
+///   are about to be read, so the provider can have their content verified
+///   and in memory before each serial read arrives. Reads no content here
+///   either — the same walk as `pending`, plus the xattrs that name each
+///   file's object and version — and changes nothing on disk: hydration still
+///   happens only through the caller's reads, exactly as §6a-ter requires.
+///   The reply is `warming N of M files`, or `error: <why>` when there is no
+///   connected provider to warm. Purely advisory: skipping it costs speed,
+///   never correctness.
 /// - `watch` — one state line immediately, another every time the state
 ///   changes, and nothing else ever, until the peer disconnects. A state line
 ///   is `key=value` pairs joined by single spaces, newline-terminated,
@@ -616,6 +625,7 @@ fn control(
     in_flight: Arc<AtomicU64>,
     active_uploads: Arc<Mutex<HashMap<FileId, String>>>,
     watchers: Arc<Watchers>,
+    warmer: Arc<Mutex<Option<Box<dyn crate::ObjectWarmer>>>>,
 ) -> io::Result<()> {
     use std::io::{BufRead, BufReader, Write};
 
@@ -687,6 +697,48 @@ fn control(
                     // not read the reply as dropped.
                     match reclaim::pending(&mount, arg) {
                         Ok(Ok(paths)) => paths.join("\n"),
+                        Ok(Err(why)) => format!("error: {why:?}"),
+                        Err(e) => format!("error: {e}"),
+                    }
+                }
+                "prefetch" => {
+                    // The same walk as `pending`, put to a different use: the
+                    // list is handed to the serving connection's provider so
+                    // the content is fetched, verified, and in memory before
+                    // the caller's serial reads arrive. §6a-ter still holds —
+                    // no content is read *here*, nothing on disk changes, and
+                    // hydration still happens only through the caller's own
+                    // reads. What each item carries is exactly what the
+                    // provider will later be asked with: the object's id, the
+                    // size the placeholder promises, and its version tag —
+                    // taken from the same xattrs a fetch resolves through, so
+                    // the warm fetch and the real one answer the same question.
+                    match reclaim::pending(&mount, arg) {
+                        Ok(Ok(paths)) => match warmer.lock().unwrap().as_ref() {
+                            None => "error: no cloud connection to warm".to_string(),
+                            Some(sink) => {
+                                let items: Vec<crate::WarmItem> = paths
+                                    .iter()
+                                    .filter_map(|rel| {
+                                        let p = crate::delta::safe_join(&mount, rel)?;
+                                        let md = std::fs::metadata(&p).ok()?;
+                                        let cloud_id =
+                                            store::get_xattr_string(&p, store::XATTR_ID)?;
+                                        Some(crate::WarmItem {
+                                            cloud_id,
+                                            size: md.len(),
+                                            content_tag: store::get_xattr_string(
+                                                &p,
+                                                store::XATTR_ETAG,
+                                            ),
+                                        })
+                                    })
+                                    .collect();
+                                let named = items.len();
+                                sink.warm(items);
+                                format!("warming {named} of {} files", paths.len())
+                            }
+                        },
                         Ok(Err(why)) => format!("error: {why:?}"),
                         Err(e) => format!("error: {e}"),
                     }
@@ -1531,11 +1583,19 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
         });
     }
 
+    // Where the control socket's `prefetch` verb reaches the serving
+    // connection's provider. The slot rather than the provider itself, because
+    // the two have different lifetimes: the control thread runs for the
+    // daemon's life, the provider for one helper connection's — and a warmer
+    // outliving its connection would hold that connection's worker pool alive
+    // with nothing left to read what it warms.
+    let warm_gate: Arc<Mutex<Option<Box<dyn crate::ObjectWarmer>>>> = Arc::new(Mutex::new(None));
+
     // The user's way in. §8 item 10's trigger, and the status surface item 11
     // asked for.
     {
         let ctl = config.socket.with_extension("ctl");
-        let (mount, q, ex, exc, inf, au, ws) = (
+        let (mount, q, ex, exc, inf, au, ws, wg) = (
             config.mount.clone(),
             Arc::clone(&queue),
             Arc::clone(&exposures),
@@ -1543,10 +1603,11 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             Arc::clone(&in_flight),
             Arc::clone(&active_uploads),
             Arc::clone(&watchers),
+            Arc::clone(&warm_gate),
         );
         eprintln!("hydration-sync: control socket at {}", ctl.display());
         std::thread::spawn(move || {
-            if let Err(e) = control(&ctl, mount, q, ex, exc, inf, au, ws) {
+            if let Err(e) = control(&ctl, mount, q, ex, exc, inf, au, ws, wg) {
                 eprintln!("hydration-sync: control socket unavailable: {e}");
             }
         });
@@ -1722,6 +1783,11 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
         // been restarted, and the index it had is a snapshot of a moment that
         // has passed.
         let provider = role(&access, C::provider)?;
+        // The warmer is taken before the provider moves into the daemon, and
+        // published only while this connection serves: the control socket's
+        // `prefetch` verb warms the pool the serving fetches will consult, and
+        // between connections there is nobody to consult it.
+        *warm_gate.lock().unwrap() = provider.warmer();
         match Daemon::new(provider, &config.mount) {
             Ok(mut daemon) => {
                 eprintln!("hydration-sync: helper connected");
@@ -1747,6 +1813,10 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             }
             Err(_) => eprintln!("hydration-sync: could not open the cloud directory"),
         }
+        // Cleared with the connection, whichever way it ended: the warmer
+        // holds its pool's workers alive, and a pool nobody will ever take
+        // from again has no business fetching.
+        *warm_gate.lock().unwrap() = None;
     }
     Ok(())
 }
@@ -3118,6 +3188,101 @@ mod tests {
         }
     }
 
+    /// What `prefetch` hands the provider, and what it refuses to.
+    ///
+    /// The announcement must carry exactly the triple a later fetch resolves
+    /// through — id, size, tag, from the placeholder's own xattrs — and a file
+    /// with no cloud id has nothing to announce. With no provider connected
+    /// there is nobody to warm, and the reply must say so rather than pretend.
+    #[test]
+    fn prefetch_announces_the_placeholders_own_promises() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        struct Recording(Arc<Mutex<Vec<crate::WarmItem>>>);
+        impl crate::ObjectWarmer for Recording {
+            fn warm(&self, items: Vec<crate::WarmItem>) {
+                self.0.lock().unwrap().extend(items);
+            }
+        }
+
+        let dir = ctl_scratch("prefetch");
+        let mount = dir.join("m");
+        std::fs::create_dir_all(mount.join("sub")).unwrap();
+        let sock = dir.join("ctl");
+
+        let announced = mount.join("sub/a.bin");
+        std::fs::write(&announced, vec![0u8; 6]).unwrap();
+        store::set_xattr(&announced, hydration_protocol::xattr::DEHYDRATED, b"1").unwrap();
+        store::set_xattr(&announced, store::XATTR_ID, b"cloud-a").unwrap();
+        store::set_xattr(&announced, store::XATTR_ETAG, b"ct:va").unwrap();
+        // Dehydrated but nameless: the walk lists it, the announcement cannot.
+        let nameless = mount.join("sub/b.bin");
+        std::fs::write(&nameless, vec![0u8; 4]).unwrap();
+        store::set_xattr(&nameless, hydration_protocol::xattr::DEHYDRATED, b"1").unwrap();
+
+        let seen: Arc<Mutex<Vec<crate::WarmItem>>> = Arc::new(Mutex::new(Vec::new()));
+        let gate: Arc<Mutex<Option<Box<dyn crate::ObjectWarmer>>>> = Arc::new(Mutex::new(None));
+        {
+            let (s, m, g) = (sock.clone(), mount.clone(), Arc::clone(&gate));
+            std::thread::spawn(move || {
+                control(
+                    &s,
+                    m,
+                    Arc::new(Mutex::new(Queue::new(
+                        Duration::from_secs(900),
+                        SystemClock::default(),
+                    ))),
+                    Arc::new(Mutex::new(Vec::new())),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(Mutex::new(HashMap::new())),
+                    Arc::new(Watchers::default()),
+                    g,
+                )
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let ask = |line: &str| -> String {
+            loop {
+                match UnixStream::connect(&sock) {
+                    Ok(mut c) => {
+                        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        writeln!(c, "{line}").unwrap();
+                        let mut reply = String::new();
+                        BufReader::new(c).read_line(&mut reply).unwrap();
+                        return reply.trim_end().to_string();
+                    }
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(e) => panic!("could not connect: {e}"),
+                }
+            }
+        };
+
+        // Nobody serving: an honest refusal, not a silent success.
+        assert_eq!(ask("prefetch sub"), "error: no cloud connection to warm");
+
+        *gate.lock().unwrap() = Some(Box::new(Recording(Arc::clone(&seen))));
+        assert_eq!(ask("prefetch sub"), "warming 1 of 2 files");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![crate::WarmItem {
+                cloud_id: "cloud-a".into(),
+                size: 6,
+                content_tag: Some("ct:va".into()),
+            }],
+            "the announcement must be the placeholder's own id, size and tag"
+        );
+
+        // The same confinement as every other path verb.
+        assert!(
+            ask("prefetch ../outside").starts_with("error:"),
+            "a path outside the sync directory must be refused"
+        );
+    }
+
     /// The regression `watch` invites, and the reason it is not served on the
     /// accept thread: a watcher is long-lived and silent *by design*, and the
     /// old shape held each connection there until its read timed out — so one
@@ -3151,7 +3316,7 @@ mod tests {
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::clone(&watchers),
             );
-            std::thread::spawn(move || control(&s, m, q, e, x, inf, au, w));
+            std::thread::spawn(move || control(&s, m, q, e, x, inf, au, w, Arc::new(Mutex::new(None))));
         }
         // The listener comes up on another thread; connecting retries until it
         // has. Deadlines are generous because the test machines run gates
@@ -3243,7 +3408,7 @@ mod tests {
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::clone(&watchers),
             );
-            std::thread::spawn(move || control(&s, m, q, e, x, inf, au, w));
+            std::thread::spawn(move || control(&s, m, q, e, x, inf, au, w, Arc::new(Mutex::new(None))));
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let ask = |line: &str| -> String {
@@ -3333,7 +3498,7 @@ mod tests {
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::clone(&watchers),
             );
-            std::thread::spawn(move || control(&s, m, q, e, x, inf, au, w));
+            std::thread::spawn(move || control(&s, m, q, e, x, inf, au, w, Arc::new(Mutex::new(None))));
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         // Reads the *whole* reply, not one line — a `pending` answer is

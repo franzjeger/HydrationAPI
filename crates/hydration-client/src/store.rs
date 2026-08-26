@@ -561,7 +561,7 @@ pub fn remove_xattr(path: &Path, name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn get_xattr_string(path: &Path, name: &str) -> Option<String> {
+pub(crate) fn get_xattr_string(path: &Path, name: &str) -> Option<String> {
     get_xattr(path, name)
         .ok()
         .flatten()

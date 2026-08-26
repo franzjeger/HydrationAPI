@@ -95,6 +95,50 @@ pub trait Provider: Send {
         span: Span,
         out: &mut Body<'_>,
     ) -> io::Result<()>;
+
+    /// A handle the control surface can announce a bulk hydration through.
+    ///
+    /// A *handle* rather than a method on `self`, because the two live on
+    /// different threads by construction: `fetch` runs on the serving loop,
+    /// which is blocked reading the helper's socket whenever it is not
+    /// fetching, and the announcement comes from the control socket, whose
+    /// whole reason to exist is being reachable while that loop is busy.
+    ///
+    /// `None` — the default — is a provider that does not speculate, and every
+    /// read pays its own round trips exactly as before this existed.
+    fn warmer(&self) -> Option<Box<dyn ObjectWarmer>> {
+        None
+    }
+}
+
+/// One file of a coming bulk hydration, named before its read arrives.
+///
+/// Exactly the triple [`Provider::fetch`] will be handed when the reader gets
+/// there: the object, the size the placeholder promises, and the version tag
+/// it was installed with. A warm fetch that used anything else would be
+/// answering a different question than the read asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmItem {
+    pub cloud_id: String,
+    pub size: u64,
+    pub content_tag: Option<String>,
+}
+
+/// Advance notice of a bulk hydration.
+///
+/// §6a-ter keeps the reads out of the daemon: a folder is hydrated by its
+/// *caller* reading each file, one blocked `read()` at a time, and the helper
+/// answers those events strictly in series. So the serial chain is fixed — what
+/// this trait changes is how much each link costs. A provider given the list up
+/// front can have the content fetched, verified, and in memory before the read
+/// that wants it exists, and the round trips that dominated a small file's
+/// hydration (measured 2026-08-25: ~250 ms of a ~250 ms total) overlap across
+/// files instead of queuing behind one another.
+///
+/// A hint, never a promise: a provider may drop any or all of it, and a read
+/// that finds nothing warm takes the inline path it always took.
+pub trait ObjectWarmer: Send {
+    fn warm(&self, items: Vec<WarmItem>);
 }
 
 /// Why a fetch could not be served, in the framework's own terms.
