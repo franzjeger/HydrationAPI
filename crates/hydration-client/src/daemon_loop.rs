@@ -1131,6 +1131,9 @@ pub fn run_with_history<C: CloudAccess>(
                                     found.holding.len()
                                 );
                                 for p in &found.holding {
+                                    if let Some(relative) = crate::lineage::relative(&mount, p) {
+                                        desktop.issue(&relative, "availability", "An online-only file contains local data of uncertain origin. Opening or copying it can replace those bytes with a cloud download. Review this file before opening it.");
+                                    }
                                     eprintln!("hydration-sync:   {}", p.display());
                                 }
                                 // No advice to copy the bytes out, because
@@ -1496,6 +1499,7 @@ pub fn run_with_history<C: CloudAccess>(
                         // not been seen.
                         let lost_the_mount = matches!(&applied, Ok(a) if a.stopped.is_some());
                         if let Ok(a) = &applied {
+                            desktop.reconciled(&changes, a);
                             if let Some(why) = &a.stopped {
                                 eprintln!(
                                     "hydration-sync: delta pass stopped after {} of {} \
@@ -1545,6 +1549,11 @@ pub fn run_with_history<C: CloudAccess>(
                                 // apply because local work would have been lost,
                                 // and they are what a conflict UI is for.
                                 for k in &a.kept_local {
+                                    desktop.issue(
+                                        &k.path,
+                                        "conflict",
+                                        &format!("Local copy preserved: {}", k.why),
+                                    );
                                     eprintln!(
                                         "hydration-sync:   kept local copy of {}: {}",
                                         k.path, k.why
@@ -1557,6 +1566,11 @@ pub fn run_with_history<C: CloudAccess>(
                                 // the same sentence, and the difference had to
                                 // be found by bisecting the daemon.
                                 for f in &a.failed {
+                                    desktop.issue(
+                                        &f.path,
+                                        "error",
+                                        &format!("Could not apply cloud update: {}", f.why),
+                                    );
                                     eprintln!(
                                         "hydration-sync:   could not apply {}: {}",
                                         f.path, f.why

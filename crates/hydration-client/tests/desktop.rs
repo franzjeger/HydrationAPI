@@ -67,3 +67,45 @@ fn queue_errors_survive_retry_and_history_survives_restart() {
         "pause does not silently persist across restart"
     );
 }
+
+#[test]
+fn empty_queue_does_not_hide_persisted_refusals() {
+    let dir = test_scratch::scratch(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+        "desktop-issues",
+    );
+    let file = dir.join("history.json");
+    let _ = std::fs::remove_file(file.with_extension("issues.json"));
+    let desktop = Desktop::load(Some(file.clone()));
+    let queue = Queue::new(Duration::from_secs(10), TestClock::default());
+    desktop.issue("a.txt", "availability", "Ambiguous local bytes");
+    desktop.issue("a.txt", "conflict", "Local copy preserved");
+    desktop.issue("b.txt", "error", "Permission denied");
+    let desktop = Desktop::load(Some(file));
+    let state: Value = serde_json::from_str(&desktop.snapshot(Path::new("/sync"), &queue)).unwrap();
+    assert_eq!(state["total"], 0);
+    assert_eq!(state["issues"].as_array().unwrap().len(), 2);
+    assert_eq!(state["issues"][1]["kind"], "availability");
+    let changes: Vec<_> = ["a.txt", "b.txt"]
+        .into_iter()
+        .map(|p| hydration_client::delta::Change::Upserted {
+            cloud_id: p.into(),
+            path: p.into(),
+            size: 0,
+            etag: None,
+        })
+        .collect();
+    desktop.reconciled(&changes, &hydration_client::delta::Applied::default());
+    let state: Value = serde_json::from_str(&desktop.snapshot(Path::new("/sync"), &queue)).unwrap();
+    assert_eq!(state["issues"].as_array().unwrap().len(), 1);
+    assert_eq!(state["issues"][0]["kind"], "availability");
+    desktop.record(
+        FileId { fsid: 1, ino: 2 },
+        Some("a.txt"),
+        &Outcome::Sent {
+            cloud_id: "a".into(),
+        },
+    );
+    let state: Value = serde_json::from_str(&desktop.snapshot(Path::new("/sync"), &queue)).unwrap();
+    assert!(state["issues"].as_array().unwrap().is_empty());
+}

@@ -4,7 +4,8 @@ The owner-only control socket accepts `desktop`, `pause <seconds>` (0 resumes,
 maximum 86400), and `retry`. The existing `watch` format is unchanged.
 
 `desktop` returns version 1 JSON: connected `mount`, `paused`, `pause_until`,
-`total` queued entries, up to 500 `queue` rows and the last 100 `history` events.
+`total` queued entries, up to 500 `queue` rows, the last 100 `history` events,
+and up to 100 unresolved `issues` (path, kind, detail).
 Queue rows contain `path` (nullable until the upload store resolves the inode),
 `status` (`waiting`, `uploading`, `retry`), nullable last-error `detail`, and
 `retry_after` seconds. These are observations of the actual upload queue, not a
@@ -27,3 +28,13 @@ Validation includes the workspace tests, real socket tests and a queue test that
 checks failed attempts, edits, pause/resume, retry, successful completion and
 history restoration. This does not replace the product's live two-device and
 process-restart acceptance matrix.
+
+Engine refusals are persisted separately alongside history. An empty queue must
+not hide them. Delta conflicts/errors clear only when a subsequent completed
+pass covers their path without refusal; ambiguous availability remains until a
+confirmed upload/deletion resolves it. A file marked online-only that holds
+unexplained bytes is reported as an availability issue: reading/copying that
+file may trigger hydration and replace those bytes. Desktop clients must avoid
+a local-open shortcut for that issue and block bulk availability actions that
+would cover it. The issue list reports the condition; it does not resolve it or
+change the kernel read path.

@@ -23,12 +23,20 @@ pub struct Event {
     pub detail: String,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Issue {
+    pub path: String,
+    pub kind: String,
+    pub detail: String,
+}
+
 #[derive(Default)]
 pub struct Desktop {
     until: AtomicU64,
     paths: Mutex<HashMap<FileId, String>>,
     errors: Mutex<HashMap<FileId, String>>,
     events: Mutex<Vec<Event>>,
+    issues: Mutex<Vec<Issue>>,
     history: Option<PathBuf>,
 }
 
@@ -40,8 +48,15 @@ impl Desktop {
             .filter(|bytes| bytes.len() <= 512 * 1024)
             .and_then(|bytes| serde_json::from_slice::<Vec<Event>>(&bytes).ok())
             .unwrap_or_default();
+        let issues = history
+            .as_ref()
+            .and_then(|p| std::fs::read(p.with_extension("issues.json")).ok())
+            .filter(|bytes| bytes.len() <= 512 * 1024)
+            .and_then(|bytes| serde_json::from_slice::<Vec<Issue>>(&bytes).ok())
+            .unwrap_or_default();
         Self {
             events: Mutex::new(events.into_iter().take(100).collect()),
+            issues: Mutex::new(issues.into_iter().take(100).collect()),
             history,
             ..Self::default()
         }
@@ -85,6 +100,11 @@ impl Desktop {
             Outcome::DeletedInstead => ("deleted", "Cloud deletion confirmed".to_owned()),
             Outcome::Ignored | Outcome::NothingToDo => return,
         };
+        if status != "error" {
+            if let Some(path) = path {
+                self.clear_issue(path);
+            }
+        }
         let mut errors = self.errors.lock().unwrap();
         if status == "error" {
             errors.insert(file, detail.clone());
@@ -128,6 +148,90 @@ impl Desktop {
         }
     }
 
+    /// Retain engine refusals until a confirmed operation resolves them.
+    /// In particular, zero queued uploads is not proof of a healthy namespace.
+    pub fn issue(&self, path: &str, kind: &str, detail: &str) {
+        let mut issues = self.issues.lock().unwrap();
+        let issue = Issue {
+            path: path.into(),
+            kind: kind.into(),
+            detail: detail.chars().take(2048).collect(),
+        };
+        if issues.contains(&issue) {
+            return;
+        }
+        // Ambiguous availability has a stronger read hazard than a later delta
+        // refusal about the same path; preserve that explanation.
+        if kind != "availability"
+            && issues
+                .iter()
+                .any(|i| i.path == path && i.kind == "availability")
+        {
+            return;
+        }
+        issues.retain(|i| i.path != path);
+        issues.insert(0, issue);
+        issues.truncate(100);
+        self.save_issues(&issues);
+    }
+
+    pub fn clear_issue(&self, path: &str) {
+        let mut issues = self.issues.lock().unwrap();
+        let len = issues.len();
+        issues.retain(|i| i.path != path);
+        if issues.len() != len {
+            self.save_issues(&issues);
+        }
+    }
+
+    /// Clear transient delta refusals only after a complete successful pass
+    /// covered the path. Ambiguous local bytes require a confirmed upload.
+    pub fn reconciled(&self, changes: &[crate::delta::Change], applied: &crate::delta::Applied) {
+        if applied.stopped.is_some() {
+            return;
+        }
+        let mut issues = self.issues.lock().unwrap();
+        let len = issues.len();
+        issues.retain(|issue| {
+            issue.kind == "availability"
+                || applied.kept_local.iter().any(|k| k.path == issue.path)
+                || applied.failed.iter().any(|f| f.path == issue.path)
+                || !changes.iter().any(|change| match change {
+                    crate::delta::Change::Upserted { path, .. }
+                    | crate::delta::Change::FolderUpserted { path, .. }
+                    | crate::delta::Change::FolderRemoved { path, .. } => path == &issue.path,
+                    crate::delta::Change::Removed { .. } => false,
+                })
+        });
+        if issues.len() != len {
+            self.save_issues(&issues);
+        }
+    }
+
+    fn save_issues(&self, issues: &[Issue]) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let Some(history) = &self.history else {
+            return;
+        };
+        let path = history.with_extension("issues.json");
+        let write = || -> std::io::Result<()> {
+            let tmp = path.with_extension("tmp");
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(&serde_json::to_vec(issues)?)?;
+            f.sync_all()?;
+            std::fs::rename(tmp, path)
+        };
+        if let Err(e) = write() {
+            eprintln!("hydration-sync: could not save sync issues: {e}");
+        }
+    }
+
     pub fn snapshot<C: Clock>(&self, root: &Path, queue: &Queue<C>) -> String {
         let paths = self.paths.lock().unwrap();
         let mut errors = self.errors.lock().unwrap();
@@ -138,6 +242,6 @@ impl Desktop {
                 "detail": errors.get(id), "retry_after": retry})
         }).collect();
         serde_json::json!({"version": 1, "mount": root, "paused": self.paused(), "pause_until": self.until.load(Ordering::SeqCst),
-            "queue": rows, "total": pending.len(), "history": *self.events.lock().unwrap()}).to_string()
+            "queue": rows, "total": pending.len(), "history": *self.events.lock().unwrap(), "issues": *self.issues.lock().unwrap()}).to_string()
     }
 }
