@@ -45,6 +45,13 @@ use std::time::Duration;
 /// `Sync` and refresh it single-flight, because three instances *will* be alive
 /// at once.
 pub trait CloudAccess: Send + 'static {
+    fn observe(&mut self, _desktop: Arc<crate::desktop::Desktop>) {}
+    fn conflicts(
+        &self,
+        _desktop: Arc<crate::desktop::Desktop>,
+    ) -> Option<Arc<dyn crate::desktop::ConflictControl>> {
+        None
+    }
     type Fetch: Provider;
     type Upload: Sink;
     type Changes: Discover;
@@ -665,122 +672,154 @@ fn control_with_desktop(
         let mut out = conn;
         for line in reader.lines().map_while(Result::ok) {
             let (verb, arg) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
-            let reply = match verb {
-                "evict" => {
-                    // The argument goes through unchanged. Trimming or joining
-                    // it here would mean two places decide what a path means,
-                    // and `reclaim` is the one that has to be right — it
-                    // resolves through `safe_join` and then through the
-                    // filesystem, so neither `..` nor a symlinked subdirectory
-                    // can lead it out of the sync directory.
-                    // Snapshotted, so the control socket never holds the queue
-                    // across a directory walk.
-                    let (waiting, sending) = {
-                        let q = queue.lock().unwrap();
-                        (q.waiting_set(), q.sending_set())
-                    };
-                    let mut store = Store::new();
-                    let _ = store.scan(&mount);
-                    match reclaim::reclaim(&mount, arg, &mut store, &waiting, &sending) {
-                        Ok(Ok(r)) => format!("reclaimed {} bytes", r.bytes),
-                        Ok(Err(why)) => format!("kept: {why:?}"),
-                        Err(e) => format!("error: {e}"),
+            let reply = if desktop.resolving.load(Ordering::SeqCst)
+                && matches!(verb, "evict" | "pin" | "unpin" | "selection")
+            {
+                "error: Finish the conflict resolution first".into()
+            } else {
+                match verb {
+                    "evict" => {
+                        // The argument goes through unchanged. Trimming or joining
+                        // it here would mean two places decide what a path means,
+                        // and `reclaim` is the one that has to be right — it
+                        // resolves through `safe_join` and then through the
+                        // filesystem, so neither `..` nor a symlinked subdirectory
+                        // can lead it out of the sync directory.
+                        // Snapshotted, so the control socket never holds the queue
+                        // across a directory walk.
+                        let (waiting, sending) = {
+                            let q = queue.lock().unwrap();
+                            (q.waiting_set(), q.sending_set())
+                        };
+                        let mut store = Store::new();
+                        let _ = store.scan(&mount);
+                        match reclaim::reclaim(&mount, arg, &mut store, &waiting, &sending) {
+                            Ok(Ok(r)) => format!("reclaimed {} bytes", r.bytes),
+                            Ok(Err(why)) => format!("kept: {why:?}"),
+                            Err(e) => format!("error: {e}"),
+                        }
                     }
-                }
-                "pin" | "unpin" => {
-                    // The same shape as evict — an untrusted path, confined by
-                    // `reclaim::set_pin` through the same `safe_join` — but it
-                    // touches no content: a pin is a `setxattr`/`removexattr`,
-                    // which fires no pre-content event and needs no privilege, so
-                    // nothing here crosses to the helper (§6b never comes into
-                    // it). Unlike evict it accepts a directory, because a folder
-                    // pin protects its subtree. A path that will not resolve
-                    // inside the sync directory is an `error:` rather than a
-                    // `kept:` — a pin keeps nothing back, it is a rejected
-                    // request.
-                    match reclaim::set_pin(&mount, arg, verb == "pin") {
-                        Ok(Ok(())) => if verb == "pin" { "pinned" } else { "unpinned" }.to_string(),
-                        Ok(Err(why)) => format!("error: {why:?}"),
-                        Err(e) => format!("error: {e}"),
+                    "pin" | "unpin" => {
+                        // The same shape as evict — an untrusted path, confined by
+                        // `reclaim::set_pin` through the same `safe_join` — but it
+                        // touches no content: a pin is a `setxattr`/`removexattr`,
+                        // which fires no pre-content event and needs no privilege, so
+                        // nothing here crosses to the helper (§6b never comes into
+                        // it). Unlike evict it accepts a directory, because a folder
+                        // pin protects its subtree. A path that will not resolve
+                        // inside the sync directory is an `error:` rather than a
+                        // `kept:` — a pin keeps nothing back, it is a rejected
+                        // request.
+                        match reclaim::set_pin(&mount, arg, verb == "pin") {
+                            Ok(Ok(())) => {
+                                if verb == "pin" { "pinned" } else { "unpinned" }.to_string()
+                            }
+                            Ok(Err(why)) => format!("error: {why:?}"),
+                            Err(e) => format!("error: {e}"),
+                        }
                     }
-                }
-                "pending" => {
-                    // A content-free enumeration: the dehydrated files under a
-                    // directory, one relative path per line, for a caller about
-                    // to hydrate each in its own process — the reads must not
-                    // happen here (§6a-ter). An empty list is a valid answer;
-                    // `writeln!` below still sends a newline, so the client does
-                    // not read the reply as dropped.
-                    match reclaim::pending(&mount, arg) {
-                        Ok(Ok(paths)) => paths.join("\n"),
-                        Ok(Err(why)) => format!("error: {why:?}"),
-                        Err(e) => format!("error: {e}"),
+                    "pending" => {
+                        // A content-free enumeration: the dehydrated files under a
+                        // directory, one relative path per line, for a caller about
+                        // to hydrate each in its own process — the reads must not
+                        // happen here (§6a-ter). An empty list is a valid answer;
+                        // `writeln!` below still sends a newline, so the client does
+                        // not read the reply as dropped.
+                        match reclaim::pending(&mount, arg) {
+                            Ok(Ok(paths)) => paths.join("\n"),
+                            Ok(Err(why)) => format!("error: {why:?}"),
+                            Err(e) => format!("error: {e}"),
+                        }
                     }
-                }
-                "desktop" => desktop.snapshot(&mount, &queue.lock().unwrap()),
-                "pause" => match arg.parse::<u64>() {
-                    Ok(seconds) if seconds <= 86400 => {
-                        desktop.pause(seconds);
+                    "review" | "resolve" => {
+                        let service = desktop.conflicts.lock().unwrap().clone();
+                        match service {
+                            None => "error: Conflict resolution is unavailable".into(),
+                            Some(service) => {
+                                let result = if verb == "review" {
+                                    service.inspect(arg)
+                                } else {
+                                    match arg.split_once(' ') {
+                                        Some((token, choice)) => service.start(token, choice),
+                                        None => Err(io::Error::other("Choose a reviewed version")),
+                                    }
+                                };
+                                result.unwrap_or_else(|e| format!("error: {e}"))
+                            }
+                        }
+                    }
+                    "selection" => match serde_json::from_str::<Vec<String>>(arg) {
+                        Ok(paths) => match desktop.select(&mount, &paths) {
+                            Ok(()) => "selection saved".into(),
+                            Err(e) => format!("error: {e}"),
+                        },
+                        Err(e) => format!("error: {e}"),
+                    },
+                    "desktop" => desktop.snapshot(&mount, &queue.lock().unwrap()),
+                    "pause" => match arg.parse::<u64>() {
+                        Ok(seconds) if seconds <= 86400 => {
+                            desktop.pause(seconds);
+                            "ok".into()
+                        }
+                        _ => "error: pause requires seconds between 0 and 86400".into(),
+                    },
+                    "retry" => {
+                        queue.lock().unwrap().flush_now();
                         "ok".into()
                     }
-                    _ => "error: pause requires seconds between 0 and 86400".into(),
-                },
-                "retry" => {
-                    queue.lock().unwrap().flush_now();
-                    "ok".into()
+                    "status" => {
+                        let pending = queue.lock().unwrap().pending();
+                        let m = Manifest::build(&mount).unwrap_or_default();
+                        // A fresh count was just paid for; publishing it costs
+                        // nothing and spares watchers up to a whole status-thread
+                        // period of staleness after an eviction.
+                        excluded.store(m.len() as u64, Ordering::SeqCst);
+                        let seen = exposures.lock().unwrap();
+                        format!(
+                            "{pending} unsent\n{}\n{}",
+                            crate::manifest::status_line(BackupPolicy::Exclude, m.len()),
+                            if seen.is_empty() {
+                                "no other mount exposes these files".to_string()
+                            } else {
+                                format!(
+                                    "WARNING: {} other mount(s) bypass hydration: {seen:?}",
+                                    seen.len()
+                                )
+                            }
+                        )
+                    }
+                    "watch" => {
+                        // From here this connection is written to and never read —
+                        // one state line now, another per change, nothing else —
+                        // so it leaves the accept thread before the next
+                        // `incoming()`. It joins a registry the status thread
+                        // already serves once a second, rather than getting a
+                        // thread of its own: a watcher is long-lived *by design*,
+                        // so serving it here would park the user's only status and
+                        // eviction channel for its whole lifetime — the exact
+                        // condition the read timeout above exists to prevent,
+                        // except that a watcher never times out on purpose — and
+                        // thread-per-watcher would let a reconnect loop grow the
+                        // daemon by one parked thread per attempt.
+                        // `false`: this is the one-shot state a new watcher gets on
+                        // connect, and control has no `delta_busy` in scope; the status
+                        // thread's next tick corrects it if a pass is in fact running.
+                        watchers.adopt(
+                            out,
+                            watch_state(
+                                &queue,
+                                &excluded,
+                                &exposures,
+                                &in_flight,
+                                false,
+                                &active_uploads,
+                            ),
+                        );
+                        break;
+                    }
+                    "" => continue,
+                    other => format!("unknown command: {other}"),
                 }
-                "status" => {
-                    let pending = queue.lock().unwrap().pending();
-                    let m = Manifest::build(&mount).unwrap_or_default();
-                    // A fresh count was just paid for; publishing it costs
-                    // nothing and spares watchers up to a whole status-thread
-                    // period of staleness after an eviction.
-                    excluded.store(m.len() as u64, Ordering::SeqCst);
-                    let seen = exposures.lock().unwrap();
-                    format!(
-                        "{pending} unsent\n{}\n{}",
-                        crate::manifest::status_line(BackupPolicy::Exclude, m.len()),
-                        if seen.is_empty() {
-                            "no other mount exposes these files".to_string()
-                        } else {
-                            format!(
-                                "WARNING: {} other mount(s) bypass hydration: {seen:?}",
-                                seen.len()
-                            )
-                        }
-                    )
-                }
-                "watch" => {
-                    // From here this connection is written to and never read —
-                    // one state line now, another per change, nothing else —
-                    // so it leaves the accept thread before the next
-                    // `incoming()`. It joins a registry the status thread
-                    // already serves once a second, rather than getting a
-                    // thread of its own: a watcher is long-lived *by design*,
-                    // so serving it here would park the user's only status and
-                    // eviction channel for its whole lifetime — the exact
-                    // condition the read timeout above exists to prevent,
-                    // except that a watcher never times out on purpose — and
-                    // thread-per-watcher would let a reconnect loop grow the
-                    // daemon by one parked thread per attempt.
-                    // `false`: this is the one-shot state a new watcher gets on
-                    // connect, and control has no `delta_busy` in scope; the status
-                    // thread's next tick corrects it if a pass is in fact running.
-                    watchers.adopt(
-                        out,
-                        watch_state(
-                            &queue,
-                            &excluded,
-                            &exposures,
-                            &in_flight,
-                            false,
-                            &active_uploads,
-                        ),
-                    );
-                    break;
-                }
-                "" => continue,
-                other => format!("unknown command: {other}"),
             };
             if writeln!(out, "{reply}").is_err() {
                 break;
@@ -845,10 +884,12 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
 /// Run with a bounded persistent desktop outcome history outside the sync root.
 pub fn run_with_history<C: CloudAccess>(
     config: Config,
-    access: C,
+    mut access: C,
     history: Option<PathBuf>,
 ) -> io::Result<()> {
     let desktop = Arc::new(crate::desktop::Desktop::load(history));
+    access.observe(Arc::clone(&desktop));
+    *desktop.conflicts.lock().unwrap() = access.conflicts(Arc::clone(&desktop));
     // Before the credential, because this one costs nothing and the failure it
     // prevents is the worst one available.
     //
@@ -1068,6 +1109,8 @@ pub fn run_with_history<C: CloudAccess>(
             let mut renames_pending = Vec::new();
             let mut folders_gone_pending = Vec::new();
             let mut folders_seeded = false;
+            let mut selected = crate::selection::read(&mount).ok();
+            let mut resolution_generation = desktop.refresh.load(Ordering::SeqCst);
             let mut next_folder_retry = std::time::Instant::now();
             // Capture the generation *before* the walk. On the live 26k-folder
             // tree the helper replaced the mount while this walk was in flight;
@@ -1092,10 +1135,29 @@ pub fn run_with_history<C: CloudAccess>(
                 }
             };
             while !stop.load(Ordering::SeqCst) {
-                if desktop.paused() {
+                let Some(_pass) = desktop.begin_pass() else {
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
+                };
+                let current = crate::selection::read(&mount).ok();
+                let changed = desktop.refresh.load(Ordering::SeqCst);
+                if changed != resolution_generation {
+                    resolution_generation = changed;
+                    match role(&access, C::sink) {
+                        Ok(fresh) => sink = fresh,
+                        Err(e) => {
+                            eprintln!("hydration-sync: could not refresh upload versions after resolution: {e}");
+                            continue;
+                        }
+                    }
+                    q.lock().unwrap().flush_now();
+                    resync.store(true, Ordering::SeqCst);
                 }
+                if current != selected {
+                    selected = current;
+                    resync.store(true, Ordering::SeqCst);
+                }
+
                 // Close the holes in the change channel by looking, rather than
                 // by trusting that nothing was missed.
                 //
@@ -1124,6 +1186,7 @@ pub fn run_with_history<C: CloudAccess>(
                             // discard, and after the next read there is nothing
                             // left to notice. This line is the only moment
                             // anyone can act on them.
+                            desktop.reconcile_availability(&mount);
                             if !found.holding.is_empty() {
                                 eprintln!(
                                     "hydration-sync: WARNING — {} dehydrated file(s) hold \
@@ -1399,11 +1462,13 @@ pub fn run_with_history<C: CloudAccess>(
             // someone acts, and five seconds of the same line is a log nobody
             // reads any of.
             let mut complained = false;
+            let mut selection = crate::selection::applied(&mount).unwrap_or_default();
+            let mut resolution_generation = desktop.refresh.load(Ordering::SeqCst);
             while !stop.load(Ordering::SeqCst) {
-                if desktop.paused() {
+                let Some(_pass) = desktop.begin_pass() else {
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
-                }
+                };
                 // Two questions, and they are not the same one.
                 //
                 // "Is there a mount here at all" is what `is_mount_point`
@@ -1419,6 +1484,31 @@ pub fn run_with_history<C: CloudAccess>(
                 // the unique mount id it captured at open time, and `apply` asks
                 // it per change. See `place.rs` for why that one cannot be
                 // carried by a path check.
+                let changed = desktop.refresh.load(Ordering::SeqCst);
+                if changed != resolution_generation {
+                    resolution_generation = changed;
+                    cloud.refresh();
+                    applied_to = None;
+                    cursor = Cursor::default();
+                }
+                match crate::selection::read(&mount) {
+                    Ok(current) if current != selection => {
+                        cloud.refresh();
+                        cursor = Cursor::default();
+                        applied_to = None;
+                        selection = current;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        desktop.issue(
+                            "",
+                            "selection",
+                            &format!("Could not read folder selection: {e}"),
+                        );
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                }
                 if placer.is_none() {
                     let opened = match crate::mount::is_mount_point(&mount) {
                         Ok(true) => TmpfilePlacer::new(&mount).map_err(|e| {
@@ -1526,6 +1616,7 @@ pub fn run_with_history<C: CloudAccess>(
                             Ok(_) => {
                                 unfinished = false;
                                 cursor = next;
+                                let _ = crate::selection::mark_applied(&mount, &selection);
                             }
                             Err(_) => unfinished = true,
                         }
@@ -1584,7 +1675,10 @@ pub fn run_with_history<C: CloudAccess>(
                     // Nothing new. Only meaningful if the last pass finished:
                     // silence must not be read as permission to move past work
                     // that was deliberately deferred.
-                    Ok((_, next)) if !unfinished => cursor = next,
+                    Ok((_, next)) if !unfinished => {
+                        cursor = next;
+                        let _ = crate::selection::mark_applied(&mount, &selection);
+                    }
                     Ok(_) => {}
                     Err(e) => eprintln!("hydration-sync: could not list the cloud: {e}"),
                 }
@@ -1603,6 +1697,7 @@ pub fn run_with_history<C: CloudAccess>(
                     }
                     walked = std::time::Instant::now();
                 }
+                drop(_pass);
                 std::thread::sleep(POLL_EVERY);
             }
         });
@@ -1640,6 +1735,7 @@ pub fn run_with_history<C: CloudAccess>(
             Arc::clone(&delta_busy),
             Arc::clone(&queue),
         );
+        let desktop = Arc::clone(&desktop);
         std::thread::spawn(move || {
             let free = StatvfsSpace {
                 mount: mount.clone(),
@@ -1659,6 +1755,9 @@ pub fn run_with_history<C: CloudAccess>(
                 if delta_busy.load(Ordering::SeqCst) {
                     continue;
                 }
+                let Some(_pass) = desktop.begin_pass() else {
+                    continue;
+                };
                 // Cheap unless something is happening: one `statvfs`, and only
                 // below the low mark do we walk and evict. P1 measured `f_bavail`
                 // coarse and lagging a delete until the commit, so the sweep sizes
@@ -3085,9 +3184,10 @@ mod tests {
 
     #[test]
     fn folder_deletes_are_versioned_and_deepest_first() {
+        let root = scratch("folder-deletes-existing-root");
         let mut sink = DeleteSink::default();
         apply_folder_removals(
-            std::path::Path::new("/no/such/root"),
+            &root,
             &[
                 crate::removals::FolderGone {
                     path: "Work".into(),

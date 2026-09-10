@@ -75,7 +75,12 @@ pub struct Store {
 pub fn load_ignore(root: &Path) -> hydration_protocol::ignore::IgnoreSet {
     let path = root.join(hydration_protocol::names::IGNORE);
     let contents = std::fs::read_to_string(&path).unwrap_or_default();
-    hydration_protocol::ignore::IgnoreSet::from_config(&contents)
+    match crate::selection::read(root) {
+        Ok(paths) => {
+            hydration_protocol::ignore::IgnoreSet::from_config(&contents).with_prefixes(paths)
+        }
+        Err(_) => hydration_protocol::ignore::IgnoreSet::all(),
+    }
 }
 
 impl Store {
@@ -97,9 +102,12 @@ impl Store {
     /// with no known root, or outside it, is not ignored.
     pub fn path_is_ignored(&self, abs: &Path) -> bool {
         match self.root.as_deref() {
-            Some(root) => abs
-                .strip_prefix(root)
-                .is_ok_and(|rel| self.ignore.is_ignored(rel)),
+            Some(root) => abs.strip_prefix(root).is_ok_and(|rel| {
+                self.ignore.is_ignored(rel)
+                    || crate::selection::read(root)
+                        .map(|paths| crate::selection::contains(&paths, rel))
+                        .unwrap_or(true)
+            }),
             None => false,
         }
     }

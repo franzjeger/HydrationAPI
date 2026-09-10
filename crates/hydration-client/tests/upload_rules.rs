@@ -513,3 +513,30 @@ fn run_upload_of_an_ignored_path_touches_no_sink() {
         sink.ops()
     );
 }
+
+#[test]
+fn excluding_a_queued_folder_takes_effect_before_another_scan() {
+    use std::os::unix::fs::MetadataExt;
+    let root = scratch("selection-queued");
+    std::fs::create_dir_all(root.join("Docs")).unwrap();
+    let path = root.join("Docs/edit.txt");
+    std::fs::write(&path, b"local edit").unwrap();
+    let mut store = Store::new();
+    store.scan(&root).unwrap();
+    let md = std::fs::metadata(&path).unwrap();
+    let id = FileId {
+        fsid: md.dev(),
+        ino: md.ino(),
+    };
+    hydration_client::selection::write(&root, &["Docs".into()]).unwrap();
+    let mut sink = Recorder::default();
+    assert!(matches!(
+        run_upload(id, &mut store, &mut sink),
+        Outcome::Ignored
+    ));
+    assert!(sink.ops().is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), b"local edit");
+    hydration_client::selection::write(&root, &[]).unwrap();
+    store.scan(&root).unwrap();
+    assert!(!store.path_is_ignored(&path));
+}

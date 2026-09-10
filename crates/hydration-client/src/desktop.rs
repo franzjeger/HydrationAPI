@@ -5,8 +5,8 @@ use hydration_protocol::FileId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 fn now() -> u64 {
     std::time::SystemTime::now()
@@ -32,7 +32,13 @@ pub struct Issue {
 
 #[derive(Default)]
 pub struct Desktop {
+    pub transfers: Arc<crate::transfers::Transfers>,
     until: AtomicU64,
+    passes: AtomicU64,
+    pub resolving: AtomicBool,
+    pub refresh: AtomicU64,
+    pub resolution: Mutex<serde_json::Value>,
+    pub conflicts: Mutex<Option<Arc<dyn ConflictControl>>>,
     paths: Mutex<HashMap<FileId, String>>,
     errors: Mutex<HashMap<FileId, String>>,
     events: Mutex<Vec<Event>>,
@@ -76,6 +82,54 @@ impl Desktop {
     }
     pub fn paused(&self) -> bool {
         self.until.load(Ordering::SeqCst) > now()
+    }
+
+    pub fn begin_pass(&self) -> Option<Pass<'_>> {
+        self.passes.fetch_add(1, Ordering::SeqCst);
+        let pass = Pass(self);
+        if self.paused() || self.resolving.load(Ordering::SeqCst) {
+            None
+        } else {
+            Some(pass)
+        }
+    }
+    /// Change rules only between complete engine passes. New passes observe
+    /// pause after incrementing the counter, closing the check/start race.
+    pub fn select(&self, root: &Path, paths: &[String]) -> std::io::Result<()> {
+        if self.resolving.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other(
+                "Finish the conflict resolution first",
+            ));
+        }
+        let paths = crate::selection::validate(paths)?;
+        let old = self.until.swap(now().saturating_add(60), Ordering::SeqCst);
+        let result = (|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while self.passes.load(Ordering::SeqCst) > 0 {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::other(
+                        "Current sync work is still finishing; try again shortly",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            crate::selection::write(root, &paths)
+        })();
+        self.until.store(old, Ordering::SeqCst);
+        result
+    }
+
+    pub fn wait_for_passes(&self) -> std::io::Result<()> {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while self.passes.load(Ordering::SeqCst) > 0 {
+            if std::time::Instant::now() >= end {
+                return Err(std::io::Error::other(
+                    "Current sync work is still finishing; review again shortly",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Ok(())
     }
 
     pub fn index<C: Clock>(&self, root: &Path, store: &Store, queue: &Queue<C>) {
@@ -232,6 +286,25 @@ impl Desktop {
         }
     }
 
+    pub fn reconcile_availability(&self, root: &Path) {
+        let paths: Vec<_> = self
+            .issues
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| i.kind == "availability")
+            .map(|i| i.path.clone())
+            .collect();
+        for path in paths {
+            if matches!(
+                hydration_protocol::stamp::state(&root.join(&path)),
+                Ok(hydration_protocol::stamp::State::Clean)
+            ) {
+                self.clear_issue(&path);
+            }
+        }
+    }
+
     pub fn snapshot<C: Clock>(&self, root: &Path, queue: &Queue<C>) -> String {
         let paths = self.paths.lock().unwrap();
         let mut errors = self.errors.lock().unwrap();
@@ -242,6 +315,20 @@ impl Desktop {
                 "detail": errors.get(id), "retry_after": retry})
         }).collect();
         serde_json::json!({"version": 1, "mount": root, "paused": self.paused(), "pause_until": self.until.load(Ordering::SeqCst),
-            "queue": rows, "total": pending.len(), "history": *self.events.lock().unwrap(), "issues": *self.issues.lock().unwrap()}).to_string()
+            "can_resolve": self.conflicts.lock().unwrap().is_some(), "resolution": *self.resolution.lock().unwrap(), "selection": crate::selection::read(root).ok(), "transfers": self.transfers.snapshot(), "queue": rows, "total": pending.len(), "history": *self.events.lock().unwrap(), "issues": *self.issues.lock().unwrap()}).to_string()
     }
+}
+
+/// One upload/delta pass; dropped across every return and panic path.
+pub struct Pass<'a>(&'a Desktop);
+impl Drop for Pass<'_> {
+    fn drop(&mut self) {
+        self.0.passes.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Explicit user choices, separate from automatic conflict/retry policy.
+pub trait ConflictControl: Send + Sync {
+    fn inspect(&self, relative: &str) -> std::io::Result<String>;
+    fn start(&self, token: &str, choice: &str) -> std::io::Result<String>;
 }

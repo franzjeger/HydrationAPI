@@ -526,6 +526,7 @@ pub mod ignore {
     /// that never loads a file still ignores `.git`.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct IgnoreSet {
+        all: bool,
         /// Matched against any single path component, at any depth: `node_modules`
         /// matches `a/node_modules/b`. `.git` is always here.
         component: Vec<String>,
@@ -586,7 +587,11 @@ pub mod ignore {
                     component.push(line.to_string());
                 }
             }
-            IgnoreSet { component, prefix }
+            IgnoreSet {
+                component,
+                prefix,
+                all: false,
+            }
         }
 
         /// True iff `rel` (root-relative, no leading `/`) is under an ignore rule:
@@ -594,7 +599,20 @@ pub mod ignore {
         /// under an anchored prefix rule. Byte-exact and case-sensitive — `.git`
         /// and `.GIT` are different directories on a Linux fs, and a
         /// case-insensitive match could silence a user's real `.GIT` data.
+        pub fn with_prefixes(mut self, paths: Vec<String>) -> Self {
+            self.prefix.extend(paths);
+            self
+        }
+        pub fn all() -> Self {
+            Self {
+                all: true,
+                ..Self::default()
+            }
+        }
         pub fn is_ignored(&self, rel: &Path) -> bool {
+            if self.all {
+                return true;
+            }
             for c in rel.components() {
                 if let Component::Normal(os) = c {
                     if os

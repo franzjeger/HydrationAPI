@@ -21,7 +21,9 @@ pub mod place;
 pub mod providers;
 pub mod reclaim;
 pub mod removals;
+pub mod selection;
 pub mod store;
+pub mod transfers;
 pub mod upload;
 pub mod wire;
 
@@ -43,6 +45,9 @@ pub use store::{Entry, Store};
 /// get right on its own. What is left is the part only the client knows: how to
 /// talk to its service.
 pub trait Provider: Send {
+    /// Metadata-only display name for the next fetch. Providers may ignore it.
+    fn set_path(&mut self, _path: &str) {}
+
     /// Write `span` of the object into `out`.
     ///
     /// Streamed rather than returned, because the previous shape — hand back a
@@ -274,6 +279,12 @@ impl<P: Provider> Daemon<P> {
                         // for — never from something the provider has yet to
                         // deliver. `Body` then holds it to that.
                         let mut body = conn.begin(req.id, span.len)?;
+                        let path = self
+                            .store
+                            .lookup(&req.file)
+                            .and_then(|e| crate::lineage::relative(&self.root, &e.path))
+                            .unwrap_or_default();
+                        self.provider.set_path(&path);
                         match self.provider.fetch(
                             &cloud_id,
                             size,

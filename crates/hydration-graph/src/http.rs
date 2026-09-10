@@ -259,6 +259,8 @@ fn auth_failure(e: AuthError) -> io::Error {
 /// request, and a 10 MiB fragment upload would block every delta page behind
 /// it.
 pub struct GraphHttp<T: TokenSource> {
+    monitor: Option<Arc<hydration_client::transfers::Transfers>>,
+    transfer: Option<Arc<hydration_client::transfers::Transfer>>,
     agent: ureq::Agent,
     token: T,
     locations: ContentLocations,
@@ -336,6 +338,14 @@ impl<T: TokenSource> GraphHttp<T> {
         let headers = caller_headers(headers)?;
         let authorized = may_authorize(url, authorize)?;
 
+        let offset = headers
+            .iter()
+            .find(|(name, _)| name == ureq::http::header::CONTENT_RANGE)
+            .and_then(|(_, value)| value.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes "))
+            .and_then(|v| v.split('-').next())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
         let mut builder = ureq::http::Request::builder()
             .method(method.as_str())
             .uri(url);
@@ -355,6 +365,20 @@ impl<T: TokenSource> GraphHttp<T> {
                 .body(())
                 .map_err(bad_request)
                 .and_then(|request| self.agent.run(request).map_err(|e| wire_error(url, e)))
+        } else if method == Method::Put && self.transfer.is_some() {
+            if let Some(t) = &self.transfer {
+                t.position(offset);
+            }
+            let mut reader = hydration_client::transfers::Reader {
+                inner: std::io::Cursor::new(body),
+                monitor: self.monitor.clone(),
+                transfer: self.transfer.clone(),
+            };
+            builder
+                .header(ureq::http::header::CONTENT_LENGTH, body.len())
+                .body(ureq::SendBody::from_reader(&mut reader))
+                .map_err(bad_request)
+                .and_then(|request| self.agent.run(request).map_err(|e| wire_error(url, e)))
         } else {
             builder
                 .body(body)
@@ -363,11 +387,21 @@ impl<T: TokenSource> GraphHttp<T> {
         }
     }
 
+    pub fn with_monitor(
+        mut self,
+        monitor: Option<Arc<hydration_client::transfers::Transfers>>,
+    ) -> Self {
+        self.monitor = monitor;
+        self
+    }
+
     pub fn new(token: T) -> Self {
         Self {
             agent: agent(),
             token,
             locations: ContentLocations::new(),
+            monitor: None,
+            transfer: None,
         }
     }
 }
@@ -811,6 +845,16 @@ impl<T: TokenSource> GraphHttp<T> {
         if span.is_empty() {
             return Ok(());
         }
+        let running = self.monitor.as_ref().map(|m| {
+            m.begin(
+                &m.path(key.to_cloud_id().as_str()),
+                hydration_client::transfers::Direction::Download,
+                span.len,
+                span.offset,
+                total,
+            )
+        });
+        let transfer = running.as_ref().map(|r| Arc::clone(&r.transfer));
         let graph_url = crate::item_content_url(key);
         let whole = span.is_whole(total);
         resume_copy(
@@ -924,7 +968,11 @@ impl<T: TokenSource> GraphHttp<T> {
                     // read again by another route.
                     validate_content_range(range, from, last, total)?;
                 }
-                let mut reader = response.body_mut().as_reader();
+                let mut reader = hydration_client::transfers::Reader {
+                    inner: response.body_mut().as_reader(),
+                    monitor: self.monitor.clone(),
+                    transfer: transfer.clone(),
+                };
                 io::copy(&mut reader, sink)?;
                 Ok(DownloadAttempt::Complete)
             },
@@ -1211,6 +1259,9 @@ impl<T: TokenSource> GraphHttp<T> {
 // ---------------------------------------------------------------------------
 
 impl<T: TokenSource> Transport for GraphHttp<T> {
+    fn set_transfer(&mut self, transfer: Option<Arc<hydration_client::transfers::Transfer>>) {
+        self.transfer = transfer;
+    }
     fn send(&mut self, request: &Request) -> io::Result<Reply> {
         let answer = self.round_trip(
             request.method,
@@ -1244,6 +1295,91 @@ mod tests {
     // Where a real upload session lives: a host this crate never composed.
     const SESSION: &str = "https://up.1drv.com/upload.aspx?token=abc";
     const CLIENT: &str = "11111111-2222-3333-4444-555555555555";
+
+    #[test]
+    fn measured_http_upload_keeps_content_length_and_counts_real_payload_reads() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                headers.push(line);
+            }
+            let length: usize = headers
+                .iter()
+                .find_map(|h| {
+                    h.to_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|s| s.trim().parse().unwrap())
+                })
+                .unwrap();
+            assert_eq!(length, 32768);
+            assert!(!headers
+                .iter()
+                .any(|h| h.to_lowercase().starts_with("transfer-encoding:")));
+            assert!(!headers
+                .iter()
+                .any(|h| h.to_lowercase().starts_with("authorization:")));
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).unwrap();
+            assert!(bytes.iter().all(|b| *b == 42));
+            socket
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .unwrap();
+        });
+        struct NoToken;
+        impl TokenSource for NoToken {
+            fn authorization(&mut self) -> io::Result<String> {
+                panic!("unauthorized body must not ask for a token")
+            }
+        }
+        let monitor = Arc::new(hydration_client::transfers::Transfers::default());
+        let running = monitor.begin(
+            "a.bin",
+            hydration_client::transfers::Direction::Upload,
+            65536,
+            0,
+            65536,
+        );
+        let mut http = GraphHttp::new(NoToken).with_monitor(Some(monitor.clone()));
+        // Only this loopback fixture permits HTTP. Production keeps https_only.
+        http.agent = ureq::Agent::config_builder()
+            .https_only(false)
+            .proxy(None)
+            .build()
+            .into();
+        http.set_transfer(Some(running.transfer.clone()));
+        let reply = http
+            .send(
+                &Request::new(Method::Put, format!("http://{addr}/upload"))
+                    .with_header("content-range", "bytes 32768-65535/65536")
+                    .with_body(vec![42; 32768])
+                    .unauthorized(),
+            )
+            .unwrap();
+        assert_eq!(reply.status, 201);
+        server.join().unwrap();
+        let state = monitor.snapshot();
+        assert_eq!(state["uploaded"], 32768);
+        assert_eq!(state["active"][0]["position"], 65536);
+        assert_eq!(
+            state["active"][0]["confirmed"], 0,
+            "transport success alone cannot confirm an upload"
+        );
+    }
 
     #[test]
     fn a_remembered_location_is_served_until_it_ages_out() {

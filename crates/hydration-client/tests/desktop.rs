@@ -109,3 +109,38 @@ fn empty_queue_does_not_hide_persisted_refusals() {
     let state: Value = serde_json::from_str(&desktop.snapshot(Path::new("/sync"), &queue)).unwrap();
     assert!(state["issues"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn selection_waits_for_current_pass_and_restores_pause() {
+    use std::sync::Arc;
+    let dir = test_scratch::scratch(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+        "selection-quiesce",
+    );
+    hydration_client::selection::write(&dir, &[]).unwrap();
+    let desktop = Arc::new(Desktop::default());
+    let pass = desktop.begin_pass().unwrap();
+    let d = desktop.clone();
+    let root = dir.clone();
+    let worker = std::thread::spawn(move || d.select(&root, &["Docs".into()]));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !desktop.paused() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(desktop.paused());
+    assert!(desktop.begin_pass().is_none());
+    assert!(hydration_client::selection::read(&dir).unwrap().is_empty());
+    drop(pass);
+    worker.join().unwrap().unwrap();
+    assert_eq!(
+        hydration_client::selection::read(&dir).unwrap(),
+        vec!["Docs"]
+    );
+    assert!(!desktop.paused());
+    desktop.pause(7200);
+    desktop.select(&dir, &[]).unwrap();
+    assert!(
+        desktop.paused(),
+        "applying rules must not undo the user's pause"
+    );
+}

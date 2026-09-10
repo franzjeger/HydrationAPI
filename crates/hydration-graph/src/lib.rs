@@ -17,6 +17,7 @@
 // one-line read.
 #![allow(dead_code)]
 
+pub mod auth;
 /// OAuth: the device code flow and the shared token cache.
 ///
 /// The one part of this crate that is *not* flattened into the root. Its names
@@ -32,7 +33,8 @@
 /// `TokenSource`, and [`auth::TokenTransport`] — the refresh POST's socket — is
 /// implemented by `GraphTokens` over the same client configuration as
 /// everything else.
-pub mod auth;
+#[cfg(feature = "http")]
+pub mod conflicts;
 
 #[cfg(feature = "http")]
 mod access;
@@ -2124,6 +2126,7 @@ pub struct GraphDiscover<P: PageSource, S: StateStore, K: Sleeper> {
     /// provider about it again. A failed call is deliberately not remembered —
     /// a laptop that lost its network must retry the request, not be diagnosed
     /// as a wedged framework.
+    force_enumerate: bool,
     last_input: Option<Cursor>,
     served: Option<(Vec<Change>, Cursor)>,
     repeats: u32,
@@ -2151,6 +2154,7 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             pages,
             store,
             sleeper,
+            force_enumerate: false,
             last_input: None,
             served: None,
             repeats: 0,
@@ -2509,7 +2513,7 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         // in place, which is the unrecoverable pair produced without any crash.
         let stored = StoredView::read(&self.scope, self.store.load()?);
 
-        let attempted = match self.attempt(&stored, false) {
+        let attempted = match self.attempt(&stored, self.force_enumerate) {
             Err(Fault::Resync) => self.attempt(&stored, true),
             other => other,
         };
@@ -2550,6 +2554,7 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         // An empty feed is a different thing entirely. Nothing was applied, so
         // the tree on disk is still the tree, and the only thing that moved is
         // the delta link.
+        self.force_enumerate = false;
         let unchanged = !done.enumerated
             && done.applied == 0
             && done.removals.is_empty()
@@ -2623,6 +2628,12 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
 impl<P: PageSource, S: StateStore, K: Sleeper> hydration_client::delta::Discover
     for GraphDiscover<P, S, K>
 {
+    fn refresh(&mut self) {
+        self.force_enumerate = true;
+        self.pending = None;
+        self.last_input = None;
+        self.served = None;
+    }
     fn changes(&mut self, cursor: &Cursor) -> io::Result<(Vec<Change>, Cursor)> {
         if let Some(served) = self.repeat(cursor) {
             // A repeat is the framework saying it could not apply the batch, so
@@ -2871,6 +2882,11 @@ pub struct Reply {
 /// [`PageSource`] for the read half and [`auth::TokenTransport`] for the
 /// credential.
 pub trait Transport: Send {
+    fn set_transfer(
+        &mut self,
+        _transfer: Option<std::sync::Arc<hydration_client::transfers::Transfer>>,
+    ) {
+    }
     fn send(&mut self, request: &Request) -> io::Result<Reply>;
 }
 
@@ -2947,6 +2963,8 @@ impl ConflictBehavior {
 /// The tag comes from the persisted tree — not from a `GET` issued just before
 /// the write, which is a precondition that can never fail.
 pub struct GraphSink<T: Transport, K: Sleeper> {
+    monitor: Option<std::sync::Arc<hydration_client::transfers::Transfers>>,
+    active_transfer: Option<std::sync::Arc<hydration_client::transfers::Transfer>>,
     scope: DriveScope,
     root: std::path::PathBuf,
     tags: TagSource,
@@ -2965,6 +2983,8 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
         sleeper: K,
     ) -> Self {
         Self {
+            monitor: None,
+            active_transfer: None,
             scope,
             root: root.into(),
             tags,
@@ -2973,6 +2993,14 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
             transport,
             sleeper,
         }
+    }
+
+    pub fn with_monitor(
+        mut self,
+        monitor: Option<std::sync::Arc<hydration_client::transfers::Transfers>>,
+    ) -> Self {
+        self.monitor = monitor;
+        self
     }
 
     pub fn with_policy(mut self, policy: UploadPolicy) -> Self {
@@ -4090,6 +4118,9 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
                     } else {
                         stalls = 0;
                     }
+                    if let Some(t) = &self.active_transfer {
+                        t.confirm(next);
+                    }
                     offset = next;
                 }
                 416 => {
@@ -4174,8 +4205,8 @@ enum Transferred {
     Abandoned(io::Error),
 }
 
-impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K> {
-    fn upload(
+impl<T: Transport, K: Sleeper> GraphSink<T, K> {
+    fn upload_inner(
         &mut self,
         path: &std::path::Path,
         existing: Option<hydration_client::upload::Known<'_>>,
@@ -4284,6 +4315,41 @@ impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K
             }
             None => self.put_at_path(&rel, body),
         }
+    }
+}
+
+impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K> {
+    fn upload(
+        &mut self,
+        path: &std::path::Path,
+        existing: Option<hydration_client::upload::Known<'_>>,
+    ) -> io::Result<Uploaded> {
+        let size = std::fs::metadata(path)?.len();
+        let name = path
+            .strip_prefix(&self.root)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        let running = self.monitor.as_ref().map(|m| {
+            m.begin(
+                name,
+                hydration_client::transfers::Direction::Upload,
+                size,
+                0,
+                size,
+            )
+        });
+        self.active_transfer = running.as_ref().map(|r| std::sync::Arc::clone(&r.transfer));
+        self.transport.set_transfer(self.active_transfer.clone());
+        let result = self.upload_inner(path, existing);
+        if result.is_ok() {
+            if let Some(t) = &self.active_transfer {
+                t.confirm(size);
+            }
+        }
+        self.transport.set_transfer(None);
+        self.active_transfer = None;
+        result
     }
 
     fn move_item(

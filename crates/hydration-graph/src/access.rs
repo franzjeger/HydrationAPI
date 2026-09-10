@@ -123,6 +123,8 @@ impl Sleeper for SystemSleeper {
 }
 
 pub struct GraphProvider {
+    monitor: Option<Arc<hydration_client::transfers::Transfers>>,
+    path: String,
     http: GraphHttp<SharedTokenCache>,
     /// Windows of read-ahead on parallel connections; see [`Prefetcher`].
     prefetch: Prefetcher,
@@ -362,6 +364,9 @@ fn quickxor_for_version(
 }
 
 impl Provider for GraphProvider {
+    fn set_path(&mut self, path: &str) {
+        self.path = path.into();
+    }
     fn fetch(
         &mut self,
         cloud_id: &str,
@@ -370,6 +375,9 @@ impl Provider for GraphProvider {
         span: Span,
         out: &mut Body<'_>,
     ) -> io::Result<()> {
+        if let Some(monitor) = &self.monitor {
+            monitor.name(cloud_id, &self.path);
+        }
         let key = CloudId::parse(cloud_id)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid Graph cloud id"))?;
         // QuickXorHash is a hash of the *object*. A range cannot be checked
@@ -464,6 +472,7 @@ impl Provider for GraphProvider {
 }
 
 pub struct GraphAccess {
+    monitor: Option<Arc<hydration_client::transfers::Transfers>>,
     scope: DriveScope,
     root: PathBuf,
     state_dir: PathBuf,
@@ -502,6 +511,7 @@ impl GraphAccess {
         cache: SharedTokenCache,
     ) -> Self {
         Self {
+            monitor: None,
             scope,
             root: root.into(),
             state_dir: state_dir.into(),
@@ -559,6 +569,21 @@ impl GraphAccess {
     }
 }
 impl CloudAccess for GraphAccess {
+    fn conflicts(
+        &self,
+        desktop: Arc<hydration_client::desktop::Desktop>,
+    ) -> Option<Arc<dyn hydration_client::desktop::ConflictControl>> {
+        Some(Arc::new(crate::conflicts::Service::new(
+            self.root.clone(),
+            self.state_dir.clone(),
+            self.scope.clone(),
+            self.cache.clone(),
+            &desktop,
+        )))
+    }
+    fn observe(&mut self, desktop: Arc<hydration_client::desktop::Desktop>) {
+        self.monitor = Some(Arc::clone(&desktop.transfers));
+    }
     type Fetch = GraphProvider;
     type Upload = GraphSink<GraphHttp<SharedTokenCache>, SystemSleeper>;
     type Changes = GraphDiscover<GraphHttp<SharedTokenCache>, FileStateStore, SystemSleeper>;
@@ -568,10 +593,13 @@ impl CloudAccess for GraphAccess {
         // the point — one stream's throughput ceiling is what it exists to
         // multiply — so nothing about a connection may be shared.
         let cache = Arc::clone(&self.cache);
+        let monitor = self.monitor.clone();
         Ok(GraphProvider {
-            http: GraphHttp::new(Arc::clone(&self.cache)),
+            monitor: self.monitor.clone(),
+            path: String::new(),
+            http: GraphHttp::new(Arc::clone(&self.cache)).with_monitor(self.monitor.clone()),
             prefetch: Prefetcher::new(PREFETCH_DEPTH, move || {
-                let mut http = GraphHttp::new(Arc::clone(&cache));
+                let mut http = GraphHttp::new(Arc::clone(&cache)).with_monitor(monitor.clone());
                 move |cloud_id: &str, span: Span, total: u64| {
                     let key = CloudId::parse(cloud_id).map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidInput, "invalid Graph cloud id")
@@ -589,9 +617,10 @@ impl CloudAccess for GraphAccess {
             self.scope.clone(),
             &self.root,
             self.tags_in_force(),
-            GraphHttp::new(Arc::clone(&self.cache)),
+            GraphHttp::new(Arc::clone(&self.cache)).with_monitor(self.monitor.clone()),
             SystemSleeper,
-        ))
+        )
+        .with_monitor(self.monitor.clone()))
     }
     fn discover(&self) -> io::Result<Self::Changes> {
         Ok(GraphDiscover::new(

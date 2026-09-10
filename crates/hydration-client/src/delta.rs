@@ -59,6 +59,8 @@ pub struct Cursor(pub Option<String>);
 
 /// Discovering changes is the client's job, because only it knows the service.
 pub trait Discover: Send {
+    /// Re-enumerate after a local selection change without committing unfinished work.
+    fn refresh(&mut self) {}
     /// Changes since `cursor`, and where to resume.
     ///
     /// May return the whole world when `cursor` is empty — the reconciler is
