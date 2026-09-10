@@ -42,8 +42,13 @@ struct GraphCloud {
 }
 impl Cloud for GraphCloud {
     fn metadata(&self, key: &crate::ObjectKey) -> io::Result<Value> {
-        let reply = GraphHttp::new(self.cache.clone())
-            .send(&Request::new(Method::Get, crate::item_metadata_url(key)))?;
+        let reply = GraphHttp::new(self.cache.clone()).send(&Request::new(
+            Method::Get,
+            format!(
+                "{},lastModifiedDateTime,webUrl",
+                crate::item_metadata_url(key)
+            ),
+        ))?;
         if reply.status != 200 {
             return Err(io::Error::other(format!(
                 "Cloud version is unavailable (HTTP {}); no version was replaced",
