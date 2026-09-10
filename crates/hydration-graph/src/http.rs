@@ -303,9 +303,7 @@ impl ContentLocations {
     /// enough to trust. An expired entry is removed on the way out.
     fn fresh(&mut self, graph_url: &str, now: Instant) -> Option<String> {
         match self.entries.get(graph_url) {
-            Some((location, learned))
-                if now.duration_since(*learned) < CONTENT_LOCATION_TTL =>
-            {
+            Some((location, learned)) if now.duration_since(*learned) < CONTENT_LOCATION_TTL => {
                 Some(location.clone())
             }
             Some(_) => {
@@ -849,8 +847,7 @@ impl<T: TokenSource> GraphHttp<T> {
                 };
                 if remembered.is_some() {
                     let status = response.status().as_u16();
-                    let retryable =
-                        status == 429 || status == 408 || (500..=599).contains(&status);
+                    let retryable = status == 429 || status == 408 || (500..=599).contains(&status);
                     // A throttle is the service speaking and takes the normal
                     // retry road below. Anything else that is not the 206 a
                     // ranged request expects means the pre-authorization went
@@ -878,7 +875,8 @@ impl<T: TokenSource> GraphHttp<T> {
                             )
                         })?;
                     if ranged {
-                        self.locations.learned(&graph_url, &location, Instant::now());
+                        self.locations
+                            .learned(&graph_url, &location, Instant::now());
                     }
                     response = self.send_response(Method::Get, &location, &headers, &[], false)?;
                 }
@@ -1278,7 +1276,10 @@ mod tests {
         locations.forget("a");
         assert_eq!(locations.fresh("a", now), None);
         // Forgetting one object's link must not take another's with it.
-        assert_eq!(locations.fresh("b", now).as_deref(), Some("https://x.example/2"));
+        assert_eq!(
+            locations.fresh("b", now).as_deref(),
+            Some("https://x.example/2")
+        );
     }
 
     #[test]

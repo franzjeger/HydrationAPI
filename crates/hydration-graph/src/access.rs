@@ -630,7 +630,9 @@ mod tests {
         assert_eq!(next_window(Span::new(24, 8), 32), None);
     }
 
-    fn counting_prefetcher(workers: usize) -> (Prefetcher, Arc<Mutex<Vec<(String, Span)>>>) {
+    type FetchCalls = Arc<Mutex<Vec<(String, Span)>>>;
+
+    fn counting_prefetcher(workers: usize) -> (Prefetcher, FetchCalls) {
         let fetched = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&fetched);
         let prefetch = Prefetcher::new(workers, move || {
@@ -681,10 +683,11 @@ mod tests {
         // Ensure it is Done, deterministically, by taking-and-replanting:
         // the ledger is reachable from the test, so plant directly instead.
         let (state, _) = &*prefetch.state;
-        state.lock().unwrap().done.insert(
-            ("obj".to_owned(), 12, 4),
-            Ok(vec![7u8; 4]),
-        );
+        state
+            .lock()
+            .unwrap()
+            .done
+            .insert(("obj".to_owned(), 12, 4), Ok(vec![7u8; 4]));
         assert_eq!(prefetch.take("other", Span::new(0, 4)), None);
         let ledger = state.lock().unwrap();
         assert!(
@@ -719,7 +722,11 @@ mod tests {
         // A window past the ceiling is never hinted at all — the ledger is
         // also the memory bound.
         let prefetch = Prefetcher::new(0, || |_: &str, _: Span, _: u64| Ok(Vec::new()));
-        prefetch.hint("obj", Span::new(0, PREFETCH_CEILING + 1), PREFETCH_CEILING * 2);
+        prefetch.hint(
+            "obj",
+            Span::new(0, PREFETCH_CEILING + 1),
+            PREFETCH_CEILING * 2,
+        );
         let (state, _) = &*prefetch.state;
         assert!(state.lock().unwrap().inflight.is_empty());
     }

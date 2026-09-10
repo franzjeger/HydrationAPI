@@ -606,6 +606,7 @@ impl Watchers {
 ///   nothing is being sent). Keys stay in that order and new keys are only ever
 ///   appended, so a reader must ignore keys it does not recognise. An unchanged
 ///   tuple is never re-sent.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn control(
     socket: &std::path::Path,
@@ -616,6 +617,31 @@ fn control(
     in_flight: Arc<AtomicU64>,
     active_uploads: Arc<Mutex<HashMap<FileId, String>>>,
     watchers: Arc<Watchers>,
+) -> io::Result<()> {
+    control_with_desktop(
+        socket,
+        mount,
+        queue,
+        exposures,
+        excluded,
+        in_flight,
+        active_uploads,
+        watchers,
+        Arc::new(crate::desktop::Desktop::default()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn control_with_desktop(
+    socket: &std::path::Path,
+    mount: PathBuf,
+    queue: Arc<Mutex<Queue<SystemClock>>>,
+    exposures: Arc<Mutex<Vec<String>>>,
+    excluded: Arc<AtomicU64>,
+    in_flight: Arc<AtomicU64>,
+    active_uploads: Arc<Mutex<HashMap<FileId, String>>>,
+    watchers: Arc<Watchers>,
+    desktop: Arc<crate::desktop::Desktop>,
 ) -> io::Result<()> {
     use std::io::{BufRead, BufReader, Write};
 
@@ -690,6 +716,18 @@ fn control(
                         Ok(Err(why)) => format!("error: {why:?}"),
                         Err(e) => format!("error: {e}"),
                     }
+                }
+                "desktop" => desktop.snapshot(&mount, &queue.lock().unwrap()),
+                "pause" => match arg.parse::<u64>() {
+                    Ok(seconds) if seconds <= 86400 => {
+                        desktop.pause(seconds);
+                        "ok".into()
+                    }
+                    _ => "error: pause requires seconds between 0 and 86400".into(),
+                },
+                "retry" => {
+                    queue.lock().unwrap().flush_now();
+                    "ok".into()
                 }
                 "status" => {
                     let pending = queue.lock().unwrap().pending();
@@ -801,6 +839,16 @@ fn plan_and_reclaim(
 /// a cloud is beyond the three traits, which is the whole point: swapping
 /// `FolderCloud` for a real service changes this file not at all.
 pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
+    run_with_history(config, access, None)
+}
+
+/// Run with a bounded persistent desktop outcome history outside the sync root.
+pub fn run_with_history<C: CloudAccess>(
+    config: Config,
+    access: C,
+    history: Option<PathBuf>,
+) -> io::Result<()> {
+    let desktop = Arc::new(crate::desktop::Desktop::load(history));
     // Before the credential, because this one costs nothing and the failure it
     // prevents is the worst one available.
     //
@@ -958,6 +1006,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             std::cmp::max(config.debounce, Duration::from_secs(1)),
             Arc::clone(&active_uploads),
         );
+        let desktop = Arc::clone(&desktop);
         std::thread::spawn(move || {
             // Same reasoning as the delta thread below: a queue that grows and
             // never drains is visible in the status line, but the reason is not,
@@ -1043,6 +1092,10 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 }
             };
             while !stop.load(Ordering::SeqCst) {
+                if desktop.paused() {
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
                 // Close the holes in the change channel by looking, rather than
                 // by trusting that nothing was missed.
                 //
@@ -1127,8 +1180,12 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 let due = q.lock().unwrap().due();
                 if !due.is_empty() {
                     let _ = store.scan(&mount);
+                    desktop.index(&mount, &store, &q.lock().unwrap());
                 }
                 for file in due {
+                    if desktop.paused() {
+                        break;
+                    }
                     q.lock().unwrap().begin(file);
                     // Captured before the send, because afterwards the file may
                     // already be gone — which is precisely the case this is for.
@@ -1177,6 +1234,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                             queue.sent(file);
                         }
                     }
+                    desktop.record(file, sent_path.as_deref(), &outcome);
                     eprintln!("hydration-sync: upload {file:?} -> {outcome:?}");
                 }
 
@@ -1288,6 +1346,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             Arc::clone(&delta_busy),
             Arc::clone(&folder_refresh),
         );
+        let desktop = Arc::clone(&desktop);
         std::thread::spawn(move || {
             // Leaving quietly here is indistinguishable, from outside, from a
             // drive with nothing on it: the status thread keeps printing "0
@@ -1338,6 +1397,10 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // reads any of.
             let mut complained = false;
             while !stop.load(Ordering::SeqCst) {
+                if desktop.paused() {
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
                 // Two questions, and they are not the same one.
                 //
                 // "Is there a mount here at all" is what `is_mount_point`
@@ -1545,8 +1608,9 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             Arc::clone(&watchers),
         );
         eprintln!("hydration-sync: control socket at {}", ctl.display());
+        let desktop = Arc::clone(&desktop);
         std::thread::spawn(move || {
-            if let Err(e) = control(&ctl, mount, q, ex, exc, inf, au, ws) {
+            if let Err(e) = control_with_desktop(&ctl, mount, q, ex, exc, inf, au, ws, desktop) {
                 eprintln!("hydration-sync: control socket unavailable: {e}");
             }
         });

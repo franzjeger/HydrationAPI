@@ -329,6 +329,24 @@ impl<C: Clock> Queue<C> {
         }
     }
 
+    /// A display snapshot of the real queue, with seconds until each attempt.
+    pub fn snapshot(&self) -> Vec<(FileId, bool, u64)> {
+        let now = self.clock.now();
+        let mut rows: Vec<_> = self
+            .waiting
+            .iter()
+            .map(|(id, w)| (*id, false, w.due.saturating_sub(now).as_secs()))
+            .collect();
+        rows.extend(self.in_flight.iter().map(|id| (*id, true, 0)));
+        rows.sort_by_key(|(id, _, _)| (id.fsid, id.ino));
+        rows
+    }
+
+    /// Whether the current queued content has failed. A new edit clears this.
+    pub fn has_failed(&self, file: &FileId) -> bool {
+        self.failures.contains_key(file)
+    }
+
     /// Files whose quiet period has expired.
     pub fn due(&self) -> Vec<FileId> {
         let now = self.clock.now();
