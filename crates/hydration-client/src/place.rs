@@ -368,7 +368,7 @@ impl TmpfilePlacer {
     /// `rel` is relative to the pinned root, and every syscall here names that
     /// descriptor. The scratch name is built from `rel` rather than from the
     /// absolute path for the same reason.
-    fn link_into_place(&self, fd: &OwnedFd, rel: &Path, seq: u64) -> io::Result<()> {
+    fn link_into_place(&self, fd: &OwnedFd, rel: &Path, mut seq: u64) -> io::Result<()> {
         let proc = format!("/proc/self/fd/{}", fd.as_raw_fd());
         match linkat_into(&proc, self.dir.as_fd(), rel) {
             Ok(()) => return Ok(()),
@@ -377,9 +377,20 @@ impl TmpfilePlacer {
         }
         let dir = rel.parent().unwrap_or(Path::new(""));
         let base = rel.file_name().and_then(|n| n.to_str()).unwrap_or("f");
-        let scratch = dir.join(format!(".{base}.hydration-{seq}"));
-        let _ = unlinkat(self.dir.as_fd(), &scratch);
-        linkat_into(&proc, self.dir.as_fd(), &scratch)?;
+        // A crash may have retained local data at a scratch-shaped name.
+        // Reusing that sequence after restart must not unlink the recovery.
+        let scratch = loop {
+            let candidate = dir.join(format!(".{base}.hydration-{seq}"));
+            match linkat_into(&proc, self.dir.as_fd(), &candidate) {
+                Ok(()) => break candidate,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    seq = seq
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("Scratch sequence exhausted"))?;
+                }
+                Err(e) => return Err(e),
+            }
+        };
         // Rename touches no content, so it fires no pre-content event — the
         // placeholder arrives complete or not at all.
         renameat(self.dir.as_fd(), &scratch, rel).inspect_err(|_| {
@@ -873,6 +884,32 @@ mod tests {
         hydration_protocol::stamp::write(&raced).unwrap();
         assert_eq!(TmpfilePlacer::sweep_scratch(&dir).unwrap(), 0);
         assert_eq!(std::fs::read(&raced).unwrap(), b"local data must survive");
+    }
+
+    #[test]
+    fn a_new_placer_never_reuses_a_retained_recovery_name() {
+        let dir = scratch("place-preserves-recovery-name");
+        let original = dir.join("document");
+        std::fs::write(&original, b"old content").unwrap();
+        // Cover both initial sequence conventions, independent of call count.
+        for i in 0..3 {
+            std::fs::write(
+                dir.join(format!(".document.hydration-{i}")),
+                b"saved local edit",
+            )
+            .unwrap();
+        }
+        TmpfilePlacer::new(&dir)
+            .unwrap()
+            .place(&original, 100, "cloud", Some("ct:new"))
+            .unwrap();
+        assert_eq!(original.metadata().unwrap().len(), 100);
+        for i in 0..3 {
+            assert_eq!(
+                std::fs::read(dir.join(format!(".document.hydration-{i}"))).unwrap(),
+                b"saved local edit"
+            );
+        }
     }
 
     #[test]
