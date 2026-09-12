@@ -3611,6 +3611,8 @@ mod tests {
             grace_secs: 0,
             sweep_cap: 1_000_000,
             min_interval_secs: 0,
+            quota_bytes: None,
+            quota_target_bytes: None,
         };
         let sending: HashSet<FileId> = std::iter::once(b_id).collect();
         // available 0 < low 100 -> under pressure; total huge so high = high_abs.

@@ -106,6 +106,11 @@ pub struct EvictionConfig {
     pub sweep_cap: u64,
     /// Minimum seconds between sweeps (used by the driver, not by `plan`).
     pub min_interval_secs: u64,
+    
+    /// Optional hard quota on the sync folder. If the total `reclaimable` size of 
+    /// all files exceeds this value, eviction is triggered regardless of disk free space.
+    pub quota_bytes: Option<u64>,
+    pub quota_target_bytes: Option<u64>,
 }
 
 impl EvictionConfig {
@@ -123,6 +128,8 @@ impl EvictionConfig {
             grace_secs: 4 * 60 * 60,
             sweep_cap: 8 * GIB,
             min_interval_secs: 5 * 60,
+            quota_bytes: None,
+            quota_target_bytes: None,
         }
     }
 
@@ -164,11 +171,18 @@ pub fn plan(
 ) -> Vec<String> {
     let (low, high) = cfg.marks(total);
 
+    let used_space: u64 = candidates.iter().map(|c| c.reclaimable).sum();
+    let disk_pressure = available < low;
+    let quota_pressure = cfg.quota_bytes.is_some_and(|q| used_space > q);
+
     // The common path: no pressure, nothing to do. Also the idempotence guard —
     // a sweep run again at target selects nothing.
-    if available >= low {
+    if !disk_pressure && !quota_pressure {
         return Vec::new();
     }
+
+    let target_available = high;
+    let target_used = cfg.quota_target_bytes.unwrap_or(cfg.quota_bytes.unwrap_or(u64::MAX));
 
     // Oldest-acquired first; a larger reclaimable breaks ties so the target is
     // reached in fewer swaps. Recency orders, size meters.
@@ -181,8 +195,18 @@ pub fn plan(
     let mut selected = Vec::new();
     let mut freed: u64 = 0;
     for c in candidates {
-        // Reached the high mark (with block-accurate sizes, not lagging statvfs).
-        if available.saturating_add(freed) >= high {
+        let disk_ok = available.saturating_add(freed) >= target_available;
+        let quota_ok = used_space.saturating_sub(freed) <= target_used;
+        
+        let reached_target = if quota_pressure && disk_pressure {
+            disk_ok && quota_ok
+        } else if quota_pressure {
+            quota_ok
+        } else {
+            disk_ok
+        };
+        
+        if reached_target {
             break;
         }
         // Min-residency: a just-acquired file is presumed in use. Skip and keep
@@ -244,6 +268,8 @@ mod tests {
             grace_secs: 10,
             sweep_cap: 1000,
             min_interval_secs: 0,
+            quota_bytes: None,
+            quota_target_bytes: None,
         }
     }
 
@@ -379,5 +405,22 @@ mod tests {
             RealClock.now_secs() > 1_700_000_000,
             "not a wall-clock second"
         );
+    }
+
+    #[test]
+    fn plan_driven_by_quota_pressure() {
+        let quota_cfg = EvictionConfig {
+            quota_bytes: Some(300),
+            quota_target_bytes: Some(200),
+            ..cfg()
+        };
+        let cs = vec![
+            cand("a", 100, 1),
+            cand("b", 100, 2),
+            cand("c", 100, 3),
+            cand("d", 100, 4),
+        ];
+        let got = plan(cs, 10000, 10000, &quota_cfg, 1000);
+        assert_eq!(got, vec!["a", "b"]);
     }
 }
