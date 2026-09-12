@@ -1,0 +1,29 @@
+--- crates/hydration-client/src/daemon_loop.rs
++++ crates/hydration-client/src/daemon_loop.rs
+@@ -131,6 +131,7 @@
+     queue: Arc<Mutex<Queue<SystemClock>>>,
+     resync: Arc<AtomicBool>,
+     exposures: Arc<Mutex<Vec<String>>>,
++    desktop: Arc<crate::desktop::Desktop>,
+ }
+ 
+ impl Changes for QueueChanges {
+@@ -153,6 +154,10 @@
+         // those files again.
+         self.resync.store(true, Ordering::SeqCst);
+     }
++
++    fn fetched(&mut self, path: &str) {
++        self.desktop.push_event(path, "downloaded", "File downloaded from cloud");
++    }
+ }
+ 
+ pub struct Config {
+@@ -291,6 +296,7 @@
+                     queue: Arc::clone(&q),
+                     resync: Arc::clone(&resync),
+                     exposures: Arc::clone(&e),
++                    desktop: Arc::clone(&desktop),
+                 }))
+                 .expect("daemon configuration allows change observation");
+ 

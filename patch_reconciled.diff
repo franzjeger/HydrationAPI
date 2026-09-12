@@ -1,0 +1,14 @@
+--- crates/hydration-client/src/desktop.rs
++++ crates/hydration-client/src/desktop.rs
+@@ -213,6 +213,11 @@
+         if issues.len() != len {
+             self.save_issues(&issues);
+         }
++        drop(issues);
++        
++        for (path, status) in &applied.succeeded {
++            self.push_event(path, status, "Namespace update from cloud");
++        }
+     }
+ 
+     pub fn reconcile_availability(&self, root: &Path) {

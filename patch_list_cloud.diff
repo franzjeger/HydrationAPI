@@ -1,0 +1,38 @@
+--- crates/hydration-graph/src/access.rs
++++ crates/hydration-graph/src/access.rs
+@@ -582,6 +582,34 @@
+     fn observe(&mut self, desktop: Arc<hydration_client::desktop::Desktop>) {
+         self.monitor = Some(Arc::clone(&desktop.transfers));
+     }
++    fn list_cloud_folders(&self, path: &str) -> Option<Vec<String>> {
++        let http = crate::http::GraphHttp::new(Arc::clone(&self.cache));
++        let url = if path.is_empty() || path == "/" {
++            format!("{}/root/children?$select=name,folder", crate::drive_base(self.scope.drive()))
++        } else {
++            let clean_path = path.trim_start_matches('/');
++            // Quick url encode space
++            let encoded_path = clean_path.replace(" ", "%20");
++            format!("{}/root:/{}:/children?$select=name,folder", crate::drive_base(self.scope.drive()), encoded_path)
++        };
++        
++        if let Ok(res) = http.request("GET", &url) {
++            if let Ok(resp) = res.call() {
++                if let Ok(json) = resp.into_json::<serde_json::Value>() {
++                    let mut folders = Vec::new();
++                    if let Some(arr) = json["value"].as_array() {
++                        for item in arr {
++                            if item["folder"].is_object() {
++                                if let Some(name) = item["name"].as_str() {
++                                    folders.push(name.to_owned());
++                                }
++                            }
++                        }
++                    }
++                    return Some(folders);
++                }
++            }
++        }
++        None
++    }
+     type Fetch = GraphProvider;
+     type Upload = GraphSink<GraphHttp<SharedTokenCache>, SystemSleeper>;

@@ -1,0 +1,11 @@
+--- lib.rs
++++ lib.rs
+@@ -107,6 +107,8 @@
+     /// Defaulted, because a client that does nothing with it still works — but
+     /// §6.4a is explicit that the framework cannot prevent this and therefore
+     /// owes the user visibility, so a client that leaves it defaulted is
+     /// choosing not to tell them.
+     fn exposed(&mut self, _mounts: &[String]) {}
++    /// A file was successfully fetched from the cloud.
++    fn fetched(&mut self, _path: &str) {}
+ }

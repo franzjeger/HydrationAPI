@@ -753,17 +753,17 @@ fn token_error(e: ureq::Error) -> io::Error {
 // The one request
 // ---------------------------------------------------------------------------
 
-struct Answer {
-    status: u16,
-    retry_after: Option<Duration>,
-    body: Vec<u8>,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) retry_after: Option<Duration>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl<T: TokenSource> GraphHttp<T> {
     /// Send one request and read one reply. Nothing else in this module talks
     /// to the network, and this function retries nothing: retry policy is above
     /// the seam, where a test can drive it without a clock.
-    fn round_trip(
+    pub(crate) fn round_trip(
         &mut self,
         method: Method,
         url: &str,

@@ -1,0 +1,30 @@
+--- crates/hydration-client/src/daemon_loop.rs
++++ crates/hydration-client/src/daemon_loop.rs
+@@ -52,6 +52,9 @@
+     ) -> Option<Arc<dyn crate::desktop::ConflictControl>> {
+         None
+     }
++    fn list_cloud_folders(&self, _path: &str) -> Option<Vec<String>> {
++        None
++    }
+     type Fetch: Provider;
+     type Upload: Sink;
+     type Changes: Discover;
+@@ -699,6 +702,17 @@
+                             Err(e) => format!("error: {e}"),
+                         }
+                     }
++                    "list_cloud" => {
++                        match access.lock().unwrap().list_cloud_folders(arg) {
++                            Some(folders) => {
++                                match serde_json::to_string(&folders) {
++                                    Ok(json) => json,
++                                    Err(e) => format!("error: {e}"),
++                                }
++                            }
++                            None => "error: list_cloud_folders not supported".into(),
++                        }
++                    }
+                     "pin" | "unpin" => {
+                         // The same shape as evict — an untrusted path, confined by
+                         // `reclaim::set_pin` through the same `safe_join` — but it

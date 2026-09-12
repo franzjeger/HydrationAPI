@@ -52,9 +52,6 @@ pub trait CloudAccess: Send + 'static {
     ) -> Option<Arc<dyn crate::desktop::ConflictControl>> {
         None
     }
-    fn list_cloud_folders(&self, _path: &str) -> Option<Vec<String>> {
-        None
-    }
     type Fetch: Provider;
     type Upload: Sink;
     type Changes: Discover;
@@ -643,12 +640,11 @@ fn control(
         active_uploads,
         watchers,
         Arc::new(crate::desktop::Desktop::default()),
-        None::<Arc<Mutex<DummyCloudAccess>>>,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn control_with_desktop<C: CloudAccess>(
+fn control_with_desktop(
     socket: &std::path::Path,
     mount: PathBuf,
     queue: Arc<Mutex<Queue<SystemClock>>>,
@@ -658,7 +654,6 @@ fn control_with_desktop<C: CloudAccess>(
     active_uploads: Arc<Mutex<HashMap<FileId, String>>>,
     watchers: Arc<Watchers>,
     desktop: Arc<crate::desktop::Desktop>,
-    access: Option<Arc<Mutex<C>>>,
 ) -> io::Result<()> {
     use std::io::{BufRead, BufReader, Write};
 
@@ -707,21 +702,6 @@ fn control_with_desktop<C: CloudAccess>(
                             Ok(Ok(r)) => format!("reclaimed {} bytes", r.bytes),
                             Ok(Err(why)) => format!("kept: {why:?}"),
                             Err(e) => format!("error: {e}"),
-                        }
-                    }
-                    "list_cloud" => {
-                        if let Some(acc) = &access {
-                            match acc.lock().unwrap().list_cloud_folders(arg) {
-                                Some(folders) => {
-                                    match serde_json::to_string(&folders) {
-                                        Ok(json) => json,
-                                        Err(e) => format!("error: {e}"),
-                                    }
-                                }
-                                None => "error: list_cloud_folders not supported".into(),
-                            }
-                        } else {
-                            "error: no cloud access".into()
                         }
                     }
                     "pin" | "unpin" => {
@@ -1731,7 +1711,6 @@ pub fn run_with_history<C: CloudAccess>(
     // The user's way in. §8 item 10's trigger, and the status surface item 11
     // asked for.
     {
-        let access_for_ctl = Arc::clone(&access);
         let ctl = config.socket.with_extension("ctl");
         let (mount, q, ex, exc, inf, au, ws) = (
             config.mount.clone(),
@@ -1745,7 +1724,7 @@ pub fn run_with_history<C: CloudAccess>(
         eprintln!("hydration-sync: control socket at {}", ctl.display());
         let desktop = Arc::clone(&desktop);
         std::thread::spawn(move || {
-            if let Err(e) = control_with_desktop(&ctl, mount, q, ex, exc, inf, au, ws, desktop, Some(access_for_ctl)) {
+            if let Err(e) = control_with_desktop(&ctl, mount, q, ex, exc, inf, au, ws, desktop) {
                 eprintln!("hydration-sync: control socket unavailable: {e}");
             }
         });
@@ -4045,12 +4024,5 @@ mod tests {
                 .all(|(p, _)| p.starts_with("Photos/2024/")),
             "the withdrawal reached outside the deleted folder"
         );
-    }
-
-    pub(crate) struct DummyCloudAccess;
-    impl CloudAccess for DummyCloudAccess {
-        type Fetch = TestProvider;
-        type Upload = TestSink;
-        type Changes = TestDiscover;
     }
 }

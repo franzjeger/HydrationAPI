@@ -1,0 +1,19 @@
+--- crates/hydration-client/src/delta.rs
++++ crates/hydration-client/src/delta.rs
+@@ -291,6 +291,8 @@
+     pub updated: usize,
+     pub removed: usize,
+     pub moved: usize,
++    /// Paths that successfully applied, with their action ("created", "updated", "removed", "moved").
++    pub succeeded: Vec<(String, String)>,
+     pub ignored: usize,
+     pub kept_local: Vec<Kept>,
+     pub failed: Vec<Failed>,
+@@ -311,6 +313,7 @@
+             updated: 0,
+             removed: 0,
+             moved: 0,
++            succeeded: Vec::new(),
+             ignored: 0,
+             kept_local: Vec::new(),
+             failed: Vec::new(),

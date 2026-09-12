@@ -1,0 +1,24 @@
+--- crates/hydration-client/src/evict_policy.rs
++++ crates/hydration-client/src/evict_policy.rs
+@@ -391,4 +391,20 @@
+             "not a wall-clock second"
+         );
+     }
++
++    #[test]
++    fn plan_driven_by_quota_pressure() {
++        let quota_cfg = EvictionConfig {
++            quota_bytes: Some(300),
++            quota_target_bytes: Some(200),
++            ..cfg()
++        };
++        let cs = vec![
++            cand("a", 100, 1),
++            cand("b", 100, 2),
++            cand("c", 100, 3),
++            cand("d", 100, 4),
++        ];
++        let got = plan(cs, 10000, 10000, &quota_cfg, 1000);
++        assert_eq!(got, vec!["a", "b"]);
++    }
+ }

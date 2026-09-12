@@ -1,0 +1,60 @@
+--- crates/hydration-client/src/desktop.rs
++++ crates/hydration-client/src/desktop.rs
+@@ -166,14 +166,13 @@
+             errors.remove(&file);
+         }
+         drop(errors);
++        self.push_event(path.unwrap_or(""), status, &detail);
++    }
++
++    pub fn push_event(&self, path: &str, status: &str, detail: &str) {
+         let mut events = self.events.lock().unwrap();
+-        // Repeated retries of the same error update its timestamp, without
+-        // burying the rest of the history under identical messages.
+-        let path = path.unwrap_or("").to_owned();
+-        events.retain(|e| !(e.path == path && e.status == status && e.detail == detail));
++        let path_str = path.to_owned();
++        events.retain(|e| !(e.path == path_str && e.status == status && e.detail == detail));
+         events.insert(
+             0,
+             Event {
+                 time: now(),
+-                path,
++                path: path_str,
+                 status: status.into(),
+-                detail,
++                detail: detail.into(),
+             },
+         );
+         events.truncate(100);
+-        if let Some(path) = &self.history {
++        if let Some(history_path) = &self.history {
+             use std::io::Write;
+             use std::os::unix::fs::OpenOptionsExt;
+             let write = || -> std::io::Result<()> {
+-                let tmp = path.with_extension("tmp");
++                let tmp = history_path.with_extension("tmp");
+                 let mut f = std::fs::OpenOptions::new()
+                     .write(true)
+                     .create(true)
+@@ -192,7 +191,7 @@
+                     .open(&tmp)?;
+                 f.write_all(&serde_json::to_vec(&*events)?)?;
+                 f.sync_all()?;
+-                std::fs::rename(tmp, path)
++                std::fs::rename(tmp, history_path)
+             };
+             if let Err(e) = write() {
+                 eprintln!("hydration-sync: could not save desktop history: {e}");
+@@ -268,6 +267,11 @@
+         if issues.len() != len {
+             self.save_issues(&issues);
+         }
++        drop(issues);
++        
++        for (path, status) in &applied.succeeded {
++            self.push_event(path, status, "Namespace update from cloud");
++        }
+     }
+ 
+     pub fn reconcile_availability(&self, root: &Path) {

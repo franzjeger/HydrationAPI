@@ -1,0 +1,22 @@
+--- crates/hydration-client/src/lib.rs
++++ crates/hydration-client/src/lib.rs
+@@ -107,6 +107,8 @@
+     /// Defaulted, because a client that does nothing with it still works — but
+     /// §6.4a is explicit that the framework cannot prevent this and therefore
+     /// owes the user visibility, so a client that leaves it defaulted is
+     /// choosing not to tell them.
+     fn exposed(&mut self, _mounts: &[String]) {}
++    /// A file was successfully fetched from the cloud.
++    fn fetched(&mut self, _path: &str) {}
+ }
+ 
+@@ -311,6 +313,9 @@
+                                 if let Err(e) = body.finish() {
+                                     eprintln!("hydration: {cloud_id} ended short: {e}");
+                                 }
++                                if let Some(sink) = self.changes.as_mut() {
++                                    sink.fetched(&path);
++                                }
+                             }
+                             Err(e) => {
+                                 let _ = body.abort(libc::EIO, &format!("{e}"));

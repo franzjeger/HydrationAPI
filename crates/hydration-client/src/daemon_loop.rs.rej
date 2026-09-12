@@ -1,0 +1,10 @@
+--- daemon_loop.rs
++++ daemon_loop.rs
+@@ -1747,6 +1767,7 @@
+     // A thread, not an async task, because resolving an interactive conflict
+     // stops the control loop until the user clicks a button.
+     {
++        let access_for_ctl = Arc::clone(&access);
+         let ctl = config.socket.clone();
+         let mount = config.mount.clone();
+         let q = Arc::clone(&queue);

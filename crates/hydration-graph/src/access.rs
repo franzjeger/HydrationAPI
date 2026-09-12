@@ -584,6 +584,35 @@ impl CloudAccess for GraphAccess {
     fn observe(&mut self, desktop: Arc<hydration_client::desktop::Desktop>) {
         self.monitor = Some(Arc::clone(&desktop.transfers));
     }
+    
+    fn list_cloud_folders(&self, path: &str) -> Option<Vec<String>> {
+        let mut http = crate::http::GraphHttp::new(Arc::clone(&self.cache));
+        let url = if path.is_empty() || path == "/" {
+            format!("{}/root/children?$select=name,folder", crate::drive_base(self.scope.drive()))
+        } else {
+            let clean_path = path.trim_start_matches('/');
+            let encoded_path = clean_path.replace(' ', "%20");
+            format!("{}/root:/{}:/children?$select=name,folder", crate::drive_base(self.scope.drive()), encoded_path)
+        };
+        
+        if let Ok(res) = http.round_trip(crate::Method::Get, &url, &[], &[], true) {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&res.body) {
+                let mut folders = Vec::new();
+                if let Some(arr) = json.get("value").and_then(|v| v.as_array()) {
+                    for item in arr {
+                        if item.get("folder").is_some() {
+                            if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                                folders.push(name.to_owned());
+                            }
+                        }
+                    }
+                }
+                return Some(folders);
+            }
+        }
+        None
+    }
+
     type Fetch = GraphProvider;
     type Upload = GraphSink<GraphHttp<SharedTokenCache>, SystemSleeper>;
     type Changes = GraphDiscover<GraphHttp<SharedTokenCache>, FileStateStore, SystemSleeper>;
