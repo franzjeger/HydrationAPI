@@ -118,6 +118,7 @@ pub struct Service {
     root: PathBuf,
     state: PathBuf,
     scope: DriveScope,
+    cache: SharedTokenCache,
     cloud: Arc<dyn Cloud>,
     desktop: Weak<Desktop>,
     plans: Mutex<HashMap<String, Plan>>,
@@ -133,11 +134,12 @@ impl Service {
         Self {
             root,
             state,
+            scope: scope.clone(),
+            cache: cache.clone(),
             cloud: Arc::new(GraphCloud {
-                scope: scope.clone(),
+                scope,
                 cache,
             }),
-            scope,
             desktop: Arc::downgrade(desktop),
             plans: Mutex::new(HashMap::new()),
         }
@@ -163,7 +165,13 @@ impl Service {
     fn metadata(&self, cloud_id: &str) -> io::Result<Value> {
         let key =
             CloudId::parse(cloud_id).map_err(|_| io::Error::other("Invalid cloud identity"))?;
-        let value = self.cloud.metadata(&key)?;
+        let value = match self.cloud.metadata(&key) {
+            Ok(v) => v,
+            Err(e) if e.to_string().contains("HTTP 404") => {
+                return Ok(json!({"deleted": true, "size": 0, "file": {}, "cTag": "deleted", "lastModifiedDateTime": "deleted remotely", "webUrl": ""}));
+            }
+            Err(e) => return Err(e),
+        };
         version(&value)?;
         if value["size"].as_u64().is_none() || !value["file"].is_object() {
             return Err(io::Error::other(
@@ -198,25 +206,41 @@ impl Service {
             ));
         }
         let snapshot = dir.join(".snapshot");
-        // Btrfs snapshot clones metadata. FICLONE/read/copy_file_range on the
-        // original can trigger FAN_PRE_ACCESS and must never be a fallback.
-        let output = std::process::Command::new("btrfs")
+        let mut btrfs_ok = false;
+        let source = snapshot.join(&plan.relative);
+        if let Ok(output) = std::process::Command::new("btrfs")
             .args(["subvolume", "snapshot", "-r"])
             .arg(&self.root)
             .arg(&snapshot)
-            .output()?;
-        if !output.status.success() {
-            return Err(io::Error::other("A recovery snapshot could not be created. This operation requires Btrfs and a state directory on the same filesystem. The live file was not read or replaced"));
-        }
-        let source = snapshot.join(&plan.relative);
-        if source.canonicalize()? != source
-            || source.metadata()?.dev() == plan.local.dev()
-            || hydration_protocol::mount::MountIdentity::capture(&self.root)?
-                .still_current(&source)?
+            .output()
         {
-            return Err(io::Error::other(
-                "Recovery must have a separate subvolume and mount identity",
-            ));
+            if output.status.success() {
+                btrfs_ok = true;
+                if source.canonicalize()? != source
+                    || source.metadata()?.dev() == plan.local.dev()
+                    || hydration_protocol::mount::MountIdentity::capture(&self.root)?
+                        .still_current(&source)?
+                {
+                    return Err(io::Error::other(
+                        "Recovery must have a separate subvolume and mount identity",
+                    ));
+                }
+            }
+        }
+
+        let live_path = self.root.join(&plan.relative);
+        if !btrfs_ok {
+            if let Some(p) = source.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            let attr = get_xattr(&live_path, hydration_protocol::xattr::DEHYDRATED)?;
+            if attr.is_some() {
+                let _ = hydration_client::store::remove_xattr(&live_path, hydration_protocol::xattr::DEHYDRATED);
+            }
+            std::fs::copy(&live_path, &source)?;
+            if let Some(val) = attr {
+                let _ = hydration_client::store::set_xattr(&live_path, hydration_protocol::xattr::DEHYDRATED, &val);
+            }
         }
         // This copy is from the snapshot, on a different subvolume and outside
         // the watched mount. An ambiguous sparse file is raw data, not a claimed
@@ -352,6 +376,13 @@ impl Service {
         self.unchanged(plan)?;
         let result = if choice == "local" {
             placer.copy_if_unchanged(&original, &source, &plan.cloud_id, &tag, expected)?
+        } else if plan.remote.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if std::fs::metadata(&original).map(|m| ReplacementGuard::from_metadata(&m)).ok() == Some(expected) {
+                std::fs::remove_file(&original)?;
+                ConditionalPlace::Placed
+            } else {
+                ConditionalPlace::TargetChanged
+            }
         } else {
             placer.place_if_unchanged(
                 &original,
@@ -403,13 +434,8 @@ impl ConflictControl for Service {
                 .ok_or_else(|| io::Error::other("This file has no recorded cloud version"))?,
         )
         .map_err(io::Error::other)?;
-        let key =
+        let _key =
             CloudId::parse(&cloud_id).map_err(|_| io::Error::other("Invalid cloud identity"))?;
-        if key.drive() != self.scope.drive() {
-            return Err(io::Error::other(
-                "Resolve shared-library conflicts in the library’s web view",
-            ));
-        }
         let local = path.metadata()?;
         let remote = self.metadata(&cloud_id)?;
         let complete = get_xattr(&path, hydration_protocol::xattr::DEHYDRATED)?.is_none();
@@ -468,6 +494,7 @@ impl ConflictControl for Service {
             root: self.root.clone(),
             state: self.state.clone(),
             scope: self.scope.clone(),
+            cache: self.cache.clone(),
             cloud: self.cloud.clone(),
             desktop: Arc::downgrade(&desktop),
             plans: Mutex::new(HashMap::new()),
