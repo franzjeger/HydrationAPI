@@ -131,6 +131,7 @@ struct QueueChanges {
     queue: Arc<Mutex<Queue<SystemClock>>>,
     resync: Arc<AtomicBool>,
     exposures: Arc<Mutex<Vec<String>>>,
+    desktop: Arc<crate::desktop::Desktop>,
 }
 
 impl Changes for QueueChanges {
@@ -152,6 +153,10 @@ impl Changes for QueueChanges {
         // recovery: the dropped events are gone, and nothing else will mention
         // those files again.
         self.resync.store(true, Ordering::SeqCst);
+    }
+
+    fn fetched(&mut self, path: &str) {
+        self.desktop.push_event(path, "downloaded", "File downloaded from cloud");
     }
 }
 
@@ -1911,6 +1916,7 @@ pub fn run_with_history<C: CloudAccess>(
                     queue: Arc::clone(&queue),
                     resync: Arc::clone(&resync),
                     exposures: Arc::clone(&exposures),
+                    desktop: Arc::clone(&desktop),
                 }));
                 // Bump the shared counter, so this connection's fetches show up
                 // in the same "downloading" number the status thread broadcasts.

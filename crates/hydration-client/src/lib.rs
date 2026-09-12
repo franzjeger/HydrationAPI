@@ -186,6 +186,7 @@ pub trait Changes: Send {
     /// owes the user visibility, so a client that leaves it defaulted is
     /// choosing not to tell them.
     fn exposed(&mut self, _mounts: &[String]) {}
+    fn fetched(&mut self, _path: &str) {}
 }
 
 impl<P: Provider> Daemon<P> {
@@ -296,6 +297,7 @@ impl<P: Provider> Daemon<P> {
                                 // A short delivery becomes an abort here rather
                                 // than a truncated file; `finish` sends it and
                                 // reports the error.
+                                if let Some(sink) = self.changes.as_mut() { sink.fetched(&path); }
                                 if let Err(e) = body.finish() {
                                     eprintln!("hydration: {cloud_id} ended short: {e}");
                                 }
