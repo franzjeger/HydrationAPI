@@ -1121,3 +1121,133 @@ fn an_ignored_folder_remove_never_removes_the_dir() {
     assert_eq!(applied.removed, 0);
     assert_eq!(applied.ignored, 1);
 }
+
+#[test]
+fn a_rename_edit_conflict_is_kept_local() {
+    let dir = scratch("rename-edit-conflict");
+    let mut m = Recorder::default();
+    let mut q = Queue::new(Duration::from_secs(900), TestClock::default());
+    run(&dir, &[upserted("old-name.bin", 64, "cloud-6")], &q, &mut m);
+
+    std::fs::rename(dir.join("old-name.bin"), dir.join("new-name.bin")).unwrap();
+    q.touch(file_id(&dir.join("new-name.bin")));
+
+    let out = run(
+        &dir,
+        &[upserted("old-name.bin", 128, "cloud-6")],
+        &q,
+        &mut m,
+    );
+
+    assert_eq!(
+        out.kept_local,
+        vec![Kept::new("old-name.bin", Why::EditWaiting)],
+        "{out:?}"
+    );
+    assert_eq!(out.updated, 0);
+    assert_eq!(out.moved, 0);
+}
+
+#[test]
+fn an_edit_rename_conflict_is_kept_local() {
+    let dir = scratch("edit-rename-conflict");
+    let mut m = Recorder::default();
+    let mut q = Queue::new(Duration::from_secs(900), TestClock::default());
+    run(&dir, &[upserted("old-name.bin", 64, "cloud-7")], &q, &mut m);
+
+    // Edit locally
+    let p = dir.join("old-name.bin");
+    std::fs::write(&p, b"my edit").unwrap();
+    q.touch(file_id(&p));
+
+    let out = run(
+        &dir,
+        &[upserted("new-name.bin", 64, "cloud-7")], // Cloud renamed it
+        &q,
+        &mut m,
+    );
+
+    assert_eq!(
+        out.kept_local,
+        vec![Kept::new("new-name.bin", Why::EditWaiting)],
+        "{out:?}"
+    );
+    assert_eq!(out.updated, 0);
+    assert_eq!(out.moved, 0);
+    assert!(p.exists()); // Still exists at old path
+}
+
+#[test]
+fn a_delete_edit_conflict_resurrects_the_edited_file() {
+    let dir = scratch("delete-edit-conflict");
+    let mut m = Recorder::default();
+    let mut q = Queue::new(Duration::from_secs(900), TestClock::default());
+    run(&dir, &[upserted("file.bin", 64, "cloud-8")], &q, &mut m);
+
+    // Delete locally
+    std::fs::remove_file(dir.join("file.bin")).unwrap();
+    // It's queued (though Queue tracks inodes, but we can't queue a deleted inode directly, 
+    // fanotify queues the parent directory for deletions. We simulate by just having it deleted)
+
+    let out = run(
+        &dir,
+        &[upserted("file.bin", 128, "cloud-8")], // Cloud edited it
+        &q,
+        &mut m,
+    );
+
+    assert_eq!(out.created, 1);
+    assert!(dir.join("file.bin").exists());
+}
+
+#[test]
+fn a_rename_rename_conflict_is_kept_local() {
+    let dir = scratch("rename-rename-conflict");
+    let mut m = Recorder::default();
+    let mut q = Queue::new(Duration::from_secs(900), TestClock::default());
+    run(&dir, &[upserted("old-name.bin", 64, "cloud-9")], &q, &mut m);
+
+    // Rename locally to local-name.bin
+    std::fs::rename(dir.join("old-name.bin"), dir.join("local-name.bin")).unwrap();
+    q.touch(file_id(&dir.join("local-name.bin")));
+
+    let out = run(
+        &dir,
+        &[upserted("cloud-name.bin", 64, "cloud-9")], // Cloud renamed it to cloud-name.bin
+        &q,
+        &mut m,
+    );
+
+    assert_eq!(
+        out.kept_local,
+        vec![Kept::new("cloud-name.bin", Why::EditWaiting)],
+        "{out:?}"
+    );
+    assert_eq!(out.updated, 0);
+    assert_eq!(out.moved, 0);
+    assert!(dir.join("local-name.bin").exists());
+}
+
+#[test]
+fn a_restart_during_delta_apply_converges_safely() {
+    let dir = scratch("restart-delta-apply");
+    let mut m = Recorder::default();
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
+
+    let batch = vec![
+        upserted("file1.txt", 10, "cloud-r1"),
+        upserted("file2.txt", 20, "cloud-r2"),
+    ];
+
+    let out1 = run(&dir, &batch, &q, &mut m);
+    assert_eq!(out1.created, 2);
+
+    // Process restarts. Cursor was not advanced, so we get the exact same delta again.
+    let mut m2 = Recorder::default();
+    let out2 = run(&dir, &batch, &q, &mut m2);
+    
+    // It should safely ignore the identical batch
+    assert_eq!(out2.created, 0);
+    assert_eq!(out2.updated, 0);
+    assert_eq!(out2.failed.len(), 0);
+}

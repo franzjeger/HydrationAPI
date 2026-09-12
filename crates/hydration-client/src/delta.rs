@@ -615,6 +615,15 @@ pub fn apply_remembering<M: Materialise>(
                 // cannot end with two claimants.
                 if let Some(existing) = by_cloud_id.get(cloud_id) {
                     if existing.path != abs && existing.path.exists() {
+                        let id = file_id(&std::fs::metadata(&existing.path).unwrap());
+                        if waiting.contains(&id) || matches!(
+                            hydration_protocol::stamp::state(&existing.path),
+                            Ok(hydration_protocol::stamp::State::Dirty)
+                        ) {
+                            out.kept_local.push(Kept::new(path, Why::EditWaiting));
+                            continue;
+                        }
+
                         if abs.exists() {
                             // Something else is already at the destination —
                             // two objects swapping paths, most likely. Placing
