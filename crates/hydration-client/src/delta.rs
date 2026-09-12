@@ -514,7 +514,8 @@ pub fn apply_remembering<M: Materialise>(
                             out.retryable = true;
                             continue;
                         }
-                        out.moved += 1; out.succeeded.push((path.to_owned(), "moved".into()));
+                        out.moved += 1;
+                        out.succeeded.push((path.to_owned(), "moved".into()));
                     }
                 }
                 match std::fs::metadata(&abs) {
@@ -532,7 +533,8 @@ pub fn apply_remembering<M: Materialise>(
                             out.retryable = true;
                             continue;
                         }
-                        out.created += 1; out.succeeded.push((path.to_owned(), "created".into()));
+                        out.created += 1;
+                        out.succeeded.push((path.to_owned(), "created".into()));
                     }
                     Err(e) => {
                         out.failed
@@ -617,10 +619,12 @@ pub fn apply_remembering<M: Materialise>(
                 if let Some(existing) = by_cloud_id.get(cloud_id) {
                     if existing.path != abs && existing.path.exists() {
                         let id = file_id(&std::fs::metadata(&existing.path).unwrap());
-                        if waiting.contains(&id) || matches!(
-                            hydration_protocol::stamp::state(&existing.path),
-                            Ok(hydration_protocol::stamp::State::Dirty)
-                        ) {
+                        if waiting.contains(&id)
+                            || matches!(
+                                hydration_protocol::stamp::state(&existing.path),
+                                Ok(hydration_protocol::stamp::State::Dirty)
+                            )
+                        {
                             out.kept_local.push(Kept::new(path, Why::EditWaiting));
                             continue;
                         }
@@ -650,7 +654,8 @@ pub fn apply_remembering<M: Materialise>(
                             out.retryable = true;
                             continue;
                         }
-                        out.moved += 1; out.succeeded.push((path.to_owned(), "moved".into()));
+                        out.moved += 1;
+                        out.succeeded.push((path.to_owned(), "moved".into()));
                         // The index has to follow, or the next change naming
                         // this object looks it up at a path that no longer
                         // exists and creates a second file for it.
@@ -664,7 +669,10 @@ pub fn apply_remembering<M: Materialise>(
                 match std::fs::metadata(&abs) {
                     // Nothing there: this is the ordinary case, a new object.
                     Err(_) => match mat.place(&abs, *size, cloud_id, etag.as_deref()) {
-                        Ok(()) => { out.created += 1; out.succeeded.push((path.to_owned(), "created".into())); },
+                        Ok(()) => {
+                            out.created += 1;
+                            out.succeeded.push((path.to_owned(), "created".into()));
+                        }
                         Err(e) => out
                             .failed
                             .push(Failed::new(path, Failure::Place(e.to_string()))),
@@ -759,7 +767,10 @@ pub fn apply_remembering<M: Materialise>(
                             continue;
                         }
                         match mat.place(&abs, *size, cloud_id, etag.as_deref()) {
-                            Ok(()) => { out.updated += 1; out.succeeded.push((path.to_owned(), "updated".into())); },
+                            Ok(()) => {
+                                out.updated += 1;
+                                out.succeeded.push((path.to_owned(), "updated".into()));
+                            }
                             Err(e) => out
                                 .failed
                                 .push(Failed::new(path, Failure::Place(e.to_string()))),
@@ -816,7 +827,11 @@ pub fn apply_remembering<M: Materialise>(
                     continue;
                 }
                 match mat.remove(&entry.path) {
-                    Ok(()) => { out.removed += 1; out.succeeded.push((entry.path.display().to_string(), "removed".into())); },
+                    Ok(()) => {
+                        out.removed += 1;
+                        out.succeeded
+                            .push((entry.path.display().to_string(), "removed".into()));
+                    }
                     Err(e) => out.failed.push(Failed::new(
                         &entry.path.display().to_string(),
                         Failure::Remove(e.to_string()),
@@ -856,7 +871,8 @@ pub fn apply_remembering<M: Materialise>(
                 }
                 match std::fs::remove_dir(existing) {
                     Ok(()) => {
-                        out.removed += 1; out.succeeded.push((path.to_owned(), "removed".into()));
+                        out.removed += 1;
+                        out.succeeded.push((path.to_owned(), "removed".into()));
                         folders.remove(cloud_id);
                     }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {

@@ -106,8 +106,8 @@ pub struct EvictionConfig {
     pub sweep_cap: u64,
     /// Minimum seconds between sweeps (used by the driver, not by `plan`).
     pub min_interval_secs: u64,
-    
-    /// Optional hard quota on the sync folder. If the total `reclaimable` size of 
+
+    /// Optional hard quota on the sync folder. If the total `reclaimable` size of
     /// all files exceeds this value, eviction is triggered regardless of disk free space.
     pub quota_bytes: Option<u64>,
     pub quota_target_bytes: Option<u64>,
@@ -182,7 +182,9 @@ pub fn plan(
     }
 
     let target_available = high;
-    let target_used = cfg.quota_target_bytes.unwrap_or(cfg.quota_bytes.unwrap_or(u64::MAX));
+    let target_used = cfg
+        .quota_target_bytes
+        .unwrap_or(cfg.quota_bytes.unwrap_or(u64::MAX));
 
     // Oldest-acquired first; a larger reclaimable breaks ties so the target is
     // reached in fewer swaps. Recency orders, size meters.
@@ -197,7 +199,7 @@ pub fn plan(
     for c in candidates {
         let disk_ok = available.saturating_add(freed) >= target_available;
         let quota_ok = used_space.saturating_sub(freed) <= target_used;
-        
+
         let reached_target = if quota_pressure && disk_pressure {
             disk_ok && quota_ok
         } else if quota_pressure {
@@ -205,7 +207,7 @@ pub fn plan(
         } else {
             disk_ok
         };
-        
+
         if reached_target {
             break;
         }

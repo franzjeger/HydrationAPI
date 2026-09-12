@@ -584,17 +584,24 @@ impl CloudAccess for GraphAccess {
     fn observe(&mut self, desktop: Arc<hydration_client::desktop::Desktop>) {
         self.monitor = Some(Arc::clone(&desktop.transfers));
     }
-    
+
     fn list_cloud_folders(&self, path: &str) -> Option<Vec<String>> {
         let mut http = crate::http::GraphHttp::new(Arc::clone(&self.cache));
         let url = if path.is_empty() || path == "/" {
-            format!("{}/root/children?$select=name,folder", crate::drive_base(self.scope.drive()))
+            format!(
+                "{}/root/children?$select=name,folder",
+                crate::drive_base(self.scope.drive())
+            )
         } else {
             let clean_path = path.trim_start_matches('/');
             let encoded_path = clean_path.replace(' ', "%20");
-            format!("{}/root:/{}:/children?$select=name,folder", crate::drive_base(self.scope.drive()), encoded_path)
+            format!(
+                "{}/root:/{}:/children?$select=name,folder",
+                crate::drive_base(self.scope.drive()),
+                encoded_path
+            )
         };
-        
+
         if let Ok(res) = http.round_trip(crate::Method::Get, &url, &[], &[], true) {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&res.body) {
                 let mut folders = Vec::new();

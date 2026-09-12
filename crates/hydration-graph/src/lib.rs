@@ -2014,6 +2014,7 @@ enum Fault {
 /// Everything here has already survived the two questions that decide whether
 /// persisted state may be believed at all: does the tree parse, and does it
 /// describe *this* drive.
+#[derive(Clone)]
 struct StoredView {
     items: Vec<Item>,
     tags: Option<TagSource>,
@@ -2145,6 +2146,7 @@ pub struct GraphDiscover<P: PageSource, S: StateStore, K: Sleeper> {
     /// applied.
     rounds: u64,
     escalation: Option<Escalation>,
+    cached_stored: Option<StoredView>,
 }
 
 impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
@@ -2161,6 +2163,7 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             pending: None,
             rounds: 0,
             escalation: None,
+            cached_stored: None,
         }
     }
 
@@ -2231,8 +2234,20 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         };
         if let Some(tree) = &pending.tree {
             self.store.save_tree(tree)?;
+            if let Some(cached) = &mut self.cached_stored {
+                if let Ok(decoded) = tree.decode() {
+                    cached.items = decoded.items.into_iter().map(Item::from).collect();
+                    cached.tags = Some(decoded.tags);
+                    cached.mounts = decoded.mounts.iter().filter_map(StoredMount::parse).collect();
+                    cached.generation = decoded.generation;
+                }
+            }
         }
-        self.store.save_token(&pending.token)
+        self.store.save_token(&pending.token)?;
+        if let Some(cached) = &mut self.cached_stored {
+            cached.tokens = pending.token;
+        }
+        Ok(())
     }
 
     fn fail(&mut self, fault: Fault) -> io::Error {
@@ -2511,7 +2526,13 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         // `hydration-sync.rs` builds one provider per role at startup — and
         // writes its stale tree back over their state with the newer token still
         // in place, which is the unrecoverable pair produced without any crash.
-        let stored = StoredView::read(&self.scope, self.store.load()?);
+        let stored = if let Some(ref cached) = self.cached_stored {
+            cached.clone()
+        } else {
+            let s = StoredView::read(&self.scope, self.store.load()?);
+            self.cached_stored = Some(s.clone());
+            s
+        };
 
         let attempted = match self.attempt(&stored, self.force_enumerate) {
             Err(Fault::Resync) => self.attempt(&stored, true),

@@ -136,10 +136,7 @@ impl Service {
             state,
             scope: scope.clone(),
             cache: cache.clone(),
-            cloud: Arc::new(GraphCloud {
-                scope,
-                cache,
-            }),
+            cloud: Arc::new(GraphCloud { scope, cache }),
             desktop: Arc::downgrade(desktop),
             plans: Mutex::new(HashMap::new()),
         }
@@ -168,7 +165,9 @@ impl Service {
         let value = match self.cloud.metadata(&key) {
             Ok(v) => v,
             Err(e) if e.to_string().contains("HTTP 404") => {
-                return Ok(json!({"deleted": true, "size": 0, "file": {}, "cTag": "deleted", "lastModifiedDateTime": "deleted remotely", "webUrl": ""}));
+                return Ok(
+                    json!({"deleted": true, "size": 0, "file": {}, "cTag": "deleted", "lastModifiedDateTime": "deleted remotely", "webUrl": ""}),
+                );
             }
             Err(e) => return Err(e),
         };
@@ -235,11 +234,18 @@ impl Service {
             }
             let attr = get_xattr(&live_path, hydration_protocol::xattr::DEHYDRATED)?;
             if attr.is_some() {
-                let _ = hydration_client::store::remove_xattr(&live_path, hydration_protocol::xattr::DEHYDRATED);
+                let _ = hydration_client::store::remove_xattr(
+                    &live_path,
+                    hydration_protocol::xattr::DEHYDRATED,
+                );
             }
             std::fs::copy(&live_path, &source)?;
             if let Some(val) = attr {
-                let _ = hydration_client::store::set_xattr(&live_path, hydration_protocol::xattr::DEHYDRATED, &val);
+                let _ = hydration_client::store::set_xattr(
+                    &live_path,
+                    hydration_protocol::xattr::DEHYDRATED,
+                    &val,
+                );
             }
         }
         // This copy is from the snapshot, on a different subvolume and outside
@@ -376,8 +382,17 @@ impl Service {
         self.unchanged(plan)?;
         let result = if choice == "local" {
             placer.copy_if_unchanged(&original, &source, &plan.cloud_id, &tag, expected)?
-        } else if plan.remote.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false) {
-            if std::fs::metadata(&original).map(|m| ReplacementGuard::from_metadata(&m)).ok() == Some(expected) {
+        } else if plan
+            .remote
+            .get("deleted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            if std::fs::metadata(&original)
+                .map(|m| ReplacementGuard::from_metadata(&m))
+                .ok()
+                == Some(expected)
+            {
                 std::fs::remove_file(&original)?;
                 ConditionalPlace::Placed
             } else {

@@ -1186,7 +1186,7 @@ fn a_delete_edit_conflict_resurrects_the_edited_file() {
 
     // Delete locally
     std::fs::remove_file(dir.join("file.bin")).unwrap();
-    // It's queued (though Queue tracks inodes, but we can't queue a deleted inode directly, 
+    // It's queued (though Queue tracks inodes, but we can't queue a deleted inode directly,
     // fanotify queues the parent directory for deletions. We simulate by just having it deleted)
 
     let out = run(
@@ -1245,7 +1245,7 @@ fn a_restart_during_delta_apply_converges_safely() {
     // Process restarts. Cursor was not advanced, so we get the exact same delta again.
     let mut m2 = Recorder::default();
     let out2 = run(&dir, &batch, &q, &mut m2);
-    
+
     // It should safely ignore the identical batch
     assert_eq!(out2.created, 0);
     assert_eq!(out2.updated, 0);

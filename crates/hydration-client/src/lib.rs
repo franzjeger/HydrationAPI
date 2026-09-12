@@ -297,7 +297,9 @@ impl<P: Provider> Daemon<P> {
                                 // A short delivery becomes an abort here rather
                                 // than a truncated file; `finish` sends it and
                                 // reports the error.
-                                if let Some(sink) = self.changes.as_mut() { sink.fetched(&path); }
+                                if let Some(sink) = self.changes.as_mut() {
+                                    sink.fetched(&path);
+                                }
                                 if let Err(e) = body.finish() {
                                     eprintln!("hydration: {cloud_id} ended short: {e}");
                                 }

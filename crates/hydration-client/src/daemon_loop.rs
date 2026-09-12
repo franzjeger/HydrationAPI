@@ -159,7 +159,8 @@ impl Changes for QueueChanges {
     }
 
     fn fetched(&mut self, path: &str) {
-        self.desktop.push_event(path, "downloaded", "File downloaded from cloud");
+        self.desktop
+            .push_event(path, "downloaded", "File downloaded from cloud");
     }
 }
 
@@ -712,12 +713,10 @@ fn control_with_desktop<C: CloudAccess>(
                     "list_cloud" => {
                         if let Some(acc) = &access {
                             match acc.lock().unwrap().list_cloud_folders(arg) {
-                                Some(folders) => {
-                                    match serde_json::to_string(&folders) {
-                                        Ok(json) => json,
-                                        Err(e) => format!("error: {e}"),
-                                    }
-                                }
+                                Some(folders) => match serde_json::to_string(&folders) {
+                                    Ok(json) => json,
+                                    Err(e) => format!("error: {e}"),
+                                },
                                 None => "error: list_cloud_folders not supported".into(),
                             }
                         } else {
@@ -1161,7 +1160,7 @@ pub fn run_with_history<C: CloudAccess>(
             };
             while !stop.load(Ordering::SeqCst) {
                 let Some(_pass) = desktop.begin_pass() else {
-                    std::thread::sleep(Duration::from_millis(200));
+                    std::thread::sleep(Duration::from_millis(1500));
                     continue;
                 };
                 let current = crate::selection::read(&mount).ok();
@@ -1415,7 +1414,7 @@ pub fn run_with_history<C: CloudAccess>(
                         next_folder_retry = std::time::Instant::now() + folder_retry;
                     }
                 }
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(1500));
             }
         });
     }
@@ -1491,7 +1490,7 @@ pub fn run_with_history<C: CloudAccess>(
             let mut resolution_generation = desktop.refresh.load(Ordering::SeqCst);
             while !stop.load(Ordering::SeqCst) {
                 let Some(_pass) = desktop.begin_pass() else {
-                    std::thread::sleep(Duration::from_millis(200));
+                    std::thread::sleep(Duration::from_millis(1500));
                     continue;
                 };
                 // Two questions, and they are not the same one.
@@ -1745,7 +1744,18 @@ pub fn run_with_history<C: CloudAccess>(
         eprintln!("hydration-sync: control socket at {}", ctl.display());
         let desktop = Arc::clone(&desktop);
         std::thread::spawn(move || {
-            if let Err(e) = control_with_desktop(&ctl, mount, q, ex, exc, inf, au, ws, desktop, Some(access_for_ctl)) {
+            if let Err(e) = control_with_desktop(
+                &ctl,
+                mount,
+                q,
+                ex,
+                exc,
+                inf,
+                au,
+                ws,
+                desktop,
+                Some(access_for_ctl),
+            ) {
                 eprintln!("hydration-sync: control socket unavailable: {e}");
             }
         });
