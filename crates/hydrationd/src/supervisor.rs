@@ -116,10 +116,7 @@ impl Drop for SharedMapping {
         // SAFETY: `self.ptr` was returned by `libc::mmap` with `size_of::<Shared>()`
         // and `Arc` guarantees no in-process references remain when `drop` runs.
         unsafe {
-            libc::munmap(
-                self.ptr as *mut libc::c_void,
-                std::mem::size_of::<Shared>(),
-            );
+            libc::munmap(self.ptr as *mut libc::c_void, std::mem::size_of::<Shared>());
         }
     }
 }

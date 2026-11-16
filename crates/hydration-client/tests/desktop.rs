@@ -162,7 +162,11 @@ fn large_reconciled_batch_persists_tail_hundred_in_single_pass_and_async_events_
                 .push((format!("Folder/file_{i}.txt"), "created".into()));
         }
         desktop.reconciled(&[], &applied);
-        desktop.push_event_async("Folder/live.txt", "downloaded", "File downloaded from cloud");
+        desktop.push_event_async(
+            "Folder/live.txt",
+            "downloaded",
+            "File downloaded from cloud",
+        );
     }
     let reloaded = Desktop::load(Some(file));
     let queue = Queue::new(Duration::from_secs(10), TestClock::default());

@@ -253,7 +253,13 @@ impl Desktop {
         self.push_event(path.unwrap_or(""), status, &detail);
     }
 
-    fn insert_event_in_memory(events: &mut Vec<Event>, ts: u64, path: &str, status: &str, detail: &str) {
+    fn insert_event_in_memory(
+        events: &mut Vec<Event>,
+        ts: u64,
+        path: &str,
+        status: &str,
+        detail: &str,
+    ) {
         events.retain(|e| !(e.path == path && e.status == status && e.detail == detail));
         events.insert(
             0,

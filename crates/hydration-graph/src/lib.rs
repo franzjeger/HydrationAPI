@@ -2119,8 +2119,12 @@ impl StoredView {
             Some(t) if t.generation <= tree.generation => t.clone(),
             _ => TokenBlob::new(),
         };
-        let items: std::sync::Arc<[Item]> =
-            tree.items.into_iter().map(Item::from).collect::<Vec<_>>().into();
+        let items: std::sync::Arc<[Item]> = tree
+            .items
+            .into_iter()
+            .map(Item::from)
+            .collect::<Vec<_>>()
+            .into();
         let namespace = Namespace::restore(items.iter().cloned());
         let listing = namespace.listing();
         let mounts: Vec<MountPoint> = tree.mounts.iter().filter_map(StoredMount::parse).collect();

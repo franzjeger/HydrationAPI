@@ -802,15 +802,14 @@ fn control_with_desktop(
                         // the status thread has written `.hydration-manifest`, instead
                         // of walking 165,000+ inodes synchronously on every CLI query.
                         let cached = excluded.load(Ordering::Acquire) as usize;
-                        let count = if cached > 0
-                            || mount.join(crate::manifest::MANIFEST_NAME).is_file()
-                        {
-                            cached
-                        } else {
-                            let m = Manifest::build(&mount).unwrap_or_default();
-                            excluded.store(m.len() as u64, Ordering::Release);
-                            m.len()
-                        };
+                        let count =
+                            if cached > 0 || mount.join(crate::manifest::MANIFEST_NAME).is_file() {
+                                cached
+                            } else {
+                                let m = Manifest::build(&mount).unwrap_or_default();
+                                excluded.store(m.len() as u64, Ordering::Release);
+                                m.len()
+                            };
                         let seen = exposures.lock().unwrap();
                         format!(
                             "{pending} unsent\n{}\n{}",
@@ -3844,7 +3843,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(freed > 0, "quota-exceeded sweep must reclaim resident blocks");
+        assert!(
+            freed > 0,
+            "quota-exceeded sweep must reclaim resident blocks"
+        );
         assert!(
             crate::store::get_xattr(&p, hydration_protocol::xattr::DEHYDRATED)
                 .unwrap()
