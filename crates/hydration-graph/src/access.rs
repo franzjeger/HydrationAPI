@@ -593,8 +593,8 @@ impl CloudAccess for GraphAccess {
                 crate::drive_base(self.scope.drive())
             )
         } else {
-            let clean_path = path.trim_start_matches('/');
-            let encoded_path = clean_path.replace(' ', "%20");
+            let clean_path = path.trim_matches('/');
+            let encoded_path = crate::encode_path(clean_path);
             format!(
                 "{}/root:/{}:/children?$select=name,folder",
                 crate::drive_base(self.scope.drive()),

@@ -75,12 +75,12 @@ fn main() -> std::io::Result<()> {
     writeln!(conn, "{}", words.join(" "))?;
     conn.flush()?;
 
-    // One command, one reply — but a reply may be several lines, and the daemon
-    // keeps the connection open for more, so read until it goes quiet rather
-    // than until EOF. `watch` is the exception in both halves: silence is its
-    // normal state and every future line is the point, so it has no timeout
-    // and reads until the daemon itself goes away.
+    // Close our write side for one-shot commands so the daemon's `reader.lines()`
+    // loop sees immediate EOF after answering and closes the reply stream instead
+    // of parking both processes on the 10-second idle read timeout. `watch` is the
+    // exception: keeping the socket open in both directions is the subscription.
     if words[0] != "watch" {
+        conn.shutdown(std::net::Shutdown::Write)?;
         conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     }
     let reader = BufReader::new(conn);

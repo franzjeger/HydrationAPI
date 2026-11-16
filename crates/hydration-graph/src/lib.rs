@@ -3176,7 +3176,7 @@ fn item_metadata_url(key: &ObjectKey) -> String {
 /// does: a `#` in a file name would otherwise cut the URL short and address the
 /// *parent*, and a `%` or a `?` would turn the rest of the name into an escape
 /// or a query — each of which lands a create on an object the user never named.
-fn encode_path(rel: &str) -> String {
+pub(crate) fn encode_path(rel: &str) -> String {
     let mut out = String::with_capacity(rel.len());
     for b in rel.bytes() {
         match b {
