@@ -35,7 +35,7 @@
 
 use hydration_protocol::Span;
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1165,7 +1165,8 @@ fn safe_download_url(url: &str) -> bool {
     !authority.is_empty() && !authority.contains('@')
 }
 
-fn copy_exact(mut source: impl Read, out: &mut dyn Write, expected: u64) -> io::Result<()> {
+#[cfg(test)]
+fn copy_exact(mut source: impl io::Read, out: &mut dyn Write, expected: u64) -> io::Result<()> {
     let copied = io::copy(&mut source, out)?;
     if copied != expected {
         return Err(io::Error::new(

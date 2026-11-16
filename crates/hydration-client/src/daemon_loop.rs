@@ -622,6 +622,8 @@ impl Watchers {
 ///   nothing is being sent). Keys stay in that order and new keys are only ever
 ///   appended, so a reader must ignore keys it does not recognise. An unchanged
 ///   tuple is never re-sent.
+type CloudFolderLister = dyn Fn(&str) -> Option<Vec<String>> + Send + Sync;
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn control(
@@ -644,12 +646,12 @@ fn control(
         active_uploads,
         watchers,
         Arc::new(crate::desktop::Desktop::default()),
-        None::<Arc<Mutex<DummyCloudAccess>>>,
+        None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn control_with_desktop<C: CloudAccess>(
+fn control_with_desktop(
     socket: &std::path::Path,
     mount: PathBuf,
     queue: Arc<Mutex<Queue<SystemClock>>>,
@@ -659,7 +661,7 @@ fn control_with_desktop<C: CloudAccess>(
     active_uploads: Arc<Mutex<HashMap<FileId, String>>>,
     watchers: Arc<Watchers>,
     desktop: Arc<crate::desktop::Desktop>,
-    access: Option<Arc<Mutex<C>>>,
+    list_cloud: Option<Box<CloudFolderLister>>,
 ) -> io::Result<()> {
     use std::io::{BufRead, BufReader, Write};
 
@@ -711,8 +713,8 @@ fn control_with_desktop<C: CloudAccess>(
                         }
                     }
                     "list_cloud" => {
-                        if let Some(acc) = &access {
-                            match acc.lock().unwrap().list_cloud_folders(arg) {
+                        if let Some(lister) = &list_cloud {
+                            match lister(arg) {
                                 Some(folders) => match serde_json::to_string(&folders) {
                                     Ok(json) => json,
                                     Err(e) => format!("error: {e}"),
@@ -1743,6 +1745,8 @@ pub fn run_with_history<C: CloudAccess>(
         );
         eprintln!("hydration-sync: control socket at {}", ctl.display());
         let desktop = Arc::clone(&desktop);
+        let list_cloud: Box<CloudFolderLister> =
+            Box::new(move |arg: &str| access_for_ctl.lock().unwrap().list_cloud_folders(arg));
         std::thread::spawn(move || {
             if let Err(e) = control_with_desktop(
                 &ctl,
@@ -1754,7 +1758,7 @@ pub fn run_with_history<C: CloudAccess>(
                 au,
                 ws,
                 desktop,
-                Some(access_for_ctl),
+                Some(list_cloud),
             ) {
                 eprintln!("hydration-sync: control socket unavailable: {e}");
             }
@@ -4055,12 +4059,5 @@ mod tests {
                 .all(|(p, _)| p.starts_with("Photos/2024/")),
             "the withdrawal reached outside the deleted folder"
         );
-    }
-
-    pub(crate) struct DummyCloudAccess;
-    impl CloudAccess for DummyCloudAccess {
-        type Fetch = TestProvider;
-        type Upload = TestSink;
-        type Changes = TestDiscover;
     }
 }

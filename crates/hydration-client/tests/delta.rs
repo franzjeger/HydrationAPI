@@ -1181,7 +1181,7 @@ fn an_edit_rename_conflict_is_kept_local() {
 fn a_delete_edit_conflict_resurrects_the_edited_file() {
     let dir = scratch("delete-edit-conflict");
     let mut m = Recorder::default();
-    let mut q = Queue::new(Duration::from_secs(900), TestClock::default());
+    let q = Queue::new(Duration::from_secs(900), TestClock::default());
     run(&dir, &[upserted("file.bin", 64, "cloud-8")], &q, &mut m);
 
     // Delete locally

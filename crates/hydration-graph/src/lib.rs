@@ -10,13 +10,6 @@
 //! crate root, so the internal `src/` split stays free to change without
 //! touching a single import in the tests.
 
-// The wire model is decoded in full and read selectively — `eTag`, `mimeType`,
-// `childCount`, `driveType` and the timestamps are all deserialised so that a
-// future reader has them, and none of them is consulted today. Dropping the
-// fields instead would make adding one a wire-format change rather than a
-// one-line read.
-#![allow(dead_code)]
-
 pub mod auth;
 /// OAuth: the device code flow and the shared token cache.
 ///
@@ -256,6 +249,11 @@ impl DriveScope {
 // `remoteItem` is what makes an inner tombstone delete the near placeholder.
 // ---------------------------------------------------------------------------
 
+// The wire model is decoded in full and read selectively — `eTag`, `mimeType`,
+// `childCount`, `driveType` and the timestamps are all deserialised so that a
+// future reader has them, and none of them is consulted today. Keep `dead_code`
+// scoped strictly to wire structs so dead logic elsewhere still fails lints.
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DriveItem {
@@ -287,6 +285,7 @@ pub struct DriveItem {
 }
 
 /// The half of a `driveItem` that a `remoteItem` may also carry.
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ItemBody {
@@ -305,6 +304,7 @@ struct ItemBody {
     shared: Option<SharedFacet>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FileFacet {
@@ -320,12 +320,14 @@ struct Hashes {
     sha1_hash: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FolderFacet {
     child_count: Option<u64>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct PackageFacet {
@@ -338,6 +340,7 @@ struct PackageFacet {
 #[serde(rename_all = "camelCase")]
 struct RootFacet {}
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct MalwareFacet {
@@ -347,30 +350,35 @@ struct MalwareFacet {
 /// `state` is optional on purpose: Graph sends bare `"deleted":{}` as well as
 /// `{"state":"deleted"}` and `{"state":"softDeleted"}`, and a non-optional
 /// field here fails to deserialise the first and takes the whole page with it.
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DeletedFacet {
     state: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct PendingOperations {
     pending_content_update: Option<PendingContentUpdate>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct PendingContentUpdate {
     queued_date_time: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SharedFacet {
     scope: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FileSystemInfo {
@@ -378,6 +386,7 @@ struct FileSystemInfo {
     last_modified_date_time: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ItemReference {
@@ -811,11 +820,16 @@ impl<W> QuickXorWriter<W> {
         }
     }
 
-    pub(crate) fn verify(mut self, expected: &str) -> io::Result<()> {
+    fn finish(mut self) -> String {
         for (slot, byte) in self.digest[12..].iter_mut().zip(self.length.to_le_bytes()) {
             *slot ^= byte;
         }
-        if base64_20(&self.digest) == expected {
+        base64_20(&self.digest)
+    }
+
+    #[cfg(feature = "http")]
+    pub(crate) fn verify(self, expected: &str) -> io::Result<()> {
+        if self.finish() == expected {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -861,10 +875,7 @@ pub fn quickxor_of(bytes: &[u8]) -> String {
     if w.write_all(bytes).is_err() {
         return String::new();
     }
-    for (slot, byte) in w.digest[12..].iter_mut().zip(w.length.to_le_bytes()) {
-        *slot ^= byte;
-    }
-    base64_20(&w.digest)
+    w.finish()
 }
 
 pub(crate) fn base64_20(bytes: &[u8; 20]) -> String {
