@@ -265,3 +265,29 @@ fn the_frameworks_own_files_are_not_indexed_as_user_content() {
         "the framework's own files were indexed as user content: {indexed:?}"
     );
 }
+
+#[test]
+fn write_if_changed_skips_redundant_disk_rewrites_unless_content_or_file_changes() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = scratch("manifest-dedup");
+    placeholder(&dir, "a.bin", 64, "cloud-a");
+    let m1 = Manifest::build(&dir).unwrap();
+    let mut sig = None;
+
+    assert!(m1.write_if_changed(&dir, &mut sig).unwrap());
+    let ino1 = std::fs::metadata(dir.join(MANIFEST_NAME)).unwrap().ino();
+
+    // Unchanged manifest must not create a new inode / rewrite disk.
+    assert!(!m1.write_if_changed(&dir, &mut sig).unwrap());
+    let ino2 = std::fs::metadata(dir.join(MANIFEST_NAME)).unwrap().ino();
+    assert_eq!(ino1, ino2);
+
+    // If the file is deleted, write_if_changed recreates it even with same sig.
+    std::fs::remove_file(dir.join(MANIFEST_NAME)).unwrap();
+    assert!(m1.write_if_changed(&dir, &mut sig).unwrap());
+
+    // Changing placeholder set writes a fresh manifest.
+    placeholder(&dir, "b.bin", 128, "cloud-b");
+    let m2 = Manifest::build(&dir).unwrap();
+    assert!(m2.write_if_changed(&dir, &mut sig).unwrap());
+}

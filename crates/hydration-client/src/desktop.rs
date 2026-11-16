@@ -31,6 +31,11 @@ pub struct Issue {
 }
 
 #[derive(Default)]
+struct AsyncHistoryFlusher {
+    notify: (Mutex<(bool, bool)>, std::sync::Condvar),
+}
+
+#[derive(Default)]
 pub struct Desktop {
     pub transfers: Arc<crate::transfers::Transfers>,
     until: AtomicU64,
@@ -41,9 +46,45 @@ pub struct Desktop {
     pub conflicts: Mutex<Option<Arc<dyn ConflictControl>>>,
     paths: Mutex<HashMap<FileId, String>>,
     errors: Mutex<HashMap<FileId, String>>,
-    events: Mutex<Vec<Event>>,
+    events: Arc<Mutex<Vec<Event>>>,
     issues: Mutex<Vec<Issue>>,
     history: Option<PathBuf>,
+    flusher: Option<Arc<AsyncHistoryFlusher>>,
+}
+
+impl Drop for Desktop {
+    fn drop(&mut self) {
+        if let Some(flusher) = &self.flusher {
+            let (lock, cvar) = &flusher.notify;
+            let mut state = lock.lock().unwrap();
+            let was_dirty = state.0;
+            state.0 = false;
+            state.1 = true;
+            cvar.notify_all();
+            drop(state);
+            if was_dirty {
+                if let Some(history_path) = &self.history {
+                    let events = self.events.lock().unwrap();
+                    let _ = write_events_atomic(history_path, &events);
+                }
+            }
+        }
+    }
+}
+
+fn write_events_atomic(history_path: &Path, events: &[Event]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = history_path.with_extension("tmp");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(&serde_json::to_vec(events)?)?;
+    f.sync_all()?;
+    std::fs::rename(tmp, history_path)
 }
 
 impl Desktop {
@@ -60,12 +101,55 @@ impl Desktop {
             .filter(|bytes| bytes.len() <= 512 * 1024)
             .and_then(|bytes| serde_json::from_slice::<Vec<Issue>>(&bytes).ok())
             .unwrap_or_default();
-        Self {
-            events: Mutex::new(events.into_iter().take(100).collect()),
-            issues: Mutex::new(issues.into_iter().take(100).collect()),
-            history,
-            ..Self::default()
-        }
+        let events = Arc::new(Mutex::new(
+            events.into_iter().take(100).collect::<Vec<Event>>(),
+        ));
+        let flusher = history.as_ref().map(|history_path| {
+            let flusher = Arc::new(AsyncHistoryFlusher::default());
+            let flusher_bg = Arc::clone(&flusher);
+            let events_bg = Arc::clone(&events);
+            let path_bg = history_path.clone();
+            std::thread::spawn(move || {
+                let (lock, cvar) = &flusher_bg.notify;
+                loop {
+                    let mut state = lock.lock().unwrap();
+                    while !state.0 && !state.1 {
+                        state = cvar.wait(state).unwrap();
+                    }
+                    if state.1 && !state.0 {
+                        break;
+                    }
+                    drop(state);
+                    // Coalesce bursts of on-demand hydrations into a single
+                    // atomic fsync+rename instead of blocking `Daemon::serve`.
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    let mut state = lock.lock().unwrap();
+                    let stop = state.1;
+                    if !state.0 {
+                        if stop {
+                            break;
+                        }
+                        continue;
+                    }
+                    state.0 = false;
+                    drop(state);
+                    let snapshot = events_bg.lock().unwrap().clone();
+                    if let Err(e) = write_events_atomic(&path_bg, &snapshot) {
+                        eprintln!("hydration-sync: could not save desktop history: {e}");
+                    }
+                    if stop {
+                        break;
+                    }
+                }
+            });
+            flusher
+        });
+        let mut out = Self::default();
+        out.events = events;
+        out.issues = Mutex::new(issues.into_iter().take(100).collect());
+        out.history = history;
+        out.flusher = flusher;
+        out
     }
 
     /// Pause new background passes. Work already executing finishes normally;
@@ -169,38 +253,43 @@ impl Desktop {
         self.push_event(path.unwrap_or(""), status, &detail);
     }
 
-    pub fn push_event(&self, path: &str, status: &str, detail: &str) {
-        let mut events = self.events.lock().unwrap();
-        let path_str = path.to_owned();
-        events.retain(|e| !(e.path == path_str && e.status == status && e.detail == detail));
+    fn insert_event_in_memory(events: &mut Vec<Event>, ts: u64, path: &str, status: &str, detail: &str) {
+        events.retain(|e| !(e.path == path && e.status == status && e.detail == detail));
         events.insert(
             0,
             Event {
-                time: now(),
-                path: path_str,
+                time: ts,
+                path: path.to_owned(),
                 status: status.into(),
                 detail: detail.into(),
             },
         );
         events.truncate(100);
+    }
+
+    pub fn push_event(&self, path: &str, status: &str, detail: &str) {
+        let mut events = self.events.lock().unwrap();
+        Self::insert_event_in_memory(&mut events, now(), path, status, detail);
         if let Some(history_path) = &self.history {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let write = || -> std::io::Result<()> {
-                let tmp = history_path.with_extension("tmp");
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&tmp)?;
-                f.write_all(&serde_json::to_vec(&*events)?)?;
-                f.sync_all()?;
-                std::fs::rename(tmp, history_path)
-            };
-            if let Err(e) = write() {
+            if let Err(e) = write_events_atomic(history_path, &events) {
                 eprintln!("hydration-sync: could not save desktop history: {e}");
             }
+        }
+    }
+
+    /// Record an event in memory immediately and schedule persistence on the
+    /// background flusher so latency-sensitive paths (`Daemon::serve`) never
+    /// block on `fsync()`.
+    pub fn push_event_async(&self, path: &str, status: &str, detail: &str) {
+        {
+            let mut events = self.events.lock().unwrap();
+            Self::insert_event_in_memory(&mut events, now(), path, status, detail);
+        }
+        if let Some(flusher) = &self.flusher {
+            let (lock, cvar) = &flusher.notify;
+            let mut state = lock.lock().unwrap();
+            state.0 = true;
+            cvar.notify_one();
         }
     }
 
@@ -264,8 +353,27 @@ impl Desktop {
         }
         drop(issues);
 
-        for (path, status) in &applied.succeeded {
-            self.push_event(path, status, "Namespace update from cloud");
+        if !applied.succeeded.is_empty() {
+            // Only the last 100 entries can survive `events.truncate(100)`, and
+            // persisting once per delta pass eliminates 165,000+ per-file `fsync()`
+            // storms on initial sync while keeping the history identical.
+            let tail_start = applied.succeeded.len().saturating_sub(100);
+            let ts = now();
+            let mut events = self.events.lock().unwrap();
+            for (path, status) in &applied.succeeded[tail_start..] {
+                Self::insert_event_in_memory(
+                    &mut events,
+                    ts,
+                    path,
+                    status,
+                    "Namespace update from cloud",
+                );
+            }
+            if let Some(history_path) = &self.history {
+                if let Err(e) = write_events_atomic(history_path, &events) {
+                    eprintln!("hydration-sync: could not save desktop history: {e}");
+                }
+            }
         }
     }
 

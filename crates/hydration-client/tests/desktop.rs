@@ -144,3 +144,32 @@ fn selection_waits_for_current_pass_and_restores_pause() {
         "applying rules must not undo the user's pause"
     );
 }
+
+#[test]
+fn large_reconciled_batch_persists_tail_hundred_in_single_pass_and_async_events_flush_on_drop() {
+    let dir = test_scratch::scratch(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+        "desktop-batch-flush",
+    );
+    let file = dir.join("history.json");
+    let _ = std::fs::remove_file(&file);
+    {
+        let desktop = Desktop::load(Some(file.clone()));
+        let mut applied = hydration_client::delta::Applied::default();
+        for i in 0..5_000 {
+            applied
+                .succeeded
+                .push((format!("Folder/file_{i}.txt"), "created".into()));
+        }
+        desktop.reconciled(&[], &applied);
+        desktop.push_event_async("Folder/live.txt", "downloaded", "File downloaded from cloud");
+    }
+    let reloaded = Desktop::load(Some(file));
+    let queue = Queue::new(Duration::from_secs(10), TestClock::default());
+    let state: Value =
+        serde_json::from_str(&reloaded.snapshot(Path::new("/sync"), &queue)).unwrap();
+    let history = state["history"].as_array().unwrap();
+    assert_eq!(history.len(), 100);
+    assert_eq!(history[0]["path"], "Folder/live.txt");
+    assert_eq!(history[1]["path"], "Folder/file_4999.txt");
+}

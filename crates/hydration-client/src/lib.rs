@@ -294,14 +294,20 @@ impl<P: Provider> Daemon<P> {
                             &mut body,
                         ) {
                             Ok(()) => {
-                                // A short delivery becomes an abort here rather
-                                // than a truncated file; `finish` sends it and
-                                // reports the error.
-                                if let Some(sink) = self.changes.as_mut() {
-                                    sink.fetched(&path);
-                                }
-                                if let Err(e) = body.finish() {
-                                    eprintln!("hydration: {cloud_id} ended short: {e}");
+                                // Finish the protocol frame *before* notifying
+                                // `changes`: `body.finish()` delivers `Done` to
+                                // `hydrationd` so the user's blocked `read()`
+                                // wakes immediately, and a short delivery aborts
+                                // instead of falsely recording a completed download.
+                                match body.finish() {
+                                    Ok(()) => {
+                                        if let Some(sink) = self.changes.as_mut() {
+                                            sink.fetched(&path);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("hydration: {cloud_id} ended short: {e}");
+                                    }
                                 }
                             }
                             Err(e) => {

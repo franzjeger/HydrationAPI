@@ -160,7 +160,7 @@ impl Changes for QueueChanges {
 
     fn fetched(&mut self, path: &str) {
         self.desktop
-            .push_event(path, "downloaded", "File downloaded from cloud");
+            .push_event_async(path, "downloaded", "File downloaded from cloud");
     }
 }
 
@@ -707,7 +707,10 @@ fn control_with_desktop(
                         let mut store = Store::new();
                         let _ = store.scan(&mount);
                         match reclaim::reclaim(&mount, arg, &mut store, &waiting, &sending) {
-                            Ok(Ok(r)) => format!("reclaimed {} bytes", r.bytes),
+                            Ok(Ok(r)) => {
+                                excluded.fetch_add(1, Ordering::AcqRel);
+                                format!("reclaimed {} bytes", r.bytes)
+                            }
                             Ok(Err(why)) => format!("kept: {why:?}"),
                             Err(e) => format!("error: {e}"),
                         }
@@ -795,15 +798,23 @@ fn control_with_desktop(
                     }
                     "status" => {
                         let pending = queue.lock().unwrap().pending();
-                        let m = Manifest::build(&mount).unwrap_or_default();
-                        // A fresh count was just paid for; publishing it costs
-                        // nothing and spares watchers up to a whole status-thread
-                        // period of staleness after an eviction.
-                        excluded.store(m.len() as u64, Ordering::SeqCst);
+                        // Serve the already-maintained excluded count in O(1) once
+                        // the status thread has written `.hydration-manifest`, instead
+                        // of walking 165,000+ inodes synchronously on every CLI query.
+                        let cached = excluded.load(Ordering::Acquire) as usize;
+                        let count = if cached > 0
+                            || mount.join(crate::manifest::MANIFEST_NAME).is_file()
+                        {
+                            cached
+                        } else {
+                            let m = Manifest::build(&mount).unwrap_or_default();
+                            excluded.store(m.len() as u64, Ordering::Release);
+                            m.len()
+                        };
                         let seen = exposures.lock().unwrap();
                         format!(
                             "{pending} unsent\n{}\n{}",
-                            crate::manifest::status_line(BackupPolicy::Exclude, m.len()),
+                            crate::manifest::status_line(BackupPolicy::Exclude, count),
                             if seen.is_empty() {
                                 "no other mount exposes these files".to_string()
                             } else {
@@ -1933,10 +1944,11 @@ pub fn run_with_history<C: CloudAccess>(
             // machine getting warm.
             const TICKS_PER_MANIFEST: u32 = 300;
             let mut tick = 0;
+            let mut last_manifest_sig: Option<(usize, u64)> = None;
             while !stop.load(Ordering::SeqCst) {
                 if tick == 0 {
                     if let Ok(m) = Manifest::build(&mount) {
-                        let _ = m.write(&mount);
+                        let _ = m.write_if_changed(&mount, &mut last_manifest_sig);
                         // The count `watch` hands out, from the walk that was
                         // happening regardless.
                         excluded.store(m.len() as u64, Ordering::SeqCst);
