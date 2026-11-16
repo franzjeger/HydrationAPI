@@ -511,6 +511,8 @@ pub fn is_pinned(path: &Path) -> io::Result<bool> {
 pub fn get_xattr(path: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
     let p = CString::new(path.as_os_str().as_bytes())?;
     let n = CString::new(name)?;
+    // SAFETY: `p` and `n` are valid NUL-terminated C strings; passing a null
+    // buffer with size 0 queries the attribute length without writing memory.
     let len = unsafe { libc::getxattr(p.as_ptr(), n.as_ptr(), std::ptr::null_mut(), 0) };
     if len < 0 {
         let e = io::Error::last_os_error();
@@ -522,6 +524,7 @@ pub fn get_xattr(path: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
         };
     }
     let mut buf = vec![0u8; len as usize];
+    // SAFETY: `p` and `n` are valid C strings and `buf` has `buf.len()` writable bytes.
     let got = unsafe {
         libc::getxattr(
             p.as_ptr(),
@@ -537,9 +540,67 @@ pub fn get_xattr(path: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(buf))
 }
 
+/// Read an extended attribute directly from an open file descriptor so callers
+/// can verify inode state (`DEHYDRATED`, `XATTR_ID`, `XATTR_ETAG`) without a
+/// path-resolution TOCTOU window.
+pub fn fget_xattr(file: &std::fs::File, name: &str) -> io::Result<Option<Vec<u8>>> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    let n = CString::new(name)?;
+    // SAFETY: `fd` is an open file descriptor borrowed for the duration of the
+    // call, `n` is a valid C string, and `(null, 0)` only queries length.
+    let len = unsafe { libc::fgetxattr(fd, n.as_ptr(), std::ptr::null_mut(), 0) };
+    if len < 0 {
+        let e = io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(None),
+            _ => Err(e),
+        };
+    }
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: `fd` is open, `n` is NUL-terminated, and `buf` owns `buf.len()` writable bytes.
+    let got = unsafe {
+        libc::fgetxattr(
+            fd,
+            n.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if got < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(got as usize);
+    Ok(Some(buf))
+}
+
+/// Open a complete local file without following symlinks and verify on the
+/// opened file descriptor — before any `read()` syscall can fire `FAN_PRE_ACCESS`
+/// — that the inode is a regular file and does *not* carry `user.hydration.dehydrated`.
+pub fn open_complete_local_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target is not a regular file",
+        ));
+    }
+    if fget_xattr(&file, XATTR_DEHYDRATED)?.is_some() {
+        return Err(io::Error::other(
+            "refusing to read a live placeholder without a Btrfs subvolume snapshot",
+        ));
+    }
+    Ok(file)
+}
+
 pub fn set_xattr(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
     let p = CString::new(path.as_os_str().as_bytes())?;
     let n = CString::new(name)?;
+    // SAFETY: `p` and `n` are valid C strings and `value` points to `value.len()` readable bytes.
     let rc = unsafe {
         libc::setxattr(
             p.as_ptr(),
@@ -558,6 +619,7 @@ pub fn set_xattr(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
 pub fn remove_xattr(path: &Path, name: &str) -> io::Result<()> {
     let p = CString::new(path.as_os_str().as_bytes())?;
     let n = CString::new(name)?;
+    // SAFETY: `p` and `n` are valid NUL-terminated C strings.
     let rc = unsafe { libc::removexattr(p.as_ptr(), n.as_ptr()) };
     if rc < 0 {
         let e = io::Error::last_os_error();

@@ -227,24 +227,37 @@ impl Service {
 
         let live_path = self.root.join(&plan.relative);
         if !btrfs_ok {
+            // Never strip `DEHYDRATED` or read a live placeholder through the
+            // monitored mount: reading an unmarked sparse placeholder stamps a
+            // permanent kernel `FAN_MARK_IGNORE_SURV` mark on the inode, turning
+            // unhydrated holes into silent zero bytes. Only verified complete
+            // local files may be copied directly via an `O_NOFOLLOW` descriptor.
+            if !plan.complete {
+                return Err(io::Error::other(
+                    "A recovery snapshot could not be created. Backing up an online-only placeholder requires Btrfs on the same filesystem; the live placeholder was not read or modified",
+                ));
+            }
+            let mut live = hydration_client::store::open_complete_local_file(&live_path)?;
+            if ReplacementGuard::from_metadata(&live.metadata()?)
+                != ReplacementGuard::from_metadata(&plan.local)
+                || hydration_client::store::fget_xattr(&live, XATTR_ID)?.as_deref()
+                    != Some(plan.cloud_id.as_bytes())
+                || hydration_client::store::fget_xattr(&live, XATTR_ETAG)? != plan.local_tag
+            {
+                return Err(io::Error::other(
+                    "The local file changed after review. Review both versions again",
+                ));
+            }
             if let Some(p) = source.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            let attr = get_xattr(&live_path, hydration_protocol::xattr::DEHYDRATED)?;
-            if attr.is_some() {
-                let _ = hydration_client::store::remove_xattr(
-                    &live_path,
-                    hydration_protocol::xattr::DEHYDRATED,
-                );
-            }
-            std::fs::copy(&live_path, &source)?;
-            if let Some(val) = attr {
-                let _ = hydration_client::store::set_xattr(
-                    &live_path,
-                    hydration_protocol::xattr::DEHYDRATED,
-                    &val,
-                );
-            }
+            let mut dst = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&source)?;
+            io::copy(&mut live, &mut dst)?;
+            dst.sync_all()?;
         }
         // This copy is from the snapshot, on a different subvolume and outside
         // the watched mount. An ambiguous sparse file is raw data, not a claimed
@@ -386,7 +399,7 @@ impl Service {
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
         {
-            if std::fs::metadata(&original)
+            if std::fs::symlink_metadata(&original)
                 .map(|m| ReplacementGuard::from_metadata(&m))
                 .ok()
                 == Some(expected)
@@ -820,12 +833,48 @@ mod tests {
     #[test]
     fn failed_snapshot_never_falls_back_to_reading_live_data() {
         let f = Fixture::new();
+        set_xattr(&f.file(), hydration_protocol::xattr::DEHYDRATED, b"1").unwrap();
         let plan = f.plan();
+        assert!(!plan.complete);
         let mut recovery = None;
         assert!(f.service.backup(&plan, &mut recovery).is_err());
         assert!(recovery.unwrap().exists());
+        assert!(get_xattr(&f.file(), hydration_protocol::xattr::DEHYDRATED)
+            .unwrap()
+            .is_some());
         assert_eq!(std::fs::read(f.file()).unwrap(), b"local version");
         assert!(f.cloud.uploads.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn non_btrfs_backup_copies_complete_local_file_and_refuses_late_dehydration() {
+        let f = Fixture::new();
+        let plan = f.plan();
+        assert!(plan.complete);
+        let mut recovery = None;
+        let dir = f.service.backup(&plan, &mut recovery).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("local.raw")).unwrap(),
+            b"local version"
+        );
+        assert!(get_xattr(&f.file(), hydration_protocol::xattr::DEHYDRATED)
+            .unwrap()
+            .is_none());
+
+        // Simulate a race where the file becomes a placeholder after review:
+        // backup must refuse before reading a single byte or stripping xattrs.
+        let f_race = Fixture::new();
+        let plan_race = f_race.plan();
+        set_xattr(&f_race.file(), hydration_protocol::xattr::DEHYDRATED, b"1").unwrap();
+        let mut race_recovery = None;
+        assert!(f_race
+            .service
+            .backup(&plan_race, &mut race_recovery)
+            .is_err());
+        assert!(
+            get_xattr(&f_race.file(), hydration_protocol::xattr::DEHYDRATED)
+                .unwrap()
+                .is_some()
+        );
     }
     #[test]
     #[ignore = "requires HYDRATION_RECOVERY_TEST_ROOT on Btrfs and permission to delete read-only subvolumes; only its own scratch subvolumes are removed"]
