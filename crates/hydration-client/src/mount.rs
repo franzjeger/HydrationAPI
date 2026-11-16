@@ -45,11 +45,12 @@ use std::path::Path;
 /// passed up rather than folded into `false`: "there is no mount here" and "I
 /// could not find out" lead to the same refusal but not to the same message.
 pub fn is_mount_point(path: &Path) -> io::Result<bool> {
-    let target = path.to_string_lossy();
+    let raw = path.to_string_lossy();
+    let target = hydration_protocol::mount::trim_mount_path(&raw);
     let info = std::fs::read_to_string("/proc/self/mountinfo")?;
     Ok(info
         .lines()
-        .any(|line| mount_point_of(line).as_deref() == Some(&*target)))
+        .any(|line| mount_point_of(line).as_deref() == Some(target)))
 }
 
 /// The mount point field of one `mountinfo` line, unescaped.
@@ -66,33 +67,7 @@ fn mount_point_of(line: &str) -> Option<String> {
     // from the right without it is guesswork.
     let (left, _) = line.split_once(" - ")?;
     let point = left.split_whitespace().nth(4)?;
-    Some(unescape(point))
-}
-
-/// `/proc/self/mountinfo` escapes space, tab, newline and backslash as octal.
-///
-/// A sync root under `~/My Documents` is an ordinary thing to want, and without
-/// this it would never match its own line — the check would refuse a mount that
-/// is perfectly real, which is a different bug with the same symptom.
-fn unescape(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\' && i + 3 < b.len() {
-            if let Some(c) = std::str::from_utf8(&b[i + 1..i + 4])
-                .ok()
-                .and_then(|o| u8::from_str_radix(o, 8).ok())
-            {
-                out.push(c as char);
-                i += 4;
-                continue;
-            }
-        }
-        out.push(b[i] as char);
-        i += 1;
-    }
-    out
+    Some(hydration_protocol::mount::unescape_mountinfo(point))
 }
 
 #[cfg(test)]
@@ -132,6 +107,15 @@ mod tests {
         assert_eq!(
             mount_point_of(line).as_deref(),
             Some("/home/frank/My Documents")
+        );
+    }
+
+    #[test]
+    fn a_utf8_mount_point_is_preserved_without_latin1_mojibake() {
+        let line = "31 64 0:34 / /home/frank/Blåbær\\040Pärm rw - btrfs /dev/x rw";
+        assert_eq!(
+            mount_point_of(line).as_deref(),
+            Some("/home/frank/Blåbær Pärm")
         );
     }
 }

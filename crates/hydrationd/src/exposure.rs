@@ -42,8 +42,13 @@
 //!   the event is treated as a *trigger to re-examine*, never as the answer.
 
 use crate::fanotify::{self, Group};
+use hydration_protocol::mount::{trim_mount_path, unescape_mountinfo};
+use hydration_protocol::transport::Notifier;
+use hydration_protocol::FromHelper;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Watches the mount namespace for mounts appearing and disappearing.
@@ -71,8 +76,8 @@ impl Row {
             (it.next()?, it.next()?, it.next()?, it.next()?, it.next()?);
         Some(Self {
             devno: devno.to_string(),
-            root: unescape(root),
-            point: unescape(point),
+            root: unescape_mountinfo(root),
+            point: unescape_mountinfo(point),
         })
     }
 }
@@ -89,10 +94,83 @@ impl ExposureWatch {
     pub fn new(mount: &Path) -> io::Result<Self> {
         let group = Group::new_mount_watch()?;
         group.mark_mount_namespace()?;
+        let raw = mount.to_string_lossy();
         Ok(Self {
             group,
-            ours: mount.to_string_lossy().to_string(),
+            ours: trim_mount_path(&raw).to_string(),
         })
+    }
+
+    /// Spawn a background monitor (must be called *after* `fork`) that keeps the
+    /// unprivileged sync daemon updated via [`FromHelper::ExposureChanged`] on
+    /// startup, whenever the mount table changes, and whenever `peer_pid`
+    /// indicates the sync daemon reconnected.
+    pub fn spawn(
+        mount: &Path,
+        notifier: Notifier,
+        peer_lost: Arc<AtomicBool>,
+        peer_pid: Arc<AtomicI32>,
+    ) -> io::Result<()> {
+        let mut watch = Self::new(mount)?;
+        std::thread::spawn(move || {
+            let mut last_sent: Option<(i32, Vec<String>)> = None;
+            let mut last_logged: Option<Vec<String>> = None;
+            loop {
+                let pid = peer_pid.load(Ordering::Acquire);
+                let need_resync = last_sent
+                    .as_ref()
+                    .is_none_or(|(sent_pid, _)| *sent_pid != pid);
+                let next = if need_resync {
+                    watch.current().ok()
+                } else {
+                    match watch.poll(Duration::from_secs(2)) {
+                        Ok(Some(list)) => Some(list),
+                        Ok(None) => None,
+                        Err(_) => {
+                            std::thread::sleep(Duration::from_secs(2));
+                            None
+                        }
+                    }
+                };
+
+                if let Some(mounts) = next {
+                    if last_logged.as_ref() != Some(&mounts) {
+                        if mounts.is_empty() {
+                            if last_logged.is_some() {
+                                eprintln!(
+                                    "[worker] exposure cleared: no other mount exposes these files"
+                                );
+                            }
+                        } else {
+                            eprintln!(
+                                "[worker] WARNING — {} other mount(s) expose these files and bypass hydration: {mounts:?}",
+                                mounts.len()
+                            );
+                        }
+                        last_logged = Some(mounts.clone());
+                    }
+                    let unchanged = last_sent
+                        .as_ref()
+                        .is_some_and(|(sent_pid, sent)| *sent_pid == pid && *sent == mounts);
+                    if !unchanged {
+                        match notifier.send(&FromHelper::ExposureChanged {
+                            mounts: mounts.clone(),
+                        }) {
+                            Ok(()) => last_sent = Some((pid, mounts)),
+                            Err(_) => {
+                                // Release pairs with fetch thread's Acquire/SeqCst swap on `peer_lost`.
+                                peer_lost.store(true, Ordering::Release);
+                                last_sent = None;
+                                std::thread::sleep(Duration::from_millis(500));
+                            }
+                        }
+                    }
+                } else if need_resync {
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+        });
+        Ok(())
     }
 
     /// Every mount point other than ours that currently reaches these files.
@@ -164,7 +242,11 @@ impl ExposureWatch {
             revents: 0,
         };
         let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: `pfd` is a valid single-element `pollfd` struct on the stack.
         if unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
+            return Ok(None);
+        }
+        if pfd.revents & libc::POLLIN == 0 {
             return Ok(None);
         }
 
@@ -180,38 +262,10 @@ impl ExposureWatch {
     }
 }
 
-/// `/proc/self/mountinfo` escapes space, tab, newline and backslash as octal.
-///
-/// Rebuilt byte by byte rather than character by character. `out.push(b as char)`
-/// looks equivalent and is not: it reinterprets each byte as a code point, so a
-/// UTF-8 path the kernel does *not* escape — `/home/frank/Pärm` — comes back as
-/// mojibake and never compares equal to the caller's real path. The mount would
-/// then never be found, and every exposure check would quietly answer "healthy"
-/// for the rest of the process's life.
-fn unescape(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\' && i + 3 < b.len() {
-            if let Some(c) = std::str::from_utf8(&b[i + 1..i + 4])
-                .ok()
-                .and_then(|o| u8::from_str_radix(o, 8).ok())
-            {
-                out.push(c);
-                i += 4;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hydration_protocol::mount::unescape_mountinfo as unescape;
 
     #[test]
     fn a_mount_of_an_ancestor_covers_us_and_a_sibling_does_not() {

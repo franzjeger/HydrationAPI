@@ -266,7 +266,15 @@ pub fn take_over(
     // reader waits forever.
     if let Some(stranded) = in_flight.current() {
         on_event(stranded);
-        group.respond_raw(stranded, fanotify::deny_with(libc::EIO))?;
+        match group.respond_raw(stranded, fanotify::deny_with(libc::EIO)) {
+            Ok(()) => {}
+            // If the worker died in the narrow instruction window between
+            // answering `respond_raw` and clearing `in_flight.released()`, the
+            // kernel already delivered that answer and reports `ENOENT` here —
+            // never a reason to abort the supervisor's post-death deny loop.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }

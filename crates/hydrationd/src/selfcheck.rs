@@ -83,8 +83,13 @@ pub enum Reach {
 /// not that mount, it only hears about it. A mark here covers this copy and
 /// nothing else.
 pub fn mount_is_a_downstream_copy(path: &Path) -> io::Result<bool> {
-    let target = path.to_string_lossy();
+    let raw = path.to_string_lossy();
+    let target = hydration_protocol::mount::trim_mount_path(&raw);
     let info = std::fs::read_to_string("/proc/self/mountinfo")?;
+    mount_is_downstream_in_table(&info, target)
+}
+
+fn mount_is_downstream_in_table(info: &str, target: &str) -> io::Result<bool> {
     for line in info.lines() {
         // `id parent major:minor root point opts [optional...] - fstype src super`
         // The optional fields are variable in number, which is why the ` - `
@@ -94,7 +99,7 @@ pub fn mount_is_a_downstream_copy(path: &Path) -> io::Result<bool> {
             continue;
         };
         let fields: Vec<&str> = left.split_whitespace().collect();
-        if fields.len() < 6 || unescape(fields[4]) != target {
+        if fields.len() < 6 || hydration_protocol::mount::unescape_mountinfo(fields[4]) != target {
             continue;
         }
         return Ok(fields[6..].iter().any(|f| f.starts_with("master:")));
@@ -103,28 +108,6 @@ pub fn mount_is_a_downstream_copy(path: &Path) -> io::Result<bool> {
         io::ErrorKind::NotFound,
         format!("{target} is not a mount point in this namespace"),
     ))
-}
-
-/// `/proc/self/mountinfo` escapes space, tab, newline and backslash as octal.
-fn unescape(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\' && i + 3 < b.len() {
-            if let Some(c) = std::str::from_utf8(&b[i + 1..i + 4])
-                .ok()
-                .and_then(|o| u8::from_str_radix(o, 8).ok())
-            {
-                out.push(c as char);
-                i += 4;
-                continue;
-            }
-        }
-        out.push(b[i] as char);
-        i += 1;
-    }
-    out
 }
 
 /// Whether a mount mark taken here reaches the rest of the machine.
@@ -178,6 +161,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn downstream_check_matches_utf8_and_escaped_mount_points() {
+        let table = "\
+31 64 0:34 /@onedrive /home/frank/Blåbær\\040Pärm rw,noatime shared:563 master:526 - btrfs /dev/nvme0n1p2 rw
+32 64 0:34 /@other /home/frank/Pärm rw,noatime shared:526 - btrfs /dev/nvme0n1p2 rw
+";
+        assert!(mount_is_downstream_in_table(table, "/home/frank/Blåbær Pärm").unwrap());
+        assert!(!mount_is_downstream_in_table(table, "/home/frank/Pärm").unwrap());
     }
 }
 

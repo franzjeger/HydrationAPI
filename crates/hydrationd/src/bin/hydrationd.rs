@@ -90,7 +90,7 @@ fn parse() -> Args {
 /// removed the user's files from where they expect them, and a detach that
 /// failed has left them reachable and unprotected. Both are things the person
 /// reading the journal needs told.
-fn detach_or_say_why(mount: &std::path::Path) {
+fn detach_or_say_why(mount: &std::path::Path) -> bool {
     let c = match std::ffi::CString::new(mount.as_os_str().as_encoded_bytes()) {
         Ok(c) => c,
         Err(e) => {
@@ -98,15 +98,17 @@ fn detach_or_say_why(mount: &std::path::Path) {
                 "hydrationd: cannot name {} to detach it: {e}",
                 mount.display()
             );
-            return;
+            return false;
         }
     };
+    // SAFETY: `c` is a valid NUL-terminated path string; `MNT_DETACH` lazily detaches.
     if unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) } == 0 {
         eprintln!(
             "hydrationd: detached {} — its files are out of reach rather than \
              readable as zeros",
             mount.display()
         );
+        true
     } else {
         let e = io::Error::last_os_error();
         // EINVAL here is the ordinary case, not a fault: the path is not a mount
@@ -118,6 +120,7 @@ fn detach_or_say_why(mount: &std::path::Path) {
                 mount.display()
             );
         }
+        false
     }
 }
 
@@ -299,13 +302,21 @@ fn main() -> io::Result<()> {
 
     // Fork before any thread exists: a thread holding a lock at fork time leaves
     // the child holding it forever.
+    // SAFETY: Single-threaded process at this point; child uses `_exit` on all exit paths.
     let child = unsafe { libc::fork() };
     if child < 0 {
         return Err(io::Error::last_os_error());
     }
 
     if child == 0 {
-        let conn = HelperConn::new(stream).unwrap();
+        let conn = match HelperConn::new(stream) {
+            Ok(c) => c,
+            Err(e) => {
+                // Never panic inside a forked child: unwinding would run parent destructors.
+                eprintln!("[worker] could not clone helper socket: {e}");
+                unsafe { libc::_exit(1) };
+            }
+        };
 
         // The sync daemon's pid, in a cell rather than a number: the daemon is
         // a user unit that restarts, the fetch path reconnects when it does,
@@ -317,6 +328,7 @@ fn main() -> io::Result<()> {
         // fetch path below — they share one socket, and the reporter follows the
         // fetch path's reconnects through it.
         let notifier = conn.notifier();
+        let exposure_notifier = conn.notifier();
 
         // Reconnecting, because the peer is a user unit and restarting it is
         // routine. Before this, its restart cost the mount: the helper's
@@ -328,6 +340,17 @@ fn main() -> io::Result<()> {
         let fetch = SocketFetch::reconnecting(conn, &args.mount, &args.socket, args.peer_uid)
             .with_peer_pid(std::sync::Arc::clone(&peer_pid));
         let mut w = Worker::new(group, fetch, Policy::default(), worker_view);
+
+        // Live mount-exposure watch (`FAN_REPORT_MNT`), spawned after `fork` so
+        // runtime bind mounts and daemon reconnects receive `ExposureChanged`.
+        if let Err(e) = ExposureWatch::spawn(
+            &args.mount,
+            exposure_notifier,
+            w.peer_lost(),
+            std::sync::Arc::clone(&peer_pid),
+        ) {
+            eprintln!("[worker] live exposure watch unavailable: {e}");
+        }
 
         // Change detection, on its own threads so the event loop never waits on
         // the socket. Spawned after the fork, never before.
@@ -346,9 +369,11 @@ fn main() -> io::Result<()> {
         // live account on 2026-08-14: without it, uploads stopped after a daemon
         // restart until a placeholder happened to be read or the helper was
         // restarted.
+        // SAFETY: `getpid` has no preconditions.
+        let our_pid = unsafe { libc::getpid() };
         match report::Reporter::spawn(
             &args.mount,
-            vec![unsafe { libc::getpid() }],
+            vec![our_pid],
             Some(peer_pid),
             notifier,
             Duration::from_millis(250),
@@ -506,10 +531,7 @@ fn main() -> io::Result<()> {
     // it contributes is the recovery: this process exits non-zero, systemd
     // restarts it, and `RequiresMountsFor=` brings the mount back with it
     // (measured; DESIGN.md §8b).
-    let detached = unsafe {
-        let c = std::ffi::CString::new(args.mount.as_os_str().as_encoded_bytes()).unwrap();
-        libc::umount2(c.as_ptr(), libc::MNT_DETACH) == 0
-    };
+    let detached = detach_or_say_why(&args.mount);
     eprintln!(
         "hydrationd: {} — denying everything still in flight, then exiting non-zero",
         if detached {
