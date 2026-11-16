@@ -34,6 +34,7 @@
 use crate::fanotify::{self, Group};
 use std::io;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long the teardown drain waits for silence before deciding nothing is left
@@ -89,6 +90,40 @@ struct Shared {
     beat: AtomicU64,
 }
 
+/// Process-local reference-counted owner of the `MAP_SHARED` page.
+///
+/// Wrapping the `MAP_SHARED` VMA inside `Arc<SharedMapping>` combines both
+/// properties cleanly:
+/// 1. Within any single process, cloning and dropping `InFlight` in arbitrary
+///    order is 100% memory-safe — `munmap` runs only when the last `Arc` in
+///    that process drops.
+/// 2. Across `fork()`, both processes inherit mappings backed by the same
+///    physical `MAP_SHARED` kernel page, while `munmap` in one process never
+///    unmaps the other process's virtual mapping.
+#[derive(Debug)]
+struct SharedMapping {
+    ptr: *mut Shared,
+}
+
+// SAFETY: `ptr` addresses an anonymous `MAP_SHARED` kernel page accessed
+// exclusively via `AtomicI32` / `AtomicU64`, and stays mapped until `Drop`.
+unsafe impl Send for SharedMapping {}
+// SAFETY: All reads and writes to `*ptr` go through lock-free atomics.
+unsafe impl Sync for SharedMapping {}
+
+impl Drop for SharedMapping {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` was returned by `libc::mmap` with `size_of::<Shared>()`
+        // and `Arc` guarantees no in-process references remain when `drop` runs.
+        unsafe {
+            libc::munmap(
+                self.ptr as *mut libc::c_void,
+                std::mem::size_of::<Shared>(),
+            );
+        }
+    }
+}
+
 /// Where the worker records the event it currently holds.
 ///
 /// A `MAP_SHARED` anonymous mapping, established *before* the fork. This has to
@@ -97,22 +132,10 @@ struct Shared {
 /// worker's writes would land in its own copy, the supervisor would read -1
 /// forever, and the stranded event would go unanswered — which presents as the
 /// reader hanging, with nothing in any log to say why.
-///
-/// That is not a hypothetical: it is how this was first written, and the
-/// integration test caught it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct InFlight {
-    /// Points into the shared mapping. Cloned by value across `fork`, which is
-    /// exactly what we want: both processes address the same page.
-    shared: *mut Shared,
-    /// Only the process that created the mapping unmaps it.
-    owner: bool,
+    mapping: Arc<SharedMapping>,
 }
-
-// The pointer addresses a shared mapping whose lifetime outlives the fork, and
-// every access is atomic.
-unsafe impl Send for InFlight {}
-unsafe impl Sync for InFlight {}
 
 impl Default for InFlight {
     fn default() -> Self {
@@ -123,6 +146,8 @@ impl Default for InFlight {
 impl InFlight {
     pub fn new() -> Self {
         let len = std::mem::size_of::<Shared>();
+        // SAFETY: Anonymous `MAP_SHARED` mapping with no file descriptor; kernel
+        // chooses a page-aligned address and zero-initializes the page.
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -138,30 +163,46 @@ impl InFlight {
             "could not map the in-flight slot: {}",
             std::io::Error::last_os_error()
         );
-        let shared = p as *mut Shared;
+        let ptr = p as *mut Shared;
+        // SAFETY: `ptr` is page-aligned (exceeding `Shared`'s 8-byte alignment),
+        // valid for `size_of::<Shared>()` bytes, and uniquely owned before return.
+        // Relaxed initialization suffices because `fork` or thread spawn provides
+        // the happens-before barrier to any concurrent reader.
         unsafe {
-            (*shared).slot.store(-1, Ordering::SeqCst);
-            (*shared).beat.store(0, Ordering::SeqCst);
-            (*shared).working.store(0, Ordering::SeqCst);
+            (*ptr).slot.store(-1, Ordering::Relaxed);
+            (*ptr).beat.store(0, Ordering::Relaxed);
+            (*ptr).working.store(0, Ordering::Relaxed);
         }
         Self {
-            shared,
-            owner: true,
+            mapping: Arc::new(SharedMapping { ptr }),
         }
+    }
+
+    #[inline]
+    fn shared(&self) -> &Shared {
+        // SAFETY: `self.mapping` keeps the `MAP_SHARED` page mapped for `&self`'s
+        // lifetime, and `Shared` contains only atomic fields.
+        unsafe { &*self.mapping.ptr }
     }
 
     /// A handle onto the same slot, for the other side of the fork.
     pub fn share(&self) -> Self {
-        Self {
-            shared: self.shared,
-            owner: false,
-        }
+        self.clone()
     }
 
     /// Called by the worker before anything that can block: a network fetch, a
     /// lock, a write to a socket the other end may never read.
+    ///
+    /// Bumps `working` *before* publishing `slot` with Release ordering: after
+    /// an idle stretch exceeding `DEFAULT_STALL`, a supervisor polling between
+    /// `holding(fd)` and the first transfer chunk must see fresh liveness rather
+    /// than mistaking prior idle silence for a 90-second stall.
     pub fn holding(&self, fd: i32) {
-        unsafe { (*self.shared).slot.store(fd, Ordering::SeqCst) };
+        let s = self.shared();
+        // AcqRel/Release ensures the liveness bump is visible to any supervisor
+        // Acquire load that observes `slot != -1`.
+        s.working.fetch_add(1, Ordering::AcqRel);
+        s.slot.store(fd, Ordering::Release);
     }
 
     /// Called by the worker once the event has been answered.
@@ -171,14 +212,15 @@ impl InFlight {
     /// not moved", so clearing first would let a worker that answers steadily
     /// look momentarily stalled.
     pub fn released(&self) {
-        unsafe {
-            (*self.shared).beat.fetch_add(1, Ordering::SeqCst);
-            (*self.shared).slot.store(-1, Ordering::SeqCst);
-        }
+        let s = self.shared();
+        // Release ensures `beat` increment is visible before `slot` clears to -1.
+        s.beat.fetch_add(1, Ordering::AcqRel);
+        s.slot.store(-1, Ordering::Release);
     }
 
     pub fn current(&self) -> Option<i32> {
-        match unsafe { (*self.shared).slot.load(Ordering::SeqCst) } {
+        // Acquire pairs with Release stores in `holding` and `released`.
+        match self.shared().slot.load(Ordering::Acquire) {
             -1 => None,
             fd => Some(fd),
         }
@@ -190,12 +232,14 @@ impl InFlight {
     /// like a hung worker — `progress()` frozen, an event held — and the mount
     /// would be torn down mid-download.
     pub fn working(&self) {
-        unsafe { (*self.shared).working.fetch_add(1, Ordering::SeqCst) };
+        // Release pairs with supervisor Acquire load in `liveness()`.
+        self.shared().working.fetch_add(1, Ordering::Release);
     }
 
     /// The worker's own liveness, independent of whether anything completed.
     pub fn liveness(&self) -> u64 {
-        unsafe { (*self.shared).working.load(Ordering::SeqCst) }
+        // Acquire pairs with `working()` / `holding()`.
+        self.shared().working.load(Ordering::Acquire)
     }
 
     /// How many events the worker has answered.
@@ -205,26 +249,8 @@ impl InFlight {
     /// that is dead — a process blocked in a pre-content event cannot be killed
     /// by a signal, so nothing recovers on its own.
     pub fn progress(&self) -> u64 {
-        unsafe { (*self.shared).beat.load(Ordering::SeqCst) }
-    }
-}
-
-impl Clone for InFlight {
-    fn clone(&self) -> Self {
-        self.share()
-    }
-}
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        if self.owner {
-            unsafe {
-                libc::munmap(
-                    self.shared as *mut libc::c_void,
-                    std::mem::size_of::<Shared>(),
-                )
-            };
-        }
+        // Acquire pairs with `released()`.
+        self.shared().beat.load(Ordering::Acquire)
     }
 }
 
@@ -379,6 +405,23 @@ mod tests {
         let b = a.clone();
         a.holding(11);
         assert_eq!(b.current(), Some(11));
+    }
+
+    #[test]
+    fn dropping_original_before_clone_is_sound_and_holding_bumps_liveness() {
+        let a = InFlight::new();
+        let b = a.clone();
+        let before = b.liveness();
+        drop(a);
+        // Previously `drop(a)` unmapped the shared page while `b` stayed live (UB/SIGSEGV).
+        b.holding(19);
+        assert_eq!(b.current(), Some(19));
+        assert!(
+            b.liveness() > before,
+            "holding(fd) must advance liveness so waking after >90s idle never trips stall kill"
+        );
+        b.released();
+        assert_eq!(b.current(), None);
     }
 
     /// The test the previous implementation passed while being wrong.

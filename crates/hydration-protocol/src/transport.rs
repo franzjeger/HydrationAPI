@@ -70,6 +70,36 @@ fn split(stream: UnixStream) -> io::Result<(BufReader<UnixStream>, UnixStream)> 
     Ok((BufReader::new(stream), writer))
 }
 
+/// Maximum length of a JSON control/header line sent from the unprivileged sync
+/// daemon to `hydrationd`. Binary body bytes travel as fixed-size raw chunks
+/// after `ToHelper::Chunk`, so legitimate `ToHelper` lines are under a few KiB;
+/// capping this prevents an unprivileged peer without a newline from OOM-killing
+/// the `CAP_SYS_ADMIN` root helper.
+const MAX_TO_HELPER_LINE: usize = 64 * 1024;
+
+/// Maximum length of a JSON line sent from `hydrationd` to the sync daemon
+/// (sized for a 16,384-inode `FromHelper::Changed` batch with generous headroom).
+const MAX_FROM_HELPER_LINE: usize = 4 * 1024 * 1024;
+
+fn read_bounded_line(reader: &mut impl BufRead, max_bytes: usize) -> io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    let n = reader
+        .take((max_bytes + 1) as u64)
+        .read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() > max_bytes && !buf.ends_with(b"\n") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("protocol JSON frame exceeded {max_bytes}-byte safety cap"),
+        ));
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 impl HelperConn {
     pub fn new(stream: UnixStream) -> io::Result<Self> {
         let (reader, writer) = split(stream)?;
@@ -145,13 +175,12 @@ impl HelperConn {
         let mut total = 0u64;
         let mut buf = vec![0u8; crate::MAX_CHUNK as usize];
         loop {
-            let mut line = String::new();
-            if self.reader.read_line(&mut line)? == 0 {
+            let Some(line) = read_bounded_line(&mut self.reader, MAX_TO_HELPER_LINE)? else {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "the sync daemon closed the connection mid-transfer",
                 ));
-            }
+            };
             let msg = decode::<ToHelper>(&line).map_err(io::Error::other)?;
             // Every frame must answer the request that is outstanding.
             //
@@ -232,13 +261,12 @@ impl HelperConn {
     /// refused before a single byte is read, so a daemon claiming a 4 GB body
     /// for a 12-byte file gets a rejection, not an allocation.
     pub fn recv(&mut self, expected: u64) -> io::Result<(FetchResponse, Vec<u8>)> {
-        let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
+        let Some(line) = read_bounded_line(&mut self.reader, MAX_TO_HELPER_LINE)? else {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "the sync daemon closed the connection",
             ));
-        }
+        };
         let msg: ToHelper = decode(&line).map_err(io::Error::other)?;
         let ToHelper::Fetch(resp) = msg else {
             return Err(io::Error::new(
@@ -417,10 +445,9 @@ impl DaemonConn {
 
     /// Wait for the next thing the helper wants. `None` means it went away.
     pub fn recv(&mut self) -> io::Result<Option<FromHelper>> {
-        let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
+        let Some(line) = read_bounded_line(&mut self.reader, MAX_FROM_HELPER_LINE)? else {
             return Ok(None);
-        }
+        };
         decode(&line).map(Some).map_err(io::Error::other)
     }
 
@@ -601,5 +628,23 @@ mod tests {
             .recv(10)
             .expect_err("a closed socket is not a success");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn an_unterminated_oversized_frame_is_rejected_without_unbounded_allocation() {
+        let (raw_helper, mut raw_daemon) = UnixStream::pair().expect("socketpair");
+        let mut helper = HelperConn::new(raw_helper).expect("helper conn");
+        std::thread::spawn(move || {
+            let chunk = vec![b'a'; 16 * 1024];
+            for _ in 0..8 {
+                if raw_daemon.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        let err = helper
+            .recv(10)
+            .expect_err("oversized line without newline must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
