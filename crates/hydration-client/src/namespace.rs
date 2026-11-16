@@ -142,7 +142,7 @@ struct Node {
 }
 
 /// The remote tree as last reported.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Namespace {
     nodes: HashMap<String, Node>,
     children: HashMap<String, BTreeSet<String>>,
@@ -278,7 +278,7 @@ impl Namespace {
     }
 
     /// Rebuild from a snapshot. Emits nothing: this is a restore, not news.
-    pub fn restore(items: Vec<Item>) -> Self {
+    pub fn restore(items: impl IntoIterator<Item = Item>) -> Self {
         let mut ns = Self::new();
         for item in items {
             ns.apply(item);

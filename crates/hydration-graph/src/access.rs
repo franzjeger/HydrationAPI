@@ -45,18 +45,67 @@ impl CredentialStore for FileCredentialStore {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl FileStamp {
+    fn from_meta(m: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            len: m.len(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct FileStateStore {
     dir: PathBuf,
+    cached_tree: Option<(FileStamp, TreeBlob)>,
 }
 impl FileStateStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            cached_tree: None,
+        }
     }
 }
 impl StateStore for FileStateStore {
     fn load(&mut self) -> io::Result<Option<PersistedState>> {
-        let tree = read_optional(self.dir.join("tree.json"))?.map(TreeBlob::from_bytes);
+        let tree_path = self.dir.join("tree.json");
+        let tree = match fs::metadata(&tree_path) {
+            Ok(meta) => {
+                let stamp = FileStamp::from_meta(&meta);
+                if let Some((cached_stamp, cached_blob)) = &self.cached_tree {
+                    if *cached_stamp == stamp {
+                        Some(cached_blob.clone())
+                    } else {
+                        let blob = TreeBlob::from_bytes(fs::read(&tree_path)?);
+                        self.cached_tree = Some((stamp, blob.clone()));
+                        Some(blob)
+                    }
+                } else {
+                    let blob = TreeBlob::from_bytes(fs::read(&tree_path)?);
+                    self.cached_tree = Some((stamp, blob.clone()));
+                    Some(blob)
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.cached_tree = None;
+                None
+            }
+            Err(e) => return Err(e),
+        };
         let token = read_optional(self.dir.join("token.json"))?
             .map(|b| TokenBlob::from_bytes(&b))
             .transpose()?;
@@ -67,7 +116,12 @@ impl StateStore for FileStateStore {
         }
     }
     fn save_tree(&mut self, tree: &TreeBlob) -> io::Result<()> {
-        atomic_private_write(&self.dir.join("tree.json"), tree.as_bytes())
+        let tree_path = self.dir.join("tree.json");
+        atomic_private_write(&tree_path, tree.as_bytes())?;
+        if let Ok(meta) = fs::metadata(&tree_path) {
+            self.cached_tree = Some((FileStamp::from_meta(&meta), tree.clone()));
+        }
+        Ok(())
     }
     fn save_token(&mut self, token: &TokenBlob) -> io::Result<()> {
         atomic_private_write(&self.dir.join("token.json"), &token.as_bytes())
