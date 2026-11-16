@@ -25,6 +25,9 @@ use std::sync::{Arc, Mutex};
 pub struct HelperConn {
     reader: BufReader<UnixStream>,
     writer: Arc<Mutex<UnixStream>>,
+    /// Reusable chunk buffer allocated lazily once on first streamed transfer,
+    /// avoiding a 1 MiB heap allocation + zero-fill on every small read event.
+    chunk_buf: Vec<u8>,
 }
 
 /// A send-only handle onto a [`HelperConn`], for threads that only report.
@@ -106,6 +109,7 @@ impl HelperConn {
         Ok(Self {
             reader,
             writer: Arc::new(Mutex::new(writer)),
+            chunk_buf: Vec::new(),
         })
     }
 
@@ -173,7 +177,8 @@ impl HelperConn {
             ));
         }
         let mut total = 0u64;
-        let mut buf = vec![0u8; crate::MAX_CHUNK as usize];
+        let mut ready_seen = false;
+        let mut ignored_control = 0u32;
         loop {
             let Some(line) = read_bounded_line(&mut self.reader, MAX_TO_HELPER_LINE)? else {
                 return Err(io::Error::new(
@@ -206,6 +211,12 @@ impl HelperConn {
             }
             match msg {
                 ToHelper::Fetch(FetchResponse::Ready { len, .. }) => {
+                    if ready_seen {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("duplicate Ready frame for request {want_id}"),
+                        ));
+                    }
                     if len != expected {
                         // Refused on the declaration, before the body. The stream
                         // is now out of step, so the caller must drop the
@@ -215,8 +226,15 @@ impl HelperConn {
                             format!("daemon offered {len} bytes for a {expected}-byte placeholder"),
                         ));
                     }
+                    ready_seen = true;
                 }
                 ToHelper::Chunk { len, .. } => {
+                    if !ready_seen {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Chunk frame preceded Ready for request {want_id}"),
+                        ));
+                    }
                     // A zero-length chunk is not progress, and treating it as
                     // such let a daemon reset the worker's stall clock forever
                     // without delivering a byte. Refused at the frame, so the
@@ -231,12 +249,21 @@ impl HelperConn {
                         ));
                     }
                     let n = len as usize;
-                    self.reader.read_exact(&mut buf[..n])?;
-                    dest(&buf[..n], total)?;
+                    if self.chunk_buf.len() < n {
+                        self.chunk_buf.resize(crate::MAX_CHUNK as usize, 0);
+                    }
+                    self.reader.read_exact(&mut self.chunk_buf[..n])?;
+                    dest(&self.chunk_buf[..n], total)?;
                     total += len;
                     on_progress(total);
                 }
                 ToHelper::Done { .. } => {
+                    if !ready_seen {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Done frame preceded Ready for request {want_id}"),
+                        ));
+                    }
                     if total != expected {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -248,8 +275,25 @@ impl HelperConn {
                 ToHelper::Abort { errno, reason, .. } => {
                     return Ok(Streamed::Aborted { errno, reason });
                 }
-                ToHelper::Fetch(other) => return Ok(Streamed::Refused(other)),
-                ToHelper::Control(_) => continue,
+                ToHelper::Fetch(other) => {
+                    if ready_seen {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unexpected FetchResponse after Ready for request {want_id}"),
+                        ));
+                    }
+                    return Ok(Streamed::Refused(other));
+                }
+                ToHelper::Control(_) => {
+                    ignored_control += 1;
+                    if ignored_control > 64 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "excessive unsolicited Control frames during active transfer",
+                        ));
+                    }
+                    continue;
+                }
             }
         }
     }
@@ -646,5 +690,30 @@ mod tests {
             .recv(10)
             .expect_err("oversized line without newline must fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn recv_streamed_rejects_done_or_chunk_before_ready_and_duplicate_ready() {
+        // 1. Done without Ready on a 0-byte span must fail closed.
+        let (raw_helper, mut raw_daemon) = UnixStream::pair().expect("socketpair");
+        let mut helper = HelperConn::new(raw_helper).expect("helper conn");
+        raw_daemon
+            .write_all(encode(&ToHelper::Done { id: 7 }).unwrap().as_bytes())
+            .unwrap();
+        let err = helper
+            .recv_streamed(7, 0, &mut |_, _| Ok(()), &mut |_| {})
+            .expect_err("Done before Ready must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // 2. Duplicate Ready must fail closed.
+        let (raw_helper2, mut raw_daemon2) = UnixStream::pair().expect("socketpair");
+        let mut helper2 = HelperConn::new(raw_helper2).expect("helper conn");
+        let ready = encode(&ToHelper::Fetch(FetchResponse::Ready { id: 9, len: 4 })).unwrap();
+        raw_daemon2.write_all(ready.as_bytes()).unwrap();
+        raw_daemon2.write_all(ready.as_bytes()).unwrap();
+        let err2 = helper2
+            .recv_streamed(9, 4, &mut |_, _| Ok(()), &mut |_| {})
+            .expect_err("duplicate Ready must fail");
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
     }
 }

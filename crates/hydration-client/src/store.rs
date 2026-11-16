@@ -511,13 +511,34 @@ pub fn is_pinned(path: &Path) -> io::Result<bool> {
 pub fn get_xattr(path: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
     let p = CString::new(path.as_os_str().as_bytes())?;
     let n = CString::new(name)?;
-    // SAFETY: `p` and `n` are valid NUL-terminated C strings; passing a null
-    // buffer with size 0 queries the attribute length without writing memory.
+    // Fast path: read directly into a 256-byte stack buffer so normal hydration
+    // xattrs (`id`, `etag`, `dehydrated`, `pinned`, `stamp`) complete in one
+    // syscall instead of two (`size` probe + read).
+    let mut stack = [0u8; 256];
+    // SAFETY: `p` and `n` are valid NUL-terminated C strings and `stack` has 256 writable bytes.
+    let first = unsafe {
+        libc::getxattr(
+            p.as_ptr(),
+            n.as_ptr(),
+            stack.as_mut_ptr() as *mut libc::c_void,
+            stack.len(),
+        )
+    };
+    if first >= 0 {
+        return Ok(Some(stack[..first as usize].to_vec()));
+    }
+    let first_err = io::Error::last_os_error();
+    match first_err.raw_os_error() {
+        Some(libc::ENODATA) | Some(libc::ENOTSUP) => return Ok(None),
+        Some(libc::ERANGE) => {}
+        _ => return Err(first_err),
+    }
+
+    // Fallback for attributes larger than 256 bytes (e.g. large selection JSON).
+    // SAFETY: `(null, 0)` queries the exact attribute length without writing memory.
     let len = unsafe { libc::getxattr(p.as_ptr(), n.as_ptr(), std::ptr::null_mut(), 0) };
     if len < 0 {
         let e = io::Error::last_os_error();
-        // Absent is not an error: a file with no cloud ID is simply one the
-        // cloud has not heard of yet.
         return match e.raw_os_error() {
             Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(None),
             _ => Err(e),
@@ -547,8 +568,27 @@ pub fn fget_xattr(file: &std::fs::File, name: &str) -> io::Result<Option<Vec<u8>
     use std::os::fd::AsRawFd;
     let fd = file.as_raw_fd();
     let n = CString::new(name)?;
-    // SAFETY: `fd` is an open file descriptor borrowed for the duration of the
-    // call, `n` is a valid C string, and `(null, 0)` only queries length.
+    let mut stack = [0u8; 256];
+    // SAFETY: `fd` is open, `n` is NUL-terminated, and `stack` has 256 writable bytes.
+    let first = unsafe {
+        libc::fgetxattr(
+            fd,
+            n.as_ptr(),
+            stack.as_mut_ptr() as *mut libc::c_void,
+            stack.len(),
+        )
+    };
+    if first >= 0 {
+        return Ok(Some(stack[..first as usize].to_vec()));
+    }
+    let first_err = io::Error::last_os_error();
+    match first_err.raw_os_error() {
+        Some(libc::ENODATA) | Some(libc::ENOTSUP) => return Ok(None),
+        Some(libc::ERANGE) => {}
+        _ => return Err(first_err),
+    }
+
+    // SAFETY: `fd` is open, `n` is a valid C string, and `(null, 0)` only queries length.
     let len = unsafe { libc::fgetxattr(fd, n.as_ptr(), std::ptr::null_mut(), 0) };
     if len < 0 {
         let e = io::Error::last_os_error();

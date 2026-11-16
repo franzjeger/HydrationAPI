@@ -55,7 +55,11 @@ pub struct Running {
 }
 impl Drop for Running {
     fn drop(&mut self) {
-        self.monitor.active.lock().unwrap().remove(&self.id);
+        self.monitor
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
     }
 }
 impl Transfers {
