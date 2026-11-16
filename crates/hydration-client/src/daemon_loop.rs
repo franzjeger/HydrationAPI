@@ -866,6 +866,53 @@ fn control_with_desktop(
 /// a file that raced into the queue after the snapshot is still refused by its
 /// live `UploadPending`/`ChangedSinceUpload` checks, which is why this loops
 /// `reclaim` rather than trusting the enumerator's pre-filter.
+static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_shutdown_signal(_: libc::c_int) {
+    // Relaxed suffices: single-flag async-signal-safe notification polled by
+    // the signal watcher thread before issuing Release shutdown stores.
+    SIGNAL_STOP.store(true, Ordering::Relaxed);
+}
+
+fn install_shutdown_signals() {
+    SIGNAL_STOP.store(false, Ordering::Relaxed);
+    // SAFETY: `sigaction` is initialized with `sigemptyset` and an async-signal-safe
+    // C handler (`on_shutdown_signal`) without `SA_RESTART` so blocking syscalls wake.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_shutdown_signal as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        let _ = libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        let _ = libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    }
+}
+
+struct DeltaBusyGuard<'a> {
+    busy: &'a AtomicBool,
+    folder_refresh: &'a AtomicBool,
+}
+
+impl<'a> DeltaBusyGuard<'a> {
+    fn enter(busy: &'a AtomicBool, folder_refresh: &'a AtomicBool) -> Self {
+        // Release ensures uploads/eviction observing `busy == true` see prior state.
+        busy.store(true, Ordering::Release);
+        Self {
+            busy,
+            folder_refresh,
+        }
+    }
+}
+
+impl Drop for DeltaBusyGuard<'_> {
+    fn drop(&mut self) {
+        // Always release `delta_busy` even if `apply_remembering` unwinds, so
+        // upload folder creation and auto-eviction can never wedge permanently.
+        self.folder_refresh.store(true, Ordering::Release);
+        self.busy.store(false, Ordering::Release);
+    }
+}
+
 fn plan_and_reclaim(
     mount: &std::path::Path,
     cfg: &EvictionConfig,
@@ -876,11 +923,14 @@ fn plan_and_reclaim(
     sending: &HashSet<FileId>,
 ) -> io::Result<u64> {
     let (low, _) = cfg.marks(total);
-    if available >= low {
-        return Ok(0); // common path: no pressure, no walk beyond this.
+    if cfg.quota_bytes.is_none() && available >= low {
+        return Ok(0); // common path when no quota is set: no pressure, no walk.
     }
     let candidates = reclaim::evictable_candidates(mount)?;
     let plan = crate::evict_policy::plan(candidates, available, total, cfg, now);
+    if plan.is_empty() {
+        return Ok(0);
+    }
 
     // One scanned Store reused across the batch — reclaim only uses it to forget
     // the swapped-out inode.
@@ -1587,17 +1637,17 @@ pub fn run_with_history<C: CloudAccess>(
                         // unprotected. The snapshot can go stale, which is what
                         // the stamp check inside `apply` is for.
                         let waiting = q.lock().unwrap().waiting_set();
-                        delta_busy.store(true, Ordering::SeqCst);
-                        let applied = delta::apply_remembering(
-                            &mount,
-                            &changes,
-                            &mut store,
-                            &waiting,
-                            placer_ref,
-                            &mut applied_to,
-                        );
-                        folder_refresh.store(true, Ordering::SeqCst);
-                        delta_busy.store(false, Ordering::SeqCst);
+                        let applied = {
+                            let _busy = DeltaBusyGuard::enter(&delta_busy, &folder_refresh);
+                            delta::apply_remembering(
+                                &mount,
+                                &changes,
+                                &mut store,
+                                &waiting,
+                                placer_ref,
+                                &mut applied_to,
+                            )
+                        };
                         // The cursor moves only past a pass that finished.
                         //
                         // A delta service does not replay a consumed change, so
@@ -1807,7 +1857,7 @@ pub fn run_with_history<C: CloudAccess>(
                     continue;
                 };
                 let (low, _) = evict_cfg.marks(total);
-                if available >= low {
+                if evict_cfg.quota_bytes.is_none() && available >= low {
                     continue;
                 }
                 // Snapshot the queue as the evict verb does — lock only long
@@ -1928,8 +1978,44 @@ pub fn run_with_history<C: CloudAccess>(
         });
     }
 
-    for conn in listener.incoming() {
-        let conn = conn?;
+    install_shutdown_signals();
+    let active_helper: Arc<Mutex<Option<std::os::unix::net::UnixStream>>> =
+        Arc::new(Mutex::new(None));
+    {
+        let stop = Arc::clone(&stop);
+        let active_helper = Arc::clone(&active_helper);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if SIGNAL_STOP.swap(false, Ordering::Relaxed) {
+                    stop.store(true, Ordering::Release);
+                    if let Some(peer) = active_helper.lock().unwrap().take() {
+                        let _ = peer.shutdown(std::net::Shutdown::Both);
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+    }
+
+    listener.set_nonblocking(true)?;
+    while !stop.load(Ordering::Acquire) {
+        let conn = match listener.accept() {
+            Ok((conn, _)) => {
+                conn.set_nonblocking(false)?;
+                conn
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         // One helper at a time. A second connection means something unexpected
         // is talking to us, and serving both would be worse than serving
         // neither.
@@ -1956,16 +2042,26 @@ pub fn run_with_history<C: CloudAccess>(
                 // Bump the shared counter, so this connection's fetches show up
                 // in the same "downloading" number the status thread broadcasts.
                 daemon.track_fetches(Arc::clone(&in_flight));
+                if let Ok(clone) = conn.try_clone() {
+                    *active_helper.lock().unwrap() = Some(clone);
+                }
                 let mut c = DaemonConn::new(conn)?;
                 if let Err(e) = daemon.serve(&mut c) {
-                    eprintln!("hydration-sync: helper connection ended: {e}");
+                    if !stop.load(Ordering::Acquire) {
+                        eprintln!("hydration-sync: helper connection ended: {e}");
+                    }
                 } else {
                     eprintln!("hydration-sync: helper disconnected");
                 }
+                *active_helper.lock().unwrap() = None;
             }
             Err(_) => eprintln!("hydration-sync: could not open the cloud directory"),
         }
     }
+    eprintln!("hydration-sync: shutting down cleanly...");
+    let _ = desktop.wait_for_passes();
+    let _ = std::fs::remove_file(&config.socket);
+    let _ = std::fs::remove_file(config.socket.with_extension("ctl"));
     Ok(())
 }
 
@@ -3704,6 +3800,44 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a file was evicted without pressure"
+        );
+    }
+
+    #[test]
+    fn a_sweep_with_quota_evicts_even_when_disk_has_ample_free_space() {
+        let dir = ctl_scratch("quota-pressure");
+        let mount = dir.join("m");
+        std::fs::create_dir_all(&mount).unwrap();
+        let p = mount.join("resident.bin");
+        std::fs::write(&p, vec![b'r'; 64 * 1024]).unwrap();
+        crate::store::set_xattr(&p, crate::store::XATTR_ID, b"cloud-quota-1").unwrap();
+        hydration_protocol::stamp::write(&p).unwrap();
+
+        let mut cfg = crate::evict_policy::EvictionConfig::default_pressure();
+        cfg.grace_secs = 0;
+        cfg.quota_bytes = Some(1024);
+        cfg.quota_target_bytes = Some(0);
+
+        // Ample disk free space (500 GiB free out of 1 TiB), so `available >= low`,
+        // yet `quota_bytes` is exceeded and must still trigger eviction!
+        let gib = 1024 * 1024 * 1024;
+        let freed = plan_and_reclaim(
+            &mount,
+            &cfg,
+            500 * gib,
+            1024 * gib,
+            u64::MAX / 2,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(freed > 0, "quota-exceeded sweep must reclaim resident blocks");
+        assert!(
+            crate::store::get_xattr(&p, hydration_protocol::xattr::DEHYDRATED)
+                .unwrap()
+                .is_some(),
+            "file exceeding quota_bytes was not dehydrated when available >= low"
         );
     }
 

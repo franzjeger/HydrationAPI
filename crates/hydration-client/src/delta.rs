@@ -617,52 +617,54 @@ pub fn apply_remembering<M: Materialise>(
                 // file open all stay correct — and it is the only handling that
                 // cannot end with two claimants.
                 if let Some(existing) = by_cloud_id.get(cloud_id) {
-                    if existing.path != abs && existing.path.exists() {
-                        let id = file_id(&std::fs::metadata(&existing.path).unwrap());
-                        if waiting.contains(&id)
-                            || matches!(
-                                hydration_protocol::stamp::state(&existing.path),
-                                Ok(hydration_protocol::stamp::State::Dirty)
-                            )
-                        {
-                            out.kept_local.push(Kept::new(path, Why::EditWaiting));
-                            continue;
-                        }
+                    if existing.path != abs {
+                        if let Ok(existing_meta) = std::fs::symlink_metadata(&existing.path) {
+                            let id = file_id(&existing_meta);
+                            if waiting.contains(&id)
+                                || matches!(
+                                    hydration_protocol::stamp::state(&existing.path),
+                                    Ok(hydration_protocol::stamp::State::Dirty)
+                                )
+                            {
+                                out.kept_local.push(Kept::new(path, Why::EditWaiting));
+                                continue;
+                            }
 
-                        if abs.exists() {
-                            // Something else is already at the destination —
-                            // two objects swapping paths, most likely. Placing
-                            // anyway would produce the two-claimant state this
-                            // branch exists to prevent, so it is reported rather
-                            // than resolved by guessing.
-                            //
-                            // Marked retryable, because a refusal nothing ever
-                            // retries is a permanent wrong state: the caller
-                            // advances its cursor and the service never mentions
-                            // these objects again.
-                            out.failed
-                                .push(Failed::new(path, Failure::DestinationOccupied));
-                            out.retryable = true;
-                            continue;
+                            if abs.exists() {
+                                // Something else is already at the destination —
+                                // two objects swapping paths, most likely. Placing
+                                // anyway would produce the two-claimant state this
+                                // branch exists to prevent, so it is reported rather
+                                // than resolved by guessing.
+                                //
+                                // Marked retryable, because a refusal nothing ever
+                                // retries is a permanent wrong state: the caller
+                                // advances its cursor and the service never mentions
+                                // these objects again.
+                                out.failed
+                                    .push(Failed::new(path, Failure::DestinationOccupied));
+                                out.retryable = true;
+                                continue;
+                            }
+                            if let Some(parent) = abs.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if let Err(e) = std::fs::rename(&existing.path, &abs) {
+                                out.failed
+                                    .push(Failed::new(path, Failure::Rename(e.to_string())));
+                                out.retryable = true;
+                                continue;
+                            }
+                            out.moved += 1;
+                            out.succeeded.push((path.to_owned(), "moved".into()));
+                            // The index has to follow, or the next change naming
+                            // this object looks it up at a path that no longer
+                            // exists and creates a second file for it.
+                            if let Some(e) = by_cloud_id.get_mut(cloud_id) {
+                                e.path = abs.clone();
+                            }
+                            store.remember(file_id(&std::fs::metadata(&abs)?), &abs);
                         }
-                        if let Some(parent) = abs.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        if let Err(e) = std::fs::rename(&existing.path, &abs) {
-                            out.failed
-                                .push(Failed::new(path, Failure::Rename(e.to_string())));
-                            out.retryable = true;
-                            continue;
-                        }
-                        out.moved += 1;
-                        out.succeeded.push((path.to_owned(), "moved".into()));
-                        // The index has to follow, or the next change naming
-                        // this object looks it up at a path that no longer
-                        // exists and creates a second file for it.
-                        if let Some(e) = by_cloud_id.get_mut(cloud_id) {
-                            e.path = abs.clone();
-                        }
-                        store.remember(file_id(&std::fs::metadata(&abs)?), &abs);
                     }
                 }
 
