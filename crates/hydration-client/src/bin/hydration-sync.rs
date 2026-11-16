@@ -70,12 +70,18 @@ fn parse() -> Args {
 }
 
 /// `$XDG_RUNTIME_DIR` when there is one: it is user-owned, mode 0700, and wiped
-/// at logout, which is exactly the lifetime this socket should have.
+/// at logout, which is exactly the lifetime this socket should have. Never
+/// silently fall back to world-writable `/tmp`.
 fn default_socket() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("hydration-sync.sock")
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir).join("hydration-sync.sock"),
+        None => {
+            eprintln!(
+                "hydration-sync: XDG_RUNTIME_DIR is not set; pass --socket <path> explicitly"
+            );
+            std::process::exit(2);
+        }
+    }
 }
 
 fn main() -> io::Result<()> {

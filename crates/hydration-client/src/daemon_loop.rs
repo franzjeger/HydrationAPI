@@ -55,6 +55,12 @@ pub trait CloudAccess: Send + 'static {
     fn list_cloud_folders(&self, _path: &str) -> Option<Vec<String>> {
         None
     }
+    /// Return an independent, lock-free cloud folder lister so control-socket
+    /// `list_cloud` queries never hold the `CloudAccess` factory mutex across
+    /// network I/O and can surface real transport or auth errors.
+    fn cloud_folder_lister(&self) -> Option<Box<CloudFolderLister>> {
+        None
+    }
     type Fetch: Provider;
     type Upload: Sink;
     type Changes: Discover;
@@ -622,7 +628,7 @@ impl Watchers {
 ///   nothing is being sent). Keys stay in that order and new keys are only ever
 ///   appended, so a reader must ignore keys it does not recognise. An unchanged
 ///   tuple is never re-sent.
-type CloudFolderLister = dyn Fn(&str) -> Option<Vec<String>> + Send + Sync;
+pub type CloudFolderLister = dyn Fn(&str) -> io::Result<Vec<String>> + Send + Sync;
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
@@ -647,6 +653,7 @@ fn control(
         watchers,
         Arc::new(crate::desktop::Desktop::default()),
         None,
+        crate::store::new_shared_hints(),
     )
 }
 
@@ -662,6 +669,7 @@ fn control_with_desktop(
     watchers: Arc<Watchers>,
     desktop: Arc<crate::desktop::Desktop>,
     list_cloud: Option<Box<CloudFolderLister>>,
+    hints: crate::store::SharedHints,
 ) -> io::Result<()> {
     use std::io::{BufRead, BufReader, Write};
 
@@ -704,10 +712,16 @@ fn control_with_desktop(
                             let q = queue.lock().unwrap();
                             (q.waiting_set(), q.sending_set())
                         };
+                        // `reclaim` only touches `store` to forget the swapped-out
+                        // inode, so pass an empty `Store` rather than walking
+                        // 165,000+ inodes per eviction, and record the new
+                        // placeholder inode in `hints` so re-hydration resolves O(1).
                         let mut store = Store::new();
-                        let _ = store.scan(&mount);
                         match reclaim::reclaim(&mount, arg, &mut store, &waiting, &sending) {
                             Ok(Ok(r)) => {
+                                if let Some(joined) = crate::delta::safe_join(&mount, arg) {
+                                    crate::store::record_hint_for_path(&hints, &joined);
+                                }
                                 excluded.fetch_add(1, Ordering::AcqRel);
                                 format!("reclaimed {} bytes", r.bytes)
                             }
@@ -718,11 +732,11 @@ fn control_with_desktop(
                     "list_cloud" => {
                         if let Some(lister) = &list_cloud {
                             match lister(arg) {
-                                Some(folders) => match serde_json::to_string(&folders) {
+                                Ok(folders) => match serde_json::to_string(&folders) {
                                     Ok(json) => json,
                                     Err(e) => format!("error: {e}"),
                                 },
-                                None => "error: list_cloud_folders not supported".into(),
+                                Err(e) => format!("error: {e}"),
                             }
                         } else {
                             "error: no cloud access".into()
@@ -926,11 +940,11 @@ impl Drop for DeltaBusyGuard<'_> {
 fn plan_and_reclaim(
     mount: &std::path::Path,
     cfg: &EvictionConfig,
-    available: u64,
-    total: u64,
+    (available, total): (u64, u64),
     now: u64,
     waiting: &HashSet<FileId>,
     sending: &HashSet<FileId>,
+    hints: Option<&crate::store::SharedHints>,
 ) -> io::Result<u64> {
     let (low, _) = cfg.marks(total);
     if cfg.quota_bytes.is_none() && available >= low {
@@ -942,16 +956,20 @@ fn plan_and_reclaim(
         return Ok(0);
     }
 
-    // One scanned Store reused across the batch — reclaim only uses it to forget
-    // the swapped-out inode.
+    // `reclaim` only touches `store` to forget the swapped-out inode — do not
+    // scan the entire tree here (`evictable_candidates` already walked it).
     let mut store = Store::new();
-    let _ = store.scan(mount);
 
     let mut freed = 0u64;
     for rel in plan {
         // A refusal (raced upload, a fresh edit, a pin set mid-sweep) is a skip,
         // not a failure: the point of looping reclaim is that it re-checks.
         if let Ok(Ok(r)) = reclaim::reclaim(mount, &rel, &mut store, waiting, sending) {
+            if let Some(h) = hints {
+                if let Some(joined) = crate::delta::safe_join(mount, &rel) {
+                    crate::store::record_hint_for_path(h, &joined);
+                }
+            }
             freed = freed.saturating_add(r.bytes);
         }
     }
@@ -1069,6 +1087,7 @@ pub fn run_with_history<C: CloudAccess>(
     let active_uploads: Arc<Mutex<HashMap<FileId, String>>> = Arc::new(Mutex::new(HashMap::new()));
     // Everyone who asked to be told when the numbers above move.
     let watchers = Arc::new(Watchers::default());
+    let shared_hints = crate::store::new_shared_hints();
 
     let _ = std::fs::remove_file(&config.socket);
     let listener = UnixListener::bind(&config.socket)?;
@@ -1083,6 +1102,7 @@ pub fn run_with_history<C: CloudAccess>(
         config.debounce.as_secs()
     );
 
+    let direct_lister = access.cloud_folder_lister();
     // Behind a lock only so three threads can each ask it for an instance. The
     // instances themselves never touch it again.
     let access = Arc::new(Mutex::new(access));
@@ -1490,13 +1510,14 @@ pub fn run_with_history<C: CloudAccess>(
     // The privileged half is never sent a destination, which is what makes §6b
     // structural rather than a rule someone has to remember.
     {
-        let (q, stop, mount, access, delta_busy, folder_refresh) = (
+        let (q, stop, mount, access, delta_busy, folder_refresh, hints_for_delta) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             config.mount.clone(),
             Arc::clone(&access),
             Arc::clone(&delta_busy),
             Arc::clone(&folder_refresh),
+            Arc::clone(&shared_hints),
         );
         let desktop = Arc::clone(&desktop);
         std::thread::spawn(move || {
@@ -1673,6 +1694,12 @@ pub fn run_with_history<C: CloudAccess>(
                         // next round has to find a mount before it opens
                         // another. Cursor stays put: what was not applied has
                         // not been seen.
+                        if applied
+                            .as_ref()
+                            .is_ok_and(|a| a.created + a.updated + a.moved + a.removed > 0)
+                        {
+                            store.export_hints(&hints_for_delta);
+                        }
                         let lost_the_mount = matches!(&applied, Ok(a) if a.stopped.is_some());
                         if let Ok(a) = &applied {
                             desktop.reconciled(&changes, a);
@@ -1780,6 +1807,8 @@ pub fn run_with_history<C: CloudAccess>(
                 if walked.elapsed() >= WALK_EVERY {
                     if let Err(e) = store.scan(&mount) {
                         eprintln!("hydration-sync: could not walk the sync root: {e}");
+                    } else {
+                        store.export_hints(&hints_for_delta);
                     }
                     walked = std::time::Instant::now();
                 }
@@ -1792,9 +1821,8 @@ pub fn run_with_history<C: CloudAccess>(
     // The user's way in. §8 item 10's trigger, and the status surface item 11
     // asked for.
     {
-        let access_for_ctl = Arc::clone(&access);
         let ctl = config.socket.with_extension("ctl");
-        let (mount, q, ex, exc, inf, au, ws) = (
+        let (mount, q, ex, exc, inf, au, ws, hints_for_ctl) = (
             config.mount.clone(),
             Arc::clone(&queue),
             Arc::clone(&exposures),
@@ -1802,11 +1830,27 @@ pub fn run_with_history<C: CloudAccess>(
             Arc::clone(&in_flight),
             Arc::clone(&active_uploads),
             Arc::clone(&watchers),
+            Arc::clone(&shared_hints),
         );
         eprintln!("hydration-sync: control socket at {}", ctl.display());
         let desktop = Arc::clone(&desktop);
-        let list_cloud: Box<CloudFolderLister> =
-            Box::new(move |arg: &str| access_for_ctl.lock().unwrap().list_cloud_folders(arg));
+        let list_cloud: Box<CloudFolderLister> = match direct_lister {
+            Some(lister) => lister,
+            None => {
+                let access_for_ctl = Arc::clone(&access);
+                Box::new(move |arg: &str| {
+                    let guard = access_for_ctl
+                        .lock()
+                        .map_err(|_| io::Error::other("the cloud access is poisoned"))?;
+                    guard.list_cloud_folders(arg).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "list_cloud_folders not supported",
+                        )
+                    })
+                })
+            }
+        };
         std::thread::spawn(move || {
             if let Err(e) = control_with_desktop(
                 &ctl,
@@ -1819,6 +1863,7 @@ pub fn run_with_history<C: CloudAccess>(
                 ws,
                 desktop,
                 Some(list_cloud),
+                hints_for_ctl,
             ) {
                 eprintln!("hydration-sync: control socket unavailable: {e}");
             }
@@ -1829,11 +1874,12 @@ pub fn run_with_history<C: CloudAccess>(
     // exist while the policy is off, so an "off" daemon never wakes to sample a
     // disk it will never act on — "off" is off, not merely idle.
     if let Some(evict_cfg) = config.eviction {
-        let (mount, stop, delta_busy, queue) = (
+        let (mount, stop, delta_busy, queue, hints_for_evict) = (
             config.mount.clone(),
             Arc::clone(&stop),
             Arc::clone(&delta_busy),
             Arc::clone(&queue),
+            Arc::clone(&shared_hints),
         );
         let desktop = Arc::clone(&desktop);
         std::thread::spawn(move || {
@@ -1879,11 +1925,11 @@ pub fn run_with_history<C: CloudAccess>(
                 match plan_and_reclaim(
                     &mount,
                     &evict_cfg,
-                    available,
-                    total,
+                    (available, total),
                     clock.now_secs(),
                     &waiting,
                     &sending,
+                    Some(&hints_for_evict),
                 ) {
                     Ok(freed) if freed > 0 => {
                         eprintln!("hydration-sync: auto-eviction freed {freed} bytes")
@@ -2053,6 +2099,7 @@ pub fn run_with_history<C: CloudAccess>(
                 // Bump the shared counter, so this connection's fetches show up
                 // in the same "downloading" number the status thread broadcasts.
                 daemon.track_fetches(Arc::clone(&in_flight));
+                daemon.with_hints(Arc::clone(&shared_hints));
                 if let Ok(clone) = conn.try_clone() {
                     *active_helper.lock().unwrap() = Some(clone);
                 }
@@ -3761,11 +3808,11 @@ mod tests {
         let freed = plan_and_reclaim(
             &mount,
             &cfg,
-            0,
-            10_000_000,
+            (0, 10_000_000),
             10_000,
             &HashSet::new(),
             &sending,
+            None,
         )
         .unwrap();
 
@@ -3797,11 +3844,11 @@ mod tests {
         let freed = plan_and_reclaim(
             &mount,
             &cfg,
-            500,
-            1000,
+            (500, 1000),
             10_000,
             &HashSet::new(),
             &HashSet::new(),
+            None,
         )
         .unwrap();
 
@@ -3835,11 +3882,11 @@ mod tests {
         let freed = plan_and_reclaim(
             &mount,
             &cfg,
-            500 * gib,
-            1024 * gib,
+            (500 * gib, 1024 * gib),
             u64::MAX / 2,
             &HashSet::new(),
             &HashSet::new(),
+            None,
         )
         .unwrap();
 

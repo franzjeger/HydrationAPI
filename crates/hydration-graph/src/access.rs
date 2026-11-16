@@ -622,6 +622,74 @@ impl GraphAccess {
         }
     }
 }
+fn list_folders_over<T: crate::Transport>(
+    scope: &DriveScope,
+    transport: &mut T,
+    path: &str,
+) -> io::Result<Vec<String>> {
+    let mut url = if path.is_empty() || path == "/" {
+        format!(
+            "{}/root/children?$select=name,folder",
+            crate::drive_base(scope.drive())
+        )
+    } else {
+        let clean_path = path.trim_matches('/');
+        let encoded_path = crate::encode_path(clean_path);
+        format!(
+            "{}/root:/{}:/children?$select=name,folder",
+            crate::drive_base(scope.drive()),
+            encoded_path
+        )
+    };
+
+    let mut folders = Vec::new();
+    let mut visited = std::collections::BTreeSet::new();
+    visited.insert(url.clone());
+
+    for _ in 0..crate::MAX_PAGES_PER_ROUND {
+        let reply = transport.send(&crate::Request::new(crate::Method::Get, &url))?;
+        if !(200..300).contains(&reply.status) {
+            return Err(io::Error::other(format!(
+                "cloud folder listing failed with HTTP {}",
+                reply.status
+            )));
+        }
+        let json: serde_json::Value = serde_json::from_slice(&reply.body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if let Some(arr) = json.get("value").and_then(|v| v.as_array()) {
+            for item in arr {
+                if item.get("folder").is_some() {
+                    if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                        folders.push(name.to_owned());
+                    }
+                }
+            }
+        }
+        match json.get("@odata.nextLink").and_then(|v| v.as_str()) {
+            None => return Ok(folders),
+            Some(next) => {
+                if !crate::on_the_graph_endpoint(next) {
+                    return Err(crate::foreign_link(next));
+                }
+                if !visited.insert(next.to_owned()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "cloud folder listing looped on @odata.nextLink",
+                    ));
+                }
+                url = next.to_owned();
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "cloud folder listing exceeded {} pages",
+            crate::MAX_PAGES_PER_ROUND
+        ),
+    ))
+}
+
 impl CloudAccess for GraphAccess {
     fn conflicts(
         &self,
@@ -641,37 +709,16 @@ impl CloudAccess for GraphAccess {
 
     fn list_cloud_folders(&self, path: &str) -> Option<Vec<String>> {
         let mut http = crate::http::GraphHttp::new(Arc::clone(&self.cache));
-        let url = if path.is_empty() || path == "/" {
-            format!(
-                "{}/root/children?$select=name,folder",
-                crate::drive_base(self.scope.drive())
-            )
-        } else {
-            let clean_path = path.trim_matches('/');
-            let encoded_path = crate::encode_path(clean_path);
-            format!(
-                "{}/root:/{}:/children?$select=name,folder",
-                crate::drive_base(self.scope.drive()),
-                encoded_path
-            )
-        };
+        list_folders_over(&self.scope, &mut http, path).ok()
+    }
 
-        if let Ok(res) = http.round_trip(crate::Method::Get, &url, &[], &[], true) {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&res.body) {
-                let mut folders = Vec::new();
-                if let Some(arr) = json.get("value").and_then(|v| v.as_array()) {
-                    for item in arr {
-                        if item.get("folder").is_some() {
-                            if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
-                                folders.push(name.to_owned());
-                            }
-                        }
-                    }
-                }
-                return Some(folders);
-            }
-        }
-        None
+    fn cloud_folder_lister(&self) -> Option<Box<hydration_client::daemon_loop::CloudFolderLister>> {
+        let scope = self.scope.clone();
+        let cache = Arc::clone(&self.cache);
+        Some(Box::new(move |path: &str| {
+            let mut http = crate::http::GraphHttp::new(Arc::clone(&cache));
+            list_folders_over(&scope, &mut http, path)
+        }))
     }
 
     type Fetch = GraphProvider;
@@ -1086,5 +1133,87 @@ mod tests {
         let err = writer.verify("AAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(!err.to_string().contains("AAAAAAAA"));
+    }
+
+    struct ScriptedTransport {
+        replies: std::collections::VecDeque<crate::Reply>,
+        seen_urls: Vec<String>,
+    }
+
+    impl crate::Transport for ScriptedTransport {
+        fn send(&mut self, request: &crate::Request) -> io::Result<crate::Reply> {
+            self.seen_urls.push(request.url.clone());
+            self.replies
+                .pop_front()
+                .ok_or_else(|| io::Error::other("unexpected request"))
+        }
+    }
+
+    #[test]
+    fn list_folders_follows_next_link_and_filters_non_folders() {
+        let scope = DriveScope::primary(crate::DriveId::parse("drv").unwrap());
+        let page1 = serde_json::to_vec(&serde_json::json!({
+            "value": [
+                {"name": "Alpha", "folder": {"childCount": 2}},
+                {"name": "readme.md", "file": {}}
+            ],
+            "@odata.nextLink": "https://graph.microsoft.com/v1.0/drives/drv/root/children?$skiptoken=p2"
+        }))
+        .unwrap();
+        let page2 = serde_json::to_vec(&serde_json::json!({
+            "value": [
+                {"name": "Beta", "folder": {"childCount": 0}}
+            ]
+        }))
+        .unwrap();
+        let mut transport = ScriptedTransport {
+            replies: std::collections::VecDeque::from([
+                crate::Reply {
+                    status: 200,
+                    retry_after: None,
+                    body: page1,
+                },
+                crate::Reply {
+                    status: 200,
+                    retry_after: None,
+                    body: page2,
+                },
+            ]),
+            seen_urls: Vec::new(),
+        };
+        let folders = list_folders_over(&scope, &mut transport, "/Projects/").unwrap();
+        assert_eq!(folders, vec!["Alpha".to_string(), "Beta".to_string()]);
+        assert_eq!(transport.seen_urls.len(), 2);
+        assert!(transport.seen_urls[0].contains("/root:/Projects:/children"));
+    }
+
+    #[test]
+    fn list_folders_rejects_foreign_next_link_and_http_errors() {
+        let scope = DriveScope::primary(crate::DriveId::parse("drv").unwrap());
+        let bad_next = serde_json::to_vec(&serde_json::json!({
+            "value": [{"name": "Alpha", "folder": {}}],
+            "@odata.nextLink": "https://evil.example/v1.0/drives/drv/root/children"
+        }))
+        .unwrap();
+        let mut transport = ScriptedTransport {
+            replies: std::collections::VecDeque::from([crate::Reply {
+                status: 200,
+                retry_after: None,
+                body: bad_next,
+            }]),
+            seen_urls: Vec::new(),
+        };
+        let err = list_folders_over(&scope, &mut transport, "/").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        let mut unauth = ScriptedTransport {
+            replies: std::collections::VecDeque::from([crate::Reply {
+                status: 401,
+                retry_after: None,
+                body: b"{}".to_vec(),
+            }]),
+            seen_urls: Vec::new(),
+        };
+        assert!(list_folders_over(&scope, &mut unauth, "/").is_err());
     }
 }

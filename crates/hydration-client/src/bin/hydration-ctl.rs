@@ -44,15 +44,18 @@ fn usage() -> ! {
 
 fn main() -> std::io::Result<()> {
     let mut args = std::env::args().skip(1).peekable();
-    let mut socket = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("hydration-sync.ctl");
+    let mut socket = None;
 
     let mut words: Vec<String> = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--socket" => socket = args.next().map(Into::into).unwrap_or_else(|| usage()),
+            "--socket" => {
+                socket = Some(
+                    args.next()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| usage()),
+                )
+            }
             "-h" | "--help" => usage(),
             _ => words.push(a),
         }
@@ -60,6 +63,18 @@ fn main() -> std::io::Result<()> {
     if words.is_empty() {
         usage();
     }
+    let socket = match socket {
+        Some(s) => s,
+        None => match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+            Some(dir) => std::path::PathBuf::from(dir).join("hydration-sync.ctl"),
+            None => {
+                eprintln!(
+                    "hydration-ctl: XDG_RUNTIME_DIR is not set; pass --socket <path> explicitly"
+                );
+                std::process::exit(2);
+            }
+        },
+    };
 
     let mut conn = match UnixStream::connect(&socket) {
         Ok(c) => c,

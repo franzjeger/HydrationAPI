@@ -33,9 +33,18 @@ fn main() -> io::Result<()> {
     let credential = value("--credential")
         .map(PathBuf::from)
         .unwrap_or_else(|| state.join("refresh-token"));
-    let socket = value("--socket")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/hydration-onedrive.sock"));
+    let socket = match value("--socket") {
+        Some(s) => PathBuf::from(s),
+        None => match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+            Some(dir) => PathBuf::from(dir).join("hydration-onedrive.sock"),
+            None => {
+                eprintln!(
+                    "hydration-onedrive: XDG_RUNTIME_DIR is not set; pass --socket <path> explicitly"
+                );
+                std::process::exit(2);
+            }
+        },
+    };
 
     let auth =
         AuthConfig::public_client(client_id).with_scopes(["Files.ReadWrite.All", "User.Read"]);

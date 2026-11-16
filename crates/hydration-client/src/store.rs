@@ -40,9 +40,38 @@ pub struct Entry {
     pub size: u64,
 }
 
+/// Shared `(FileId -> PathBuf)` hint map populated by delta placement and
+/// eviction swaps so `Daemon::resolve_or_rescan` resolves newly placed
+/// placeholders in O(1) without walking 165,000+ inodes on first `read()`.
+pub type SharedHints = std::sync::Arc<std::sync::RwLock<HashMap<FileId, PathBuf>>>;
+
+pub fn new_shared_hints() -> SharedHints {
+    std::sync::Arc::new(std::sync::RwLock::new(HashMap::new()))
+}
+
+pub fn record_hint_for_path(hints: &SharedHints, path: &Path) {
+    if let Ok(md) = std::fs::symlink_metadata(path) {
+        let id = FileId {
+            fsid: md.dev(),
+            ino: md.ino(),
+        };
+        if let Ok(mut map) = hints.write() {
+            map.insert(id, path.to_path_buf());
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IndexedFile {
+    path: PathBuf,
+    cloud_id: Option<String>,
+    etag: Option<String>,
+    size: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct Store {
-    index: HashMap<FileId, PathBuf>,
+    index: HashMap<FileId, IndexedFile>,
     /// Where the last scan started, so a caller can look again without having to
     /// be told the root a second time — and without being able to get it wrong.
     root: Option<std::path::PathBuf>,
@@ -252,40 +281,33 @@ impl Store {
                 let ignored = path
                     .strip_prefix(root)
                     .is_ok_and(|rel| self.ignore.is_ignored(rel));
+
+                // Read `XATTR_ID` and `XATTR_ETAG` at most once per file during
+                // the scan and reuse them across lineage, fingerprint, and
+                // `by_cloud_id` — eliminating two redundant full-tree xattr
+                // passes (~650,000+ syscalls per delta round at 165k files).
+                let (cloud_id, etag) = if !ignored {
+                    (
+                        get_xattr_string(&path, XATTR_ID),
+                        get_xattr_string(&path, XATTR_ETAG),
+                    )
+                } else {
+                    (None, None)
+                };
+
                 if keeping_lineage && !ignored {
                     if let Some(rel) = crate::lineage::relative(root, &path) {
-                        // Placeholders are left out, and the reason is size.
-                        //
-                        // Recording every file with a cloud id put 167,883 lines
-                        // and 43 MB into the sync root on the measured account —
-                        // a near-duplicate of the manifest, rewritten whenever
-                        // any one object changed. The 1,018 files that actually
-                        // hold content come to 0.3 MB.
-                        //
-                        // The limit this accepts: a placeholder that is replaced
-                        // by an atomic save *without ever being read* loses its
-                        // identity with no record here to recover it. Its
-                        // identity is in §6d's manifest, which lists exactly the
-                        // dehydrated files and carries the same three columns —
-                        // so the information is not gone, only not wired to this
-                        // path. Wiring it would double a 43 MB file to cover a
-                        // case that needs a program to write over a document it
-                        // never opened.
                         let placeholder = get_xattr(&path, hydration_protocol::xattr::DEHYDRATED)
                             .ok()
                             .flatten()
                             .is_some();
-                        // Recorded from the file only when the file has something
-                        // to say. A file that has lost its attributes contributes
-                        // its *path* and nothing else, which is what keeps the
-                        // record it needs alive rather than erasing it.
                         if !placeholder {
-                            if let Some(cloud_id) = get_xattr_string(&path, XATTR_ID) {
+                            if let Some(cid) = &cloud_id {
                                 seen.insert(
                                     rel.clone(),
                                     crate::lineage::Record {
-                                        cloud_id,
-                                        tag: get_xattr_string(&path, XATTR_ETAG),
+                                        cloud_id: cid.clone(),
+                                        tag: etag.clone(),
                                     },
                                 );
                             }
@@ -301,8 +323,8 @@ impl Store {
                     let mut h = std::collections::hash_map::DefaultHasher::new();
                     path.hash(&mut h);
                     md.len().hash(&mut h);
-                    get_xattr_string(&path, XATTR_ID).hash(&mut h);
-                    get_xattr_string(&path, XATTR_ETAG).hash(&mut h);
+                    cloud_id.hash(&mut h);
+                    etag.hash(&mut h);
                     fingerprint = fingerprint.wrapping_add(h.finish());
                 }
                 self.index.insert(
@@ -310,7 +332,12 @@ impl Store {
                         fsid: md.dev(),
                         ino: md.ino(),
                     },
-                    path,
+                    IndexedFile {
+                        path,
+                        cloud_id,
+                        etag,
+                        size: md.len(),
+                    },
                 );
                 found += 1;
             }
@@ -342,20 +369,66 @@ impl Store {
     /// renamed locally since, and looking it up by name would then miss it and
     /// leave a file the cloud no longer has.
     pub fn by_cloud_id(&self) -> HashMap<String, Entry> {
-        let mut out = HashMap::new();
-        for (id, path) in &self.index {
-            if let Some(e) = self.lookup(id) {
-                if let Some(cid) = e.cloud_id.clone() {
-                    out.insert(cid, e);
+        let mut out = HashMap::with_capacity(self.index.len());
+        for entry in self.index.values() {
+            if let Some(cid) = &entry.cloud_id {
+                out.insert(
+                    cid.clone(),
+                    Entry {
+                        path: entry.path.clone(),
+                        cloud_id: Some(cid.clone()),
+                        etag: entry.etag.clone(),
+                        size: entry.size,
+                    },
+                );
+            } else if !self.path_is_ignored(&entry.path) {
+                if let Some(remembered) = self.remembered(&entry.path) {
+                    out.insert(
+                        remembered.cloud_id.clone(),
+                        Entry {
+                            path: entry.path.clone(),
+                            cloud_id: Some(remembered.cloud_id.clone()),
+                            etag: remembered.tag.clone(),
+                            size: entry.size,
+                        },
+                    );
                 }
             }
-            let _ = path;
         }
         out
     }
 
+    /// Export all currently indexed `(FileId -> PathBuf)` entries into `hints`.
+    pub fn export_hints(&self, hints: &SharedHints) {
+        if let Ok(mut map) = hints.write() {
+            map.clear();
+            map.reserve(self.index.len());
+            for (&id, entry) in &self.index {
+                map.insert(id, entry.path.clone());
+            }
+        }
+    }
+
     pub fn remember(&mut self, id: FileId, path: &Path) {
-        self.index.insert(id, path.to_path_buf());
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let ignored = self.path_is_ignored(path);
+        let (cloud_id, etag) = if !ignored {
+            (
+                get_xattr_string(path, XATTR_ID),
+                get_xattr_string(path, XATTR_ETAG),
+            )
+        } else {
+            (None, None)
+        };
+        self.index.insert(
+            id,
+            IndexedFile {
+                path: path.to_path_buf(),
+                cloud_id,
+                etag,
+                size,
+            },
+        );
     }
 
     pub fn forget(&mut self, id: &FileId) {
@@ -367,7 +440,7 @@ impl Store {
     /// Exposed so a caller can assert what is *not* in here — the framework's
     /// own files most of all, since including them is silent rather than loud.
     pub fn paths(&self) -> impl Iterator<Item = &Path> {
-        self.index.values().map(|p| p.as_path())
+        self.index.values().map(|e| e.path.as_path())
     }
 
     /// The root the last [`Store::scan`] walked, if there has been one.
@@ -390,7 +463,7 @@ impl Store {
     /// whose inode no longer matches is not this file, and returning it would
     /// mean fetching content for one file and delivering it to another.
     pub fn lookup(&self, id: &FileId) -> Option<Entry> {
-        let path = self.index.get(id)?;
+        let path = &self.index.get(id)?.path;
         let md = std::fs::metadata(path).ok()?;
         if md.dev() != id.fsid || md.ino() != id.ino {
             return None;
@@ -768,5 +841,37 @@ mod ignore_tests {
             before,
             "a real edit must move the fingerprint"
         );
+    }
+
+    #[test]
+    fn by_cloud_id_serves_cached_xattrs_and_lineage_fallback_from_scan() {
+        let root = scratch("by-cloud-id");
+        let direct = root.join("direct.txt");
+        std::fs::write(&direct, b"hello").unwrap();
+        set_xattr(&direct, XATTR_ID, b"cid-direct").unwrap();
+        set_xattr(&direct, XATTR_ETAG, b"etag-1").unwrap();
+
+        let atomic = root.join("atomic.txt");
+        std::fs::write(&atomic, b"v1").unwrap();
+        set_xattr(&atomic, XATTR_ID, b"cid-atomic").unwrap();
+        set_xattr(&atomic, XATTR_ETAG, b"etag-a1").unwrap();
+
+        let mut store = Store::new().remembering();
+        store.scan(&root).unwrap();
+
+        // Simulate atomic save replacing inode & stripping xattrs.
+        let tmp = root.join("atomic.txt.tmp");
+        std::fs::write(&tmp, b"v2-longer").unwrap();
+        std::fs::rename(&tmp, &atomic).unwrap();
+        store.scan(&root).unwrap();
+
+        let map = store.by_cloud_id();
+        let d = map.get("cid-direct").expect("direct entry present");
+        assert_eq!(d.etag.as_deref(), Some("etag-1"));
+        assert_eq!(d.size, 5);
+
+        let a = map.get("cid-atomic").expect("lineage fallback present");
+        assert_eq!(a.etag.as_deref(), Some("etag-a1"));
+        assert_eq!(a.size, 9);
     }
 }

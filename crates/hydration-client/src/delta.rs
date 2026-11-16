@@ -672,6 +672,9 @@ pub fn apply_remembering<M: Materialise>(
                     // Nothing there: this is the ordinary case, a new object.
                     Err(_) => match mat.place(&abs, *size, cloud_id, etag.as_deref()) {
                         Ok(()) => {
+                            if let Ok(placed_md) = std::fs::symlink_metadata(&abs) {
+                                store.remember(file_id(&placed_md), &abs);
+                            }
                             out.created += 1;
                             out.succeeded.push((path.to_owned(), "created".into()));
                         }
@@ -770,6 +773,10 @@ pub fn apply_remembering<M: Materialise>(
                         }
                         match mat.place(&abs, *size, cloud_id, etag.as_deref()) {
                             Ok(()) => {
+                                store.forget(&id);
+                                if let Ok(placed_md) = std::fs::symlink_metadata(&abs) {
+                                    store.remember(file_id(&placed_md), &abs);
+                                }
                                 out.updated += 1;
                                 out.succeeded.push((path.to_owned(), "updated".into()));
                             }
@@ -830,6 +837,7 @@ pub fn apply_remembering<M: Materialise>(
                 }
                 match mat.remove(&entry.path) {
                     Ok(()) => {
+                        store.forget(&id);
                         out.removed += 1;
                         out.succeeded
                             .push((entry.path.display().to_string(), "removed".into()));
