@@ -126,7 +126,7 @@ pub struct TmpfilePlacer {
 /// eviction is being prepared, keeping the inode and changing the only copy of
 /// the bytes. Size and nanosecond mtime make that write a mismatch too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReplacementGuard {
+pub struct ReplacementGuard {
     dev: u64,
     ino: u64,
     size: u64,
@@ -135,13 +135,13 @@ pub(crate) struct ReplacementGuard {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConditionalPlace {
+pub enum ConditionalPlace {
     Placed,
     TargetChanged,
 }
 
 impl ReplacementGuard {
-    pub(crate) fn from_metadata(md: &std::fs::Metadata) -> Self {
+    pub fn from_metadata(md: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
         Self {
             dev: md.dev(),
@@ -268,7 +268,14 @@ impl TmpfilePlacer {
                     // occupant can be user content preserved by conditional
                     // eviction and must survive even though its name has our
                     // shape.
-                    let ours = matches!(store::get_xattr(&path, xattr::DEHYDRATED), Ok(Some(_)));
+                    let ours = matches!(store::get_xattr(&path, xattr::DEHYDRATED), Ok(Some(_)))
+                        && matches!(
+                            hydration_protocol::stamp::state(&path),
+                            Ok(hydration_protocol::stamp::State::Clean)
+                        )
+                        // SEEK_DATA inspects extent metadata, never content.
+                        // st_blocks also counts external xattrs on ext4.
+                        && matches!(hydration_protocol::holds_data(&path), Ok(false));
                     if ours && std::fs::remove_file(path).is_ok() {
                         removed += 1;
                     }
@@ -361,7 +368,7 @@ impl TmpfilePlacer {
     /// `rel` is relative to the pinned root, and every syscall here names that
     /// descriptor. The scratch name is built from `rel` rather than from the
     /// absolute path for the same reason.
-    fn link_into_place(&self, fd: &OwnedFd, rel: &Path, seq: u64) -> io::Result<()> {
+    fn link_into_place(&self, fd: &OwnedFd, rel: &Path, mut seq: u64) -> io::Result<()> {
         let proc = format!("/proc/self/fd/{}", fd.as_raw_fd());
         match linkat_into(&proc, self.dir.as_fd(), rel) {
             Ok(()) => return Ok(()),
@@ -370,9 +377,20 @@ impl TmpfilePlacer {
         }
         let dir = rel.parent().unwrap_or(Path::new(""));
         let base = rel.file_name().and_then(|n| n.to_str()).unwrap_or("f");
-        let scratch = dir.join(format!(".{base}.hydration-{seq}"));
-        let _ = unlinkat(self.dir.as_fd(), &scratch);
-        linkat_into(&proc, self.dir.as_fd(), &scratch)?;
+        // A crash may have retained local data at a scratch-shaped name.
+        // Reusing that sequence after restart must not unlink the recovery.
+        let scratch = loop {
+            let candidate = dir.join(format!(".{base}.hydration-{seq}"));
+            match linkat_into(&proc, self.dir.as_fd(), &candidate) {
+                Ok(()) => break candidate,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    seq = seq
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("Scratch sequence exhausted"))?;
+                }
+                Err(e) => return Err(e),
+            }
+        };
         // Rename touches no content, so it fires no pre-content event — the
         // placeholder arrives complete or not at all.
         renameat(self.dir.as_fd(), &scratch, rel).inspect_err(|_| {
@@ -389,7 +407,7 @@ impl TmpfilePlacer {
     /// occupant at `scratch`, where it can be inspected. A mismatch is exchanged
     /// back before the anonymous placeholder is discarded, so the newer file is
     /// never unlinked.
-    pub(crate) fn place_if_unchanged(
+    pub fn place_if_unchanged(
         &mut self,
         path: &Path,
         size: u64,
@@ -409,6 +427,50 @@ impl TmpfilePlacer {
         })?;
         self.make_parents(rel)?;
         let fd = self.placeholder(size, cloud_id, etag)?;
+        self.exchange_if_unchanged(fd, rel, expected)
+    }
+
+    /// Install a verified complete recovery copy without reading the live file.
+    /// The same inode/mtime/size exchange guard protects eviction and resolution.
+    pub fn copy_if_unchanged(
+        &mut self,
+        path: &Path,
+        source: &Path,
+        cloud_id: &str,
+        etag: &str,
+        expected: ReplacementGuard,
+    ) -> io::Result<ConditionalPlace> {
+        let rel = self
+            .relative(path)
+            .ok_or_else(|| io::Error::other("path is outside the sync root"))?
+            .to_path_buf();
+        let fd = self.anonymous()?;
+        let mut input = std::fs::File::open(source)?;
+        let mut output = std::fs::File::from(fd);
+        std::io::copy(&mut input, &mut output)?;
+        output.set_permissions(input.metadata()?.permissions())?;
+        let fd: OwnedFd = output.into();
+        Self::set(&fd, store::XATTR_ID, cloud_id.as_bytes())?;
+        Self::set(&fd, store::XATTR_ETAG, etag.as_bytes())?;
+        if matches!(
+            store::get_xattr(source, "user.hydration.pinned"),
+            Ok(Some(_))
+        ) {
+            Self::set(&fd, "user.hydration.pinned", b"1")?;
+        }
+        hydration_protocol::stamp::write_fd(fd.as_fd())?;
+        if unsafe { libc::fsync(fd.as_raw_fd()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.exchange_if_unchanged(fd, &rel, expected)
+    }
+
+    fn exchange_if_unchanged(
+        &mut self,
+        fd: OwnedFd,
+        rel: &Path,
+        expected: ReplacementGuard,
+    ) -> io::Result<ConditionalPlace> {
         let placeholder = guard_of_fd(fd.as_fd())?;
 
         let dir = rel.parent().unwrap_or(Path::new(""));
@@ -788,6 +850,8 @@ mod tests {
         std::fs::write(&second, b"").unwrap();
         store::set_xattr(&first, xattr::DEHYDRATED, b"1").unwrap();
         store::set_xattr(&second, xattr::DEHYDRATED, b"1").unwrap();
+        hydration_protocol::stamp::write(&first).unwrap();
+        hydration_protocol::stamp::write(&second).unwrap();
         std::fs::write(dir.join("keep.txt"), b"x").unwrap();
         std::fs::write(dir.join(".hydration-manifest"), b"x").unwrap();
 
@@ -807,6 +871,85 @@ mod tests {
 
         assert_eq!(TmpfilePlacer::sweep_scratch(&dir).unwrap(), 0);
         assert_eq!(std::fs::read(&raced).unwrap(), b"a concurrent atomic save");
+    }
+
+    #[test]
+    fn marked_scratch_with_ambiguous_local_bytes_survives_restart() {
+        let dir = scratch("sweep-preserves-marked-race");
+        let raced = dir.join(".report.docx.hydration-1");
+        std::fs::write(&raced, b"local data must survive").unwrap();
+        store::set_xattr(&raced, xattr::DEHYDRATED, b"1").unwrap();
+        assert_eq!(TmpfilePlacer::sweep_scratch(&dir).unwrap(), 0);
+        // Even a matching stamp is insufficient while blocks remain allocated.
+        hydration_protocol::stamp::write(&raced).unwrap();
+        assert_eq!(TmpfilePlacer::sweep_scratch(&dir).unwrap(), 0);
+        assert_eq!(std::fs::read(&raced).unwrap(), b"local data must survive");
+    }
+
+    #[test]
+    fn a_new_placer_never_reuses_a_retained_recovery_name() {
+        let dir = scratch("place-preserves-recovery-name");
+        let original = dir.join("document");
+        std::fs::write(&original, b"old content").unwrap();
+        // Cover both initial sequence conventions, independent of call count.
+        for i in 0..3 {
+            std::fs::write(
+                dir.join(format!(".document.hydration-{i}")),
+                b"saved local edit",
+            )
+            .unwrap();
+        }
+        TmpfilePlacer::new(&dir)
+            .unwrap()
+            .place(&original, 100, "cloud", Some("ct:new"))
+            .unwrap();
+        assert_eq!(original.metadata().unwrap().len(), 100);
+        for i in 0..3 {
+            assert_eq!(
+                std::fs::read(dir.join(format!(".document.hydration-{i}"))).unwrap(),
+                b"saved local edit"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recovery_copy_only_replaces_the_reviewed_inode() {
+        let dir = scratch("conditional-recovery");
+        let source = dir.join("saved");
+        let original = dir.join("document");
+        std::fs::write(&source, b"reviewed local version").unwrap();
+        std::fs::write(&original, b"old version").unwrap();
+        let expected = ReplacementGuard::from_metadata(&original.metadata().unwrap());
+        let mut placer = TmpfilePlacer::new(&dir).unwrap();
+        assert_eq!(
+            placer
+                .copy_if_unchanged(&original, &source, "cloud", "ct:new", expected)
+                .unwrap(),
+            ConditionalPlace::Placed
+        );
+        assert_eq!(std::fs::read(&original).unwrap(), b"reviewed local version");
+        assert_eq!(
+            hydration_protocol::stamp::state(&original).unwrap(),
+            hydration_protocol::stamp::State::Clean
+        );
+        assert!(store::get_xattr(&original, xattr::DEHYDRATED)
+            .unwrap()
+            .is_none());
+
+        let expected = ReplacementGuard::from_metadata(&original.metadata().unwrap());
+        let newer = dir.join("editor-save");
+        std::fs::write(&newer, b"newer edit").unwrap();
+        std::fs::rename(newer, &original).unwrap();
+        assert_eq!(
+            placer
+                .copy_if_unchanged(&original, &source, "cloud", "ct:new", expected)
+                .unwrap(),
+            ConditionalPlace::TargetChanged
+        );
+        assert_eq!(std::fs::read(&original).unwrap(), b"newer edit");
+        assert!(store::get_xattr(&original, store::XATTR_ETAG)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

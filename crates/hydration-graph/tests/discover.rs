@@ -4468,3 +4468,35 @@ fn an_empty_feed_moves_the_token_without_rewriting_the_tree() {
         "a second empty feed is no different from the first"
     );
 }
+
+#[test]
+fn selection_refresh_discards_uncommitted_cursor_and_reenumerates() {
+    let rig = Rig::new();
+    rig.store.preload(primed(
+        &[
+            root_item(MINE, ROOT),
+            file_item(MINE, "01A", ROOT, "a.txt", 10, "c:{G},1"),
+        ],
+        Some("D9"),
+    ));
+    rig.script(
+        resume_req("D9"),
+        vec![Reply::ok(body_delta(&[], &lnk("D10")))],
+    );
+    let mut d = rig.provider();
+    let (_, next) = d.changes(&Cursor::default()).unwrap();
+    rig.script(
+        first_req(MINE),
+        vec![Reply::ok(body_delta(
+            &[
+                root_json(MINE, ROOT),
+                file_json(MINE, "01A", "a.txt", ROOT, 12, "c:{G},2"),
+            ],
+            &lnk("D11"),
+        ))],
+    );
+    d.refresh();
+    let (changes, _) = d.changes(&next).unwrap();
+    assert_eq!(paths(&changes), set(&["a.txt".to_string()]));
+    assert_eq!(rig.journal.calls(), vec![resume_req("D9"), first_req(MINE)]);
+}

@@ -1,0 +1,179 @@
+use hydration_client::desktop::Desktop;
+use hydration_client::upload::{Outcome, Queue, TestClock};
+use hydration_protocol::FileId;
+use serde_json::Value;
+use std::path::Path;
+use std::time::Duration;
+
+#[test]
+fn queue_errors_survive_retry_and_history_survives_restart() {
+    let dir = test_scratch::scratch(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+        "desktop-history",
+    );
+    let file = dir.join("history.json");
+    let _ = std::fs::remove_file(&file);
+    let desktop = Desktop::load(Some(file.clone()));
+    let mut queue = Queue::new(Duration::from_secs(10), TestClock::default());
+    let id = FileId { fsid: 1, ino: 2 };
+    queue.touch(id);
+    queue.begin(id);
+    queue.finish(id);
+    queue.failed(id);
+    desktop.record(
+        id,
+        Some("Documents/a.txt"),
+        &Outcome::Failed("Remote version changed".into()),
+    );
+    let parse = |d: &Desktop, q: &Queue<TestClock>| -> Value {
+        serde_json::from_str(&d.snapshot(Path::new("/sync"), q)).unwrap()
+    };
+    let state = parse(&desktop, &queue);
+    assert_eq!(state["queue"][0]["status"], "retry");
+    assert_eq!(state["queue"][0]["detail"], "Remote version changed");
+    assert!(state["queue"][0]["retry_after"].as_u64().unwrap() > 0);
+    queue.touch(id);
+    let edited = parse(&desktop, &queue);
+    assert_eq!(edited["queue"][0]["status"], "waiting");
+    assert!(
+        edited["queue"][0]["detail"].is_null(),
+        "old error must not describe newly edited content"
+    );
+    desktop.pause(7200);
+    assert!(desktop.paused());
+    assert_eq!(queue.pending(), 1, "pausing must retain queued work");
+    desktop.pause(0);
+    assert!(!desktop.paused());
+    queue.flush_now();
+    assert_eq!(queue.due(), vec![id]);
+    queue.begin(id);
+    assert_eq!(parse(&desktop, &queue)["queue"][0]["status"], "uploading");
+    queue.finish(id);
+    queue.sent(id);
+    desktop.record(
+        id,
+        Some("Documents/a.txt"),
+        &Outcome::Sent {
+            cloud_id: "cloud-id".into(),
+        },
+    );
+    let restarted = Desktop::load(Some(file));
+    let state = parse(&restarted, &queue);
+    assert_eq!(state["queue"].as_array().unwrap().len(), 0);
+    assert_eq!(state["history"][0]["status"], "uploaded");
+    assert_eq!(state["history"][1]["status"], "error");
+    assert!(
+        !restarted.paused(),
+        "pause does not silently persist across restart"
+    );
+}
+
+#[test]
+fn empty_queue_does_not_hide_persisted_refusals() {
+    let dir = test_scratch::scratch(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+        "desktop-issues",
+    );
+    let file = dir.join("history.json");
+    let _ = std::fs::remove_file(file.with_extension("issues.json"));
+    let desktop = Desktop::load(Some(file.clone()));
+    let queue = Queue::new(Duration::from_secs(10), TestClock::default());
+    desktop.issue("a.txt", "availability", "Ambiguous local bytes");
+    desktop.issue("a.txt", "conflict", "Local copy preserved");
+    desktop.issue("b.txt", "error", "Permission denied");
+    let desktop = Desktop::load(Some(file));
+    let state: Value = serde_json::from_str(&desktop.snapshot(Path::new("/sync"), &queue)).unwrap();
+    assert_eq!(state["total"], 0);
+    assert_eq!(state["issues"].as_array().unwrap().len(), 2);
+    assert_eq!(state["issues"][1]["kind"], "availability");
+    let changes: Vec<_> = ["a.txt", "b.txt"]
+        .into_iter()
+        .map(|p| hydration_client::delta::Change::Upserted {
+            cloud_id: p.into(),
+            path: p.into(),
+            size: 0,
+            etag: None,
+        })
+        .collect();
+    desktop.reconciled(&changes, &hydration_client::delta::Applied::default());
+    let state: Value = serde_json::from_str(&desktop.snapshot(Path::new("/sync"), &queue)).unwrap();
+    assert_eq!(state["issues"].as_array().unwrap().len(), 1);
+    assert_eq!(state["issues"][0]["kind"], "availability");
+    desktop.record(
+        FileId { fsid: 1, ino: 2 },
+        Some("a.txt"),
+        &Outcome::Sent {
+            cloud_id: "a".into(),
+        },
+    );
+    let state: Value = serde_json::from_str(&desktop.snapshot(Path::new("/sync"), &queue)).unwrap();
+    assert!(state["issues"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn selection_waits_for_current_pass_and_restores_pause() {
+    use std::sync::Arc;
+    let dir = test_scratch::scratch(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+        "selection-quiesce",
+    );
+    hydration_client::selection::write(&dir, &[]).unwrap();
+    let desktop = Arc::new(Desktop::default());
+    let pass = desktop.begin_pass().unwrap();
+    let d = desktop.clone();
+    let root = dir.clone();
+    let worker = std::thread::spawn(move || d.select(&root, &["Docs".into()]));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !desktop.paused() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(desktop.paused());
+    assert!(desktop.begin_pass().is_none());
+    assert!(hydration_client::selection::read(&dir).unwrap().is_empty());
+    drop(pass);
+    worker.join().unwrap().unwrap();
+    assert_eq!(
+        hydration_client::selection::read(&dir).unwrap(),
+        vec!["Docs"]
+    );
+    assert!(!desktop.paused());
+    desktop.pause(7200);
+    desktop.select(&dir, &[]).unwrap();
+    assert!(
+        desktop.paused(),
+        "applying rules must not undo the user's pause"
+    );
+}
+
+#[test]
+fn large_reconciled_batch_persists_tail_hundred_in_single_pass_and_async_events_flush_on_drop() {
+    let dir = test_scratch::scratch(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+        "desktop-batch-flush",
+    );
+    let file = dir.join("history.json");
+    let _ = std::fs::remove_file(&file);
+    {
+        let desktop = Desktop::load(Some(file.clone()));
+        let mut applied = hydration_client::delta::Applied::default();
+        for i in 0..5_000 {
+            applied
+                .succeeded
+                .push((format!("Folder/file_{i}.txt"), "created".into()));
+        }
+        desktop.reconciled(&[], &applied);
+        desktop.push_event_async(
+            "Folder/live.txt",
+            "downloaded",
+            "File downloaded from cloud",
+        );
+    }
+    let reloaded = Desktop::load(Some(file));
+    let queue = Queue::new(Duration::from_secs(10), TestClock::default());
+    let state: Value =
+        serde_json::from_str(&reloaded.snapshot(Path::new("/sync"), &queue)).unwrap();
+    let history = state["history"].as_array().unwrap();
+    assert_eq!(history.len(), 100);
+    assert_eq!(history[0]["path"], "Folder/live.txt");
+    assert_eq!(history[1]["path"], "Folder/file_4999.txt");
+}

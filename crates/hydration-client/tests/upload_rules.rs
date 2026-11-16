@@ -513,3 +513,59 @@ fn run_upload_of_an_ignored_path_touches_no_sink() {
         sink.ops()
     );
 }
+
+#[test]
+fn excluding_a_queued_folder_takes_effect_before_another_scan() {
+    use std::os::unix::fs::MetadataExt;
+    let root = scratch("selection-queued");
+    std::fs::create_dir_all(root.join("Docs")).unwrap();
+    let path = root.join("Docs/edit.txt");
+    std::fs::write(&path, b"local edit").unwrap();
+    let mut store = Store::new();
+    store.scan(&root).unwrap();
+    let md = std::fs::metadata(&path).unwrap();
+    let id = FileId {
+        fsid: md.dev(),
+        ino: md.ino(),
+    };
+    hydration_client::selection::write(&root, &["Docs".into()]).unwrap();
+    let mut sink = Recorder::default();
+    assert!(matches!(
+        run_upload(id, &mut store, &mut sink),
+        Outcome::Ignored
+    ));
+    assert!(sink.ops().is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), b"local edit");
+    hydration_client::selection::write(&root, &[]).unwrap();
+    store.scan(&root).unwrap();
+    assert!(!store.path_is_ignored(&path));
+}
+
+#[test]
+fn a_restart_during_upload_converges_safely() {
+    let dir = scratch("restart-upload");
+    let clock = TestClock::default();
+    let mut store = Store::new();
+    store.scan(&dir).unwrap();
+
+    let path = dir.join("upload.txt");
+    std::fs::write(&path, b"data").unwrap();
+    let id = file_id(&path);
+
+    // Process starts, queue is populated (e.g. by scan_unidentified)
+    let mut q = Queue::new(DEBOUNCE, clock.clone());
+    q.touch(id);
+    clock.advance(DEBOUNCE * 2);
+
+    // Abort halfway by just creating a new queue and store
+    let mut q2 = Queue::new(DEBOUNCE, clock.clone());
+    q2.touch(id); // Simulating the daemon discovering it again
+
+    let mut store2 = Store::new();
+    store2.scan(&dir).unwrap();
+
+    let mut sink = Recorder::default();
+    let outcome = q2.run_one(id, &mut store2, &mut sink);
+
+    assert!(matches!(outcome, Outcome::Sent { .. }));
+}

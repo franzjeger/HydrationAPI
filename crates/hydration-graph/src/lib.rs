@@ -10,13 +10,7 @@
 //! crate root, so the internal `src/` split stays free to change without
 //! touching a single import in the tests.
 
-// The wire model is decoded in full and read selectively — `eTag`, `mimeType`,
-// `childCount`, `driveType` and the timestamps are all deserialised so that a
-// future reader has them, and none of them is consulted today. Dropping the
-// fields instead would make adding one a wire-format change rather than a
-// one-line read.
-#![allow(dead_code)]
-
+pub mod auth;
 /// OAuth: the device code flow and the shared token cache.
 ///
 /// The one part of this crate that is *not* flattened into the root. Its names
@@ -32,7 +26,8 @@
 /// `TokenSource`, and [`auth::TokenTransport`] — the refresh POST's socket — is
 /// implemented by `GraphTokens` over the same client configuration as
 /// everything else.
-pub mod auth;
+#[cfg(feature = "http")]
+pub mod conflicts;
 
 #[cfg(feature = "http")]
 mod access;
@@ -254,6 +249,11 @@ impl DriveScope {
 // `remoteItem` is what makes an inner tombstone delete the near placeholder.
 // ---------------------------------------------------------------------------
 
+// The wire model is decoded in full and read selectively — `eTag`, `mimeType`,
+// `childCount`, `driveType` and the timestamps are all deserialised so that a
+// future reader has them, and none of them is consulted today. Keep `dead_code`
+// scoped strictly to wire structs so dead logic elsewhere still fails lints.
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DriveItem {
@@ -285,6 +285,7 @@ pub struct DriveItem {
 }
 
 /// The half of a `driveItem` that a `remoteItem` may also carry.
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ItemBody {
@@ -303,6 +304,7 @@ struct ItemBody {
     shared: Option<SharedFacet>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FileFacet {
@@ -318,12 +320,14 @@ struct Hashes {
     sha1_hash: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FolderFacet {
     child_count: Option<u64>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct PackageFacet {
@@ -336,6 +340,7 @@ struct PackageFacet {
 #[serde(rename_all = "camelCase")]
 struct RootFacet {}
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct MalwareFacet {
@@ -345,30 +350,35 @@ struct MalwareFacet {
 /// `state` is optional on purpose: Graph sends bare `"deleted":{}` as well as
 /// `{"state":"deleted"}` and `{"state":"softDeleted"}`, and a non-optional
 /// field here fails to deserialise the first and takes the whole page with it.
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DeletedFacet {
     state: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct PendingOperations {
     pending_content_update: Option<PendingContentUpdate>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct PendingContentUpdate {
     queued_date_time: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SharedFacet {
     scope: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FileSystemInfo {
@@ -376,6 +386,7 @@ struct FileSystemInfo {
     last_modified_date_time: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ItemReference {
@@ -809,11 +820,16 @@ impl<W> QuickXorWriter<W> {
         }
     }
 
-    pub(crate) fn verify(mut self, expected: &str) -> io::Result<()> {
+    fn finish(mut self) -> String {
         for (slot, byte) in self.digest[12..].iter_mut().zip(self.length.to_le_bytes()) {
             *slot ^= byte;
         }
-        if base64_20(&self.digest) == expected {
+        base64_20(&self.digest)
+    }
+
+    #[cfg(feature = "http")]
+    pub(crate) fn verify(self, expected: &str) -> io::Result<()> {
+        if self.finish() == expected {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -859,10 +875,7 @@ pub fn quickxor_of(bytes: &[u8]) -> String {
     if w.write_all(bytes).is_err() {
         return String::new();
     }
-    for (slot, byte) in w.digest[12..].iter_mut().zip(w.length.to_le_bytes()) {
-        *slot ^= byte;
-    }
-    base64_20(&w.digest)
+    w.finish()
 }
 
 pub(crate) fn base64_20(bytes: &[u8; 20]) -> String {
@@ -1444,7 +1457,14 @@ impl Round {
     // cannot act on it. Boxing would move the cost to every caller for a value
     // constructed at most once per round.
     #[allow(clippy::result_large_err)]
-    pub fn finish(mut self) -> Result<CompletedRound, (Escalation, Report)> {
+    pub fn finish(self) -> Result<CompletedRound, (Escalation, Report)> {
+        self.finish_keeping_namespace().map(|(c, _)| c)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn finish_keeping_namespace(
+        mut self,
+    ) -> Result<(CompletedRound, Namespace), (Escalation, Report)> {
         self.report.unresolved_problems = self
             .namespace
             .problems()
@@ -1480,11 +1500,14 @@ impl Round {
                 self.report,
             ));
         };
-        Ok(CompletedRound {
-            changes: self.changes,
-            token,
-            report: self.report,
-        })
+        Ok((
+            CompletedRound {
+                changes: self.changes,
+                token,
+                report: self.report,
+            },
+            self.namespace,
+        ))
     }
 }
 
@@ -1796,14 +1819,14 @@ fn encode_tree(
     // a panic on the delta thread is not, because that thread is spawned bare
     // and never restarted.
     TreeBlob {
-        bytes: serde_json::to_vec(&stored).unwrap_or_default(),
+        bytes: serde_json::to_vec(&stored).unwrap_or_default().into(),
     }
 }
 
 /// The tree, encoded for storage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeBlob {
-    bytes: Vec<u8>,
+    bytes: std::sync::Arc<[u8]>,
 }
 
 impl TreeBlob {
@@ -1811,10 +1834,15 @@ impl TreeBlob {
         encode_tree(drive, tags, items, &[], FIRST_GENERATION)
     }
     pub fn from_bytes(bytes: Vec<u8>) -> TreeBlob {
-        TreeBlob { bytes }
+        TreeBlob {
+            bytes: bytes.into(),
+        }
     }
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.bytes, &other.bytes)
     }
 
     /// Every accessor goes through here, and every one of them is fallible.
@@ -1857,7 +1885,9 @@ impl TreeBlob {
         };
         stored.mounts = mounts.iter().map(StoredMount::from).collect();
         match serde_json::to_vec(&stored) {
-            Ok(bytes) => TreeBlob { bytes },
+            Ok(bytes) => TreeBlob {
+                bytes: bytes.into(),
+            },
             Err(_) => self,
         }
     }
@@ -2007,90 +2037,124 @@ enum Fault {
     Resync,
 }
 
+/// Warm in-memory representation of a verified `TreeBlob` so steady-state 30s
+/// delta rounds neither re-parse 90 MB of JSON nor rebuild a 165k-node
+/// `Namespace` when `StateStore::load()` returns the same `TreeBlob` allocation.
+#[derive(Clone)]
+struct ResidentTree {
+    blob: TreeBlob,
+    items: std::sync::Arc<[Item]>,
+    namespace: Namespace,
+    listing: Vec<Change>,
+    tags: TagSource,
+    mounts: Vec<MountPoint>,
+    generation: u64,
+}
+
 /// The store's answer, once it has been judged.
 ///
 /// Everything here has already survived the two questions that decide whether
 /// persisted state may be believed at all: does the tree parse, and does it
 /// describe *this* drive.
+#[derive(Clone)]
 struct StoredView {
-    items: Vec<Item>,
+    items: std::sync::Arc<[Item]>,
     tags: Option<TagSource>,
     mounts: Vec<MountPoint>,
     tokens: TokenBlob,
     generation: u64,
+    resident: Option<ResidentTree>,
 }
 
 impl StoredView {
     fn nothing() -> Self {
         Self {
-            items: Vec::new(),
+            items: Vec::new().into(),
             tags: None,
             mounts: Vec::new(),
             tokens: TokenBlob::new(),
             generation: 0,
+            resident: None,
         }
     }
 
-    fn read(scope: &DriveScope, state: Option<PersistedState>) -> Self {
+    fn from_persisted(
+        scope: &DriveScope,
+        state: Option<PersistedState>,
+        cached: &mut Option<ResidentTree>,
+    ) -> Self {
         let Some(state) = state else {
+            *cached = None;
             return Self::nothing();
         };
-        // The tree is judged first and a failure discards both halves. A token
-        // whose tree we do not have is the one unrecoverable state: resuming it
-        // builds the namespace out of only what changed since, so every
-        // unchanged file is absent from `listing()` forever and the next
-        // expired-token diff reads all of them as deletions.
         let Some(blob) = state.tree() else {
+            *cached = None;
             return Self::nothing();
         };
+        if let Some(res) = cached.as_ref() {
+            if res.blob.same_allocation(blob) {
+                let tokens = match state.token() {
+                    Some(t) if t.generation <= res.generation => t.clone(),
+                    _ => TokenBlob::new(),
+                };
+                return Self {
+                    items: std::sync::Arc::clone(&res.items),
+                    tags: Some(res.tags),
+                    mounts: res.mounts.clone(),
+                    tokens,
+                    generation: res.generation,
+                    resident: Some(res.clone()),
+                };
+            }
+        }
         let Ok(tree) = blob.decode() else {
+            *cached = None;
             return Self::nothing();
         };
         if tree.drive != scope.drive().as_str() {
-            // The user signed into a different account, or the site id changed.
-            // Kept whole would report every file of the old account as removed;
-            // merged, the new root is refused as `ForeignRoot` and every new
-            // item waits forever on a root that will never arrive.
+            *cached = None;
             return Self::nothing();
         }
         let tokens = match state.token() {
-            // A tree at least as new as its token is resumable; the replayed
-            // items are no-ops. A token ahead of its tree is discarded, and the
-            // tree is kept — that is the whole of the ordering rule, read back.
             Some(t) if t.generation <= tree.generation => t.clone(),
             _ => TokenBlob::new(),
         };
+        let items: std::sync::Arc<[Item]> = tree
+            .items
+            .into_iter()
+            .map(Item::from)
+            .collect::<Vec<_>>()
+            .into();
+        let namespace = Namespace::restore(items.iter().cloned());
+        let listing = namespace.listing();
+        let mounts: Vec<MountPoint> = tree.mounts.iter().filter_map(StoredMount::parse).collect();
+        let res = ResidentTree {
+            blob: blob.clone(),
+            items: std::sync::Arc::clone(&items),
+            namespace,
+            listing,
+            tags: tree.tags,
+            mounts: mounts.clone(),
+            generation: tree.generation,
+        };
+        *cached = Some(res.clone());
         Self {
-            items: tree.items.into_iter().map(Item::from).collect(),
+            items,
             tags: Some(tree.tags),
-            mounts: tree.mounts.iter().filter_map(StoredMount::parse).collect(),
+            mounts,
             tokens,
             generation: tree.generation,
+            resident: Some(res),
         }
     }
 }
 
-/// A completed round's two writes, derived and held back until the framework
-/// proves it applied the batch they describe.
-///
-/// A provider is never told a batch was applied. Committing at the end of the
-/// round that derived them therefore advances the durable position past changes
-/// the framework may never have seen — and a removal is the one change that
-/// cannot be recovered afterwards. Graph does not replay a consumed tombstone,
-/// `Namespace::listing()` cannot express a deletion, and the tree written
-/// alongside the token already agrees the object is gone, so no later diff can
-/// rediscover it either.
-///
-/// Deferring only the token is not enough, and that is not a guess: with the
-/// tree still written in-round, a restart resumes the older token and replays
-/// the tombstone, but `Namespace::apply(Item::Delete { id })` for an id the
-/// restored tree no longer holds emits no `Change` at all. The position
-/// recovers; the removal does not. So the pair moves together or not at all.
 struct Uncommitted {
     /// `None` when the round changed nothing and the tree on disk is still the
     /// one this token was derived after.
     tree: Option<TreeBlob>,
     token: TokenBlob,
+    resident: Option<ResidentTree>,
 }
 
 /// One completed pass over the feed, before anything is written.
@@ -2104,7 +2168,8 @@ struct Attempt {
     /// How many items the feed handed this round. Zero means nothing was applied
     /// and the tree on disk is still the tree.
     applied: usize,
-    items: Vec<Item>,
+    items: std::sync::Arc<[Item]>,
+    namespace: Option<Namespace>,
     mounts: Vec<MountPoint>,
     tokens: TokenBlob,
     tags: TagSource,
@@ -2124,6 +2189,7 @@ pub struct GraphDiscover<P: PageSource, S: StateStore, K: Sleeper> {
     /// provider about it again. A failed call is deliberately not remembered —
     /// a laptop that lost its network must retry the request, not be diagnosed
     /// as a wedged framework.
+    force_enumerate: bool,
     last_input: Option<Cursor>,
     served: Option<(Vec<Change>, Cursor)>,
     repeats: u32,
@@ -2142,6 +2208,7 @@ pub struct GraphDiscover<P: PageSource, S: StateStore, K: Sleeper> {
     /// applied.
     rounds: u64,
     escalation: Option<Escalation>,
+    cached_resident: Option<ResidentTree>,
 }
 
 impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
@@ -2151,12 +2218,14 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             pages,
             store,
             sleeper,
+            force_enumerate: false,
             last_input: None,
             served: None,
             repeats: 0,
             pending: None,
             rounds: 0,
             escalation: None,
+            cached_resident: None,
         }
     }
 
@@ -2228,7 +2297,11 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         if let Some(tree) = &pending.tree {
             self.store.save_tree(tree)?;
         }
-        self.store.save_token(&pending.token)
+        self.store.save_token(&pending.token)?;
+        if let Some(res) = pending.resident {
+            self.cached_resident = Some(res);
+        }
+        Ok(())
     }
 
     fn fail(&mut self, fault: Fault) -> io::Error {
@@ -2308,12 +2381,11 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             }
         }
 
-        let ns = if enumerate {
-            Namespace::new()
-        } else {
-            Namespace::restore(stored.items.clone())
-        };
-        let mut ns = Some(ns);
+        let can_skip_idle_rebuild = !enumerate
+            && stored.resident.as_ref().is_some_and(|r| {
+                r.namespace.problems().is_empty() && r.namespace.pending_ids().is_empty()
+            });
+
         let mut round: Option<Round> = None;
         let mut tags = stored.tags;
 
@@ -2339,11 +2411,6 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             loop {
                 fetched += 1;
                 if fetched > MAX_PAGES_PER_ROUND {
-                    // A chain of fresh links that never ends is an OOM of the
-                    // process that owns the upload queue, and killing that loses
-                    // queued uploads with no other copy. The budget belongs to
-                    // the round: held on the provider instead, a third round
-                    // would trip a limit the first two consumed.
                     return Err(Fault::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("the round exceeded {MAX_PAGES_PER_ROUND} pages"),
@@ -2352,37 +2419,37 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
 
                 let page = self.fetch(&scope, &what)?;
 
-                // Both links are read out before the page is handed over, since
-                // `feed` borrows it and the decision about what to do next is
-                // made from them.
                 let end = match &page.end {
                     PageEnd::More(n) => Err(n.as_str().to_string()),
                     PageEnd::Done(d) => Ok(d.as_str().to_string()),
                 };
 
-                match &mut round {
-                    Some(r) => r.feed(&scope, &page),
-                    None => {
-                        // The source is pinned once, from the first page, and
-                        // then persisted — never re-probed. A drive that starts
-                        // reporting cTags alongside its hashes would otherwise
-                        // flip every tag on it at once, and `is_current`
-                        // compares byte for byte, so the next pass would find
-                        // nothing current and dehydrate the whole drive.
-                        let pinned = tags.or_else(|| probe_tag_source(&page)).unwrap_or(
-                            // A first page with no file on it pins nothing
-                            // meaningful; the conventional source is the honest
-                            // default, and nothing reads a tag until a file
-                            // arrives. (A hash-only drive whose first page holds
-                            // no file would refuse its files for one round and
-                            // withhold the token, which is visible rather than
-                            // silent.)
-                            TagSource::CTag,
-                        );
-                        tags = Some(pinned);
-                        let mut r = Round::new(pinned, ns.take().unwrap_or_default());
-                        r.feed(&scope, &page);
-                        round = Some(r);
+                // Fast path for steady-state 30s idle polls: when resuming an
+                // already clean resident tree and the page carries zero items,
+                // avoid cloning or rebuilding the 165k-node Namespace at all.
+                if round.is_none() && can_skip_idle_rebuild && page.value.is_empty() {
+                    if tags.is_none() {
+                        tags = Some(TagSource::CTag);
+                    }
+                } else {
+                    match &mut round {
+                        Some(r) => r.feed(&scope, &page),
+                        None => {
+                            let pinned = tags
+                                .or_else(|| probe_tag_source(&page))
+                                .unwrap_or(TagSource::CTag);
+                            tags = Some(pinned);
+                            let base_ns = if enumerate {
+                                Namespace::new()
+                            } else if let Some(res) = &stored.resident {
+                                res.namespace.clone()
+                            } else {
+                                Namespace::restore(stored.items.iter().cloned())
+                            };
+                            let mut r = Round::new(pinned, base_ns);
+                            r.feed(&scope, &page);
+                            round = Some(r);
+                        }
                     }
                 }
 
@@ -2395,14 +2462,9 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
                         break;
                     }
                     Err(next) => {
-                        // Checked before it is fetched, not after: the fetch is
-                        // where the credential goes.
                         if !on_the_graph_endpoint(&next) {
                             return Err(Fault::Io(foreign_link(&next)));
                         }
-                        // A visited *set*, not a memory of the last link. `if
-                        // next == previous` is one-deep and a two-link cycle
-                        // walks straight through it.
                         if !visited.insert(next.clone()) {
                             return Err(Fault::Io(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -2414,8 +2476,6 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
                 }
             }
 
-            // Only now: a share becomes a scope once the page describing it has
-            // been mapped, so the queue grows as the round runs.
             if let Some(r) = &round {
                 for m in r.mounts().to_vec() {
                     queue_mount(&mut queue, &mut mounts, &m);
@@ -2423,49 +2483,51 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             }
         }
 
-        let round = match round {
-            Some(r) => r,
-            // Unreachable: the queue always holds the primary scope and its loop
-            // fetches at least one page or returns. Kept total rather than
-            // unwrapped, because a panic here kills the delta thread.
-            None => Round::new(TagSource::CTag, ns.take().unwrap_or_default()),
-        };
-        // Nothing is emitted for a scope that was never reached, so a mount the
-        // store knew about and this round could not queue must not survive into
-        // the tree as though it had.
         mounts.retain(|m| queue.iter().any(|s| s.drive() == m.remote.drive()));
 
+        // All scopes resumed cleanly with zero feed items: reuse resident tree!
+        if round.is_none() {
+            if let Some(res) = &stored.resident {
+                return Ok(Attempt {
+                    listing: res.listing.clone(),
+                    removals: Vec::new(),
+                    enumerated: false,
+                    applied: 0,
+                    items: std::sync::Arc::clone(&res.items),
+                    namespace: None,
+                    mounts,
+                    tokens,
+                    tags: tags.unwrap_or(res.tags),
+                });
+            }
+        }
+
+        let round = match round {
+            Some(r) => r,
+            None => Round::new(
+                tags.unwrap_or(TagSource::CTag),
+                if enumerate {
+                    Namespace::new()
+                } else {
+                    Namespace::restore(stored.items.iter().cloned())
+                },
+            ),
+        };
+
         let listing = round.namespace().listing();
-        let items = round.namespace().snapshot();
+        let items: std::sync::Arc<[Item]> = round.namespace().snapshot().into();
         let applied = round.applied();
-        // Taken before `finish` consumes the round, and *before* the round's own
-        // verdict is applied — but only unwrapped after it, so a round that was
-        // going to escalate anyway is reported as what it is rather than as a
-        // blast radius.
         let diff = if enumerate {
             Some(deletions_since(&stored.items, round.namespace()))
         } else {
             None
         };
-        let completed = round.finish().map_err(|(e, _)| Fault::Escalated(e))?;
+        let (completed, final_ns) = round
+            .finish_keeping_namespace()
+            .map_err(|(e, _)| Fault::Escalated(e))?;
         let diff = match diff {
             Some(Ok(gone)) => gone,
             Some(Err(Escalation::BlastRadius { removals, known })) => {
-                // A complete enumeration that is missing a large fraction of the
-                // stored tree is almost always a real mass deletion (user cleanup,
-                // OneDrive policy, a permission change) rather than a mistake —
-                // the truncated-enumeration case is already caught by the
-                // incomplete-round guard and never reaches `deletions_since`.
-                // Refusing here used to be a one-shot alarm, but the token is
-                // never advanced, so the next round re-enumerates the whole drive
-                // and refuses again: a permanent livelock that costs a full
-                // enumeration of CPU and memory every seven minutes.
-                //
-                // The round completes: the tree is updated to the new enumeration
-                // (which does not include the missing items), the token advances,
-                // and the local placeholders for the deleted items become
-                // local-only files the user can review and delete. The count is
-                // logged so the event is visible in the journal.
                 eprintln!(
                     "hydration-graph: deferred {removals} deletions \
                      (known {known}); the round completes without applying them"
@@ -2476,8 +2538,6 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             None => Vec::new(),
         };
 
-        // A tombstone this round consumed, and a deletion only the diff could
-        // find. Both are removals and neither can be re-derived from `listing()`.
         let mut removals: Vec<Change> = completed
             .changes
             .into_iter()
@@ -2495,6 +2555,7 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             enumerated: enumerate,
             applied,
             items,
+            namespace: Some(final_ns),
             mounts,
             tokens,
             tags: tags.unwrap_or(TagSource::CTag),
@@ -2502,14 +2563,14 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
     }
 
     fn run_round(&mut self) -> io::Result<(Vec<Change>, Cursor)> {
-        // Once per round, and re-read every round. An instance that loaded at
-        // construction holds a snapshot from before any of its siblings ran —
-        // `hydration-sync.rs` builds one provider per role at startup — and
-        // writes its stale tree back over their state with the newer token still
-        // in place, which is the unrecoverable pair produced without any crash.
-        let stored = StoredView::read(&self.scope, self.store.load()?);
+        // Always consult `self.store.load()` once per round so external store
+        // updates (e.g. a sibling instance) are never overwritten with stale
+        // state, while `ResidentTree` + `FileStateStore`'s inode stamp cache
+        // make unchanged rounds O(1) with zero JSON parsing or tree rebuilds.
+        let persisted = self.store.load()?;
+        let stored = StoredView::from_persisted(&self.scope, persisted, &mut self.cached_resident);
 
-        let attempted = match self.attempt(&stored, false) {
+        let attempted = match self.attempt(&stored, self.force_enumerate) {
             Err(Fault::Resync) => self.attempt(&stored, true),
             other => other,
         };
@@ -2518,38 +2579,7 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
             Err(f) => return Err(self.fail(f)),
         };
 
-        // Derive the tree and the token, and write neither. A round that
-        // completed is not a round that was applied, and only [`commit`] — on
-        // the next call that proves the framework moved on — puts either on
-        // disk. "Always write the tree, then decide about the token" satisfies
-        // every ordering assertion and destroys the state a refusal was
-        // protecting: the next round starts from a tree that agrees with the
-        // page it refused to trust.
-        // A round that changed nothing does not rewrite the tree.
-        //
-        // `encode_tree` serialises every object on the drive and `commit` writes
-        // the result. Measured on a live account on 2026-08-13: 167,890 objects,
-        // 67.6 MB, written every eight seconds to record that the cloud had not
-        // moved. That is where the daemon's 45% of a core went, and it grows
-        // with the user's file count, which is what made a large folder feel
-        // like the client's limit rather than the client's bug.
-        //
-        // The generation is what makes skipping it safe. A token may never be
-        // newer than the tree it was written after — that pair is unrecoverable
-        // and costs a full re-enumeration — so the token keeps the generation
-        // the tree on disk already carries. Equal is allowed; ahead is not.
-        // "Nothing was applied", not "no changes were emitted".
-        //
-        // A new empty folder emits no `Change` and still changes the tree, and
-        // `a_round_that_produced_no_changes_still_persists_its_tree` is the
-        // failure that follows from confusing the two: the token advances past
-        // the folder's creation, the feed never re-reports an unchanged folder,
-        // and every file that later arrives inside it waits forever for a parent
-        // that will never come. Sync stops permanently, on a folder.
-        //
-        // An empty feed is a different thing entirely. Nothing was applied, so
-        // the tree on disk is still the tree, and the only thing that moved is
-        // the delta link.
+        self.force_enumerate = false;
         let unchanged = !done.enumerated
             && done.applied == 0
             && done.removals.is_empty()
@@ -2560,60 +2590,49 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
         } else {
             stored.generation + 1
         };
-        let tree = if unchanged {
-            None
+        let (tree, next_resident) = if unchanged {
+            (None, None)
         } else {
-            Some(encode_tree(
+            let blob = encode_tree(
                 self.scope.drive(),
                 done.tags,
                 &done.items,
                 &done.mounts,
                 generation,
-            ))
+            );
+            let res = ResidentTree {
+                blob: blob.clone(),
+                items: std::sync::Arc::clone(&done.items),
+                namespace: done
+                    .namespace
+                    .unwrap_or_else(|| Namespace::restore(done.items.iter().cloned())),
+                listing: done.listing.clone(),
+                tags: done.tags,
+                mounts: done.mounts,
+                generation,
+            };
+            (Some(blob), Some(res))
         };
 
         let mut token = done.tokens;
         token.generation = generation;
 
         let Some(link) = token.get(self.scope.drive()).map(str::to_string) else {
-            // The primary scope always ends at a deltaLink or the attempt fails,
-            // so this cannot happen — and `Cursor(None)` on a batch would make
-            // the driver reset to an empty cursor and re-enumerate the whole
-            // drive every pass, so it is refused rather than returned.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "the round derived no token for the drive it was syncing",
             ));
         };
 
-        // Held, not written. A crash from here until the next accepted pass
-        // costs one round trip and nothing else: the older token is still on
-        // disk, so the round — tombstones included — is simply run again.
-        self.pending = Some(Uncommitted { tree, token });
+        self.pending = Some(Uncommitted {
+            tree,
+            token,
+            resident: next_resident,
+        });
 
         self.rounds += 1;
         let cursor = Cursor(Some(format!("r{}:{link}", self.rounds)));
 
-        // The batch is the tree plus this round's removals, never the round's
-        // own change list. After a restart the framework's `Store` knows only
-        // what is on disk, so filtering to what the service said changed means a
-        // placeholder the user deleted locally never comes back — and the
-        // restart is exactly when the framework has lost every other way to find
-        // out. Removals first: they free the paths the upserts may claim.
-        // The batch is the tree plus this round's removals, never the round's
-        // own change list. After a restart the framework's `Store` knows only
-        // what is on disk, so filtering to what the service said changed means a
-        // placeholder the user deleted locally never comes back — and the
-        // restart is exactly when the framework has lost every other way to find
-        // out. Removals first: they free the paths the upserts may claim.
-        //
-        // Narrowing this to the round's own changes was tried, on the grounds
-        // that the five hundredth quiet round has nothing new to re-assert, and
-        // `a_quiet_steady_state_round_reports_the_tree_rather_than_an_empty_batch`
-        // refused it. It is right to: a quiet round would then be
-        // `(vec![], new_cursor)`, which is the shape PROVIDER.md:103 forbids and
-        // which one framework version ago consumed a refusal that had been
-        // deliberately held back.
         let mut batch = done.removals;
         batch.extend(done.listing);
         Ok((batch, cursor))
@@ -2623,6 +2642,12 @@ impl<P: PageSource, S: StateStore, K: Sleeper> GraphDiscover<P, S, K> {
 impl<P: PageSource, S: StateStore, K: Sleeper> hydration_client::delta::Discover
     for GraphDiscover<P, S, K>
 {
+    fn refresh(&mut self) {
+        self.force_enumerate = true;
+        self.pending = None;
+        self.last_input = None;
+        self.served = None;
+    }
     fn changes(&mut self, cursor: &Cursor) -> io::Result<(Vec<Change>, Cursor)> {
         if let Some(served) = self.repeat(cursor) {
             // A repeat is the framework saying it could not apply the batch, so
@@ -2871,6 +2896,11 @@ pub struct Reply {
 /// [`PageSource`] for the read half and [`auth::TokenTransport`] for the
 /// credential.
 pub trait Transport: Send {
+    fn set_transfer(
+        &mut self,
+        _transfer: Option<std::sync::Arc<hydration_client::transfers::Transfer>>,
+    ) {
+    }
     fn send(&mut self, request: &Request) -> io::Result<Reply>;
 }
 
@@ -2947,6 +2977,8 @@ impl ConflictBehavior {
 /// The tag comes from the persisted tree — not from a `GET` issued just before
 /// the write, which is a precondition that can never fail.
 pub struct GraphSink<T: Transport, K: Sleeper> {
+    monitor: Option<std::sync::Arc<hydration_client::transfers::Transfers>>,
+    active_transfer: Option<std::sync::Arc<hydration_client::transfers::Transfer>>,
     scope: DriveScope,
     root: std::path::PathBuf,
     tags: TagSource,
@@ -2965,6 +2997,8 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
         sleeper: K,
     ) -> Self {
         Self {
+            monitor: None,
+            active_transfer: None,
             scope,
             root: root.into(),
             tags,
@@ -2973,6 +3007,14 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
             transport,
             sleeper,
         }
+    }
+
+    pub fn with_monitor(
+        mut self,
+        monitor: Option<std::sync::Arc<hydration_client::transfers::Transfers>>,
+    ) -> Self {
+        self.monitor = monitor;
+        self
     }
 
     pub fn with_policy(mut self, policy: UploadPolicy) -> Self {
@@ -3116,7 +3158,7 @@ fn item_metadata_url(key: &ObjectKey) -> String {
 /// does: a `#` in a file name would otherwise cut the URL short and address the
 /// *parent*, and a `%` or a `?` would turn the rest of the name into an escape
 /// or a query — each of which lands a create on an object the user never named.
-fn encode_path(rel: &str) -> String {
+pub(crate) fn encode_path(rel: &str) -> String {
     let mut out = String::with_capacity(rel.len());
     for b in rel.bytes() {
         match b {
@@ -4090,6 +4132,9 @@ impl<T: Transport, K: Sleeper> GraphSink<T, K> {
                     } else {
                         stalls = 0;
                     }
+                    if let Some(t) = &self.active_transfer {
+                        t.confirm(next);
+                    }
                     offset = next;
                 }
                 416 => {
@@ -4174,8 +4219,8 @@ enum Transferred {
     Abandoned(io::Error),
 }
 
-impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K> {
-    fn upload(
+impl<T: Transport, K: Sleeper> GraphSink<T, K> {
+    fn upload_inner(
         &mut self,
         path: &std::path::Path,
         existing: Option<hydration_client::upload::Known<'_>>,
@@ -4284,6 +4329,41 @@ impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K
             }
             None => self.put_at_path(&rel, body),
         }
+    }
+}
+
+impl<T: Transport, K: Sleeper> hydration_client::upload::Sink for GraphSink<T, K> {
+    fn upload(
+        &mut self,
+        path: &std::path::Path,
+        existing: Option<hydration_client::upload::Known<'_>>,
+    ) -> io::Result<Uploaded> {
+        let size = std::fs::metadata(path)?.len();
+        let name = path
+            .strip_prefix(&self.root)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        let running = self.monitor.as_ref().map(|m| {
+            m.begin(
+                name,
+                hydration_client::transfers::Direction::Upload,
+                size,
+                0,
+                size,
+            )
+        });
+        self.active_transfer = running.as_ref().map(|r| std::sync::Arc::clone(&r.transfer));
+        self.transport.set_transfer(self.active_transfer.clone());
+        let result = self.upload_inner(path, existing);
+        if result.is_ok() {
+            if let Some(t) = &self.active_transfer {
+                t.confirm(size);
+            }
+        }
+        self.transport.set_transfer(None);
+        self.active_transfer = None;
+        result
     }
 
     fn move_item(

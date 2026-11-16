@@ -11,6 +11,7 @@
 
 pub mod daemon_loop;
 pub mod delta;
+pub mod desktop;
 pub mod evict_policy;
 pub mod lineage;
 pub mod manifest;
@@ -20,7 +21,9 @@ pub mod place;
 pub mod providers;
 pub mod reclaim;
 pub mod removals;
+pub mod selection;
 pub mod store;
+pub mod transfers;
 pub mod upload;
 pub mod wire;
 
@@ -42,6 +45,9 @@ pub use store::{Entry, Store};
 /// get right on its own. What is left is the part only the client knows: how to
 /// talk to its service.
 pub trait Provider: Send {
+    /// Metadata-only display name for the next fetch. Providers may ignore it.
+    fn set_path(&mut self, _path: &str) {}
+
     /// Write `span` of the object into `out`.
     ///
     /// Streamed rather than returned, because the previous shape — hand back a
@@ -137,6 +143,7 @@ pub struct Daemon<P: Provider> {
     /// "downloading N". Defaults to this daemon's own counter; the run loop
     /// replaces it with one shared with the broadcaster via [`Daemon::track_fetches`].
     in_flight: Arc<AtomicU64>,
+    hints: Option<store::SharedHints>,
 }
 
 /// Raises the in-flight fetch count for as long as it is alive.
@@ -180,6 +187,7 @@ pub trait Changes: Send {
     /// owes the user visibility, so a client that leaves it defaulted is
     /// choosing not to tell them.
     fn exposed(&mut self, _mounts: &[String]) {}
+    fn fetched(&mut self, _path: &str) {}
 }
 
 impl<P: Provider> Daemon<P> {
@@ -193,7 +201,15 @@ impl<P: Provider> Daemon<P> {
             changes: None,
             exposures: Vec::new(),
             in_flight: Arc::new(AtomicU64::new(0)),
+            hints: None,
         })
+    }
+
+    /// Attach a shared `(FileId -> PathBuf)` hint map updated by delta placement
+    /// and eviction swaps so newly created placeholders resolve in O(1) without
+    /// scanning the entire directory tree on first `read()`.
+    pub fn with_hints(&mut self, hints: store::SharedHints) {
+        self.hints = Some(hints);
     }
 
     /// Share the in-flight fetch counter with the status broadcaster, so the
@@ -273,6 +289,12 @@ impl<P: Provider> Daemon<P> {
                         // for — never from something the provider has yet to
                         // deliver. `Body` then holds it to that.
                         let mut body = conn.begin(req.id, span.len)?;
+                        let path = self
+                            .store
+                            .lookup(&req.file)
+                            .and_then(|e| crate::lineage::relative(&self.root, &e.path))
+                            .unwrap_or_default();
+                        self.provider.set_path(&path);
                         match self.provider.fetch(
                             &cloud_id,
                             size,
@@ -281,11 +303,20 @@ impl<P: Provider> Daemon<P> {
                             &mut body,
                         ) {
                             Ok(()) => {
-                                // A short delivery becomes an abort here rather
-                                // than a truncated file; `finish` sends it and
-                                // reports the error.
-                                if let Err(e) = body.finish() {
-                                    eprintln!("hydration: {cloud_id} ended short: {e}");
+                                // Finish the protocol frame *before* notifying
+                                // `changes`: `body.finish()` delivers `Done` to
+                                // `hydrationd` so the user's blocked `read()`
+                                // wakes immediately, and a short delivery aborts
+                                // instead of falsely recording a completed download.
+                                match body.finish() {
+                                    Ok(()) => {
+                                        if let Some(sink) = self.changes.as_mut() {
+                                            sink.fetched(&path);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("hydration: {cloud_id} ended short: {e}");
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -337,7 +368,17 @@ impl<P: Provider> Daemon<P> {
         file: FileId,
     ) -> Result<(String, u64, Option<String>), Refusal> {
         if self.store.lookup(&file).is_none() {
-            let _ = self.rescan();
+            let hinted = self
+                .hints
+                .as_ref()
+                .and_then(|h| h.read().ok())
+                .and_then(|map| map.get(&file).cloned());
+            if let Some(path) = hinted {
+                self.store.remember(file, &path);
+            }
+            if self.store.lookup(&file).is_none() {
+                let _ = self.rescan();
+            }
         }
         self.resolve(file)
     }
@@ -401,5 +442,58 @@ mod tests {
             0,
             "the early return dropped the guard and cleared the count"
         );
+    }
+
+    struct NoopProvider;
+    impl Provider for NoopProvider {
+        fn fetch(
+            &mut self,
+            _cloud_id: &str,
+            _size: u64,
+            _content_tag: Option<&str>,
+            _span: Span,
+            _out: &mut Body<'_>,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn shared_hints_resolve_post_scan_placeholder_without_tree_rescan() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = test_scratch::scratch(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"),
+            "daemon-hints/post-scan",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let hints = store::new_shared_hints();
+        let mut daemon = Daemon::new(NoopProvider, &dir).unwrap();
+        daemon.with_hints(Arc::clone(&hints));
+        assert_eq!(daemon.store().len(), 0);
+
+        // Create both an unhinted bystander and a hinted placeholder after `Daemon::new`.
+        let bystander = dir.join("unhinted.bin");
+        std::fs::write(&bystander, b"x").unwrap();
+
+        let placed = dir.join("hinted.bin");
+        std::fs::write(&placed, b"abcd").unwrap();
+        store::set_xattr(&placed, store::XATTR_ID, b"cloud-hinted").unwrap();
+        store::set_xattr(&placed, store::XATTR_ETAG, b"etag-hinted").unwrap();
+        store::record_hint_for_path(&hints, &placed);
+
+        let md = std::fs::metadata(&placed).unwrap();
+        let fid = FileId {
+            fsid: md.dev(),
+            ino: md.ino(),
+        };
+        let (cid, size, tag) = daemon.resolve_or_rescan(fid).unwrap();
+        assert_eq!(cid, "cloud-hinted");
+        assert_eq!(size, 4);
+        assert_eq!(tag.as_deref(), Some("etag-hinted"));
+        // Proves O(1) hint resolution ran instead of a full-tree `rescan()`
+        // (which would also have indexed `unhinted.bin`).
+        assert_eq!(daemon.store().len(), 1);
     }
 }

@@ -102,7 +102,9 @@ fn unique_mnt_id(path: &Path) -> io::Result<u64> {
 }
 
 fn statx_mnt_id(dirfd: libc::c_int, path: &std::ffi::CStr, flags: libc::c_int) -> io::Result<u64> {
+    // SAFETY: `libc::statx` is a POD C struct safe to zero-initialize.
     let mut sx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a valid NUL-terminated C string and `sx` points to writable `statx` storage.
     let rc = unsafe {
         libc::statx(
             dirfd,
@@ -127,6 +129,48 @@ fn statx_mnt_id(dirfd: libc::c_int, path: &std::ffi::CStr, flags: libc::c_int) -
         ));
     }
     Ok(sx.stx_mnt_id)
+}
+
+/// Decode octal escapes (`\040`, `\011`, `\012`, `\134`, ...) in `/proc/self/mountinfo`
+/// and `/etc/fstab` fields while preserving raw UTF-8 byte sequences intact.
+///
+/// Rebuilt as raw bytes (`Vec<u8>`) before UTF-8 decoding: `out.push(b as char)`
+/// reinterprets non-ASCII UTF-8 bytes as Latin-1 code points, corrupting paths
+/// such as `/home/frank/Pärm` or `/home/frank/Blåbær` into mojibake.
+pub fn unescape_mountinfo(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() {
+            if let Some(c) = std::str::from_utf8(&b[i + 1..i + 4])
+                .ok()
+                .and_then(|o| u8::from_str_radix(o, 8).ok())
+            {
+                out.push(c);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Strip non-root trailing slashes so `/home/u/OneDrive/` matches `/home/u/OneDrive`
+/// as reported in `/proc/self/mountinfo`.
+pub fn trim_mount_path(s: &str) -> &str {
+    if s == "/" {
+        "/"
+    } else {
+        let trimmed = s.trim_end_matches('/');
+        if trimmed.is_empty() {
+            "/"
+        } else {
+            trimmed
+        }
+    }
 }
 
 #[cfg(test)]
@@ -167,5 +211,18 @@ mod tests {
             MountIdentity::of_fd(f.as_fd()).unwrap(),
             MountIdentity::capture(Path::new("/")).unwrap()
         );
+    }
+
+    #[test]
+    fn unescape_mountinfo_preserves_utf8_and_decodes_octal_escapes() {
+        assert_eq!(
+            unescape_mountinfo("/home/frank/Blåbær\\040Skog/Pärm"),
+            "/home/frank/Blåbær Skog/Pärm"
+        );
+        assert_eq!(
+            trim_mount_path("/home/frank/OneDrive/"),
+            "/home/frank/OneDrive"
+        );
+        assert_eq!(trim_mount_path("/"), "/");
     }
 }

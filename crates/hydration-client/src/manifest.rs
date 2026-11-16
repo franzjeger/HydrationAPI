@@ -146,10 +146,31 @@ impl Manifest {
     /// The same atomic-save shape §5.4 is about, applied to ourselves.
     pub fn write(&self, root: &Path) -> io::Result<PathBuf> {
         let target = root.join(MANIFEST_NAME);
-        let tmp = root.join(format!("{MANIFEST_NAME}.tmp"));
-        std::fs::write(&tmp, self.render())?;
-        std::fs::rename(&tmp, &target)?;
+        write_manifest_atomic(root, &target, &self.render())?;
         Ok(target)
+    }
+
+    /// Write the manifest only when its rendered bytes differ from the previous
+    /// write or the on-disk file disappeared/changed size — avoiding ~12.4 GB/day
+    /// of redundant 43 MB SSD rewrites on an idle 165k-file drive.
+    pub fn write_if_changed(
+        &self,
+        root: &Path,
+        last_sig: &mut Option<(usize, u64)>,
+    ) -> io::Result<bool> {
+        let rendered = self.render();
+        let sig = (rendered.len(), fnv1a_64(rendered.as_bytes()));
+        let target = root.join(MANIFEST_NAME);
+        if *last_sig == Some(sig)
+            && std::fs::metadata(&target)
+                .map(|m| m.is_file() && m.len() == rendered.len() as u64)
+                .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        write_manifest_atomic(root, &target, &rendered)?;
+        *last_sig = Some(sig);
+        Ok(true)
     }
 
     /// Human-readable on purpose.
@@ -291,6 +312,29 @@ pub fn status_line(policy: BackupPolicy, dehydrated: usize) -> String {
 /// flag means. See `hydration_protocol::flags` for why the request numbers are
 /// computed rather than pasted.
 pub use hydration_protocol::flags::{has_nodump, set_nodump};
+
+fn write_manifest_atomic(root: &Path, target: &Path, rendered: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    let tmp = root.join(format!("{MANIFEST_NAME}.tmp"));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    f.write_all(rendered.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, target)
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
 
 fn string_xattr(path: &Path, name: &str) -> Option<String> {
     store::get_xattr(path, name)

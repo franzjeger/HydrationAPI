@@ -2,3 +2,9 @@ target/
 *.o
 *.img
 probes/build/
+*.orig
+*.rej
+*.patch
+patch_*.diff
+strace.out*
+

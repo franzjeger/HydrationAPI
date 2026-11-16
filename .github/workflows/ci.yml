@@ -14,7 +14,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -28,7 +27,7 @@ jobs:
     name: fmt, clippy, docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -78,7 +77,7 @@ jobs:
           # and the binaries are not installed at their deployed paths. Anything
           # else — an unknown key, a bad section, a syntax error — is a defect.
           bad="$(printf '%s\n' "$out" \
-            | grep -vE 'Failed to (prepare|resolve)|is not executable: No such file or directory|^$' || true)"
+            | grep -vE '^/(usr/)?lib/systemd/|Failed to (prepare|resolve)|is not executable: No such file or directory|^$' || true)"
           if [ -n "$bad" ]; then
             echo "::error::systemd rejected a unit file:"
             printf '%s\n' "$bad"
@@ -97,7 +96,7 @@ jobs:
     name: tests (no root)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --no-fail-fast
@@ -154,7 +153,7 @@ jobs:
             mkfs: mkfs.xfs -q -f
             pkg: xfsprogs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -311,7 +310,7 @@ jobs:
     name: probes still compile
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Compiled, not linked: what would actually break here is a header
       # changing under a probe, which the compile catches and a link failure

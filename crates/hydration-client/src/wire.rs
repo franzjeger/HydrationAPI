@@ -18,6 +18,7 @@ pub fn encode_path(path: &str) -> String {
         match c {
             '\\' => out.push_str("\\\\"),
             ' ' => out.push_str("\\s"),
+            '\t' => out.push_str("\\t"),
             '=' => out.push_str("\\e"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
@@ -38,6 +39,7 @@ pub fn decode_path(token: &str) -> String {
             match chars.next() {
                 Some('\\') => out.push('\\'),
                 Some('s') => out.push(' '),
+                Some('t') => out.push('\t'),
                 Some('e') => out.push('='),
                 Some('n') => out.push('\n'),
                 Some('r') => out.push('\r'),
@@ -68,15 +70,16 @@ mod tests {
 
     #[test]
     fn the_tricky_characters_round_trip() {
-        let p = "a\\b c=d\ne\r";
+        let p = "a\\b c\td=e\nf\r";
         assert_eq!(decode_path(&encode_path(p)), p);
     }
 
     #[test]
     fn an_encoded_path_needs_no_whitespace_or_equals() {
-        let p = "a b=c d";
+        let p = "a b\tc=d e";
         let enc = encode_path(p);
         assert!(!enc.contains(' '));
+        assert!(!enc.contains('\t'));
         assert!(!enc.contains('='));
         assert!(!enc.contains('\n'));
     }

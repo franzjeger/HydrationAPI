@@ -8,6 +8,8 @@ description = "The unprivileged sync daemon: credentials, cloud access, state"
 [dependencies]
 hydration-protocol = { path = "../hydration-protocol" }
 libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 test-scratch.workspace = true

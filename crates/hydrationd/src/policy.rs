@@ -134,14 +134,21 @@ fn pid_from_pidfd(pidfd: BorrowedFd<'_>) -> io::Result<i32> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Pid in fdinfo"))
 }
 
+const DENIALS_KEPT: usize = 64;
+
 /// A record of every refusal, so a denial is never silent.
 ///
 /// §6c is explicit that the list is a product, not a setting: a user whose
 /// backup started complaining has to be able to find out why in one place. A
 /// policy that quietly refuses is a worse failure than no policy at all.
+///
+/// Aggregated incrementally in `counts` with a bounded `recent` ring buffer so
+/// a backup sweep across 165,000+ placeholders stays O(1) in both CPU and RAM.
 #[derive(Debug, Default)]
 pub struct DenialLog {
-    entries: Vec<Denial>,
+    counts: std::collections::BTreeMap<String, usize>,
+    recent: std::collections::VecDeque<Denial>,
+    total: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,25 +160,30 @@ pub struct Denial {
 
 impl DenialLog {
     pub fn record(&mut self, cgroup: &str, rule: &str, path: Option<&Path>) {
-        self.entries.push(Denial {
+        self.total += 1;
+        *self.counts.entry(rule.to_string()).or_default() += 1;
+        if self.recent.len() == DENIALS_KEPT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(Denial {
             cgroup: cgroup.to_string(),
             rule: rule.to_string(),
             path: path.map(|p| p.display().to_string()),
         });
     }
 
-    pub fn entries(&self) -> &[Denial] {
-        &self.entries
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    pub fn recent(&self) -> impl DoubleEndedIterator<Item = &Denial> {
+        self.recent.iter()
     }
 
     /// What the user is shown. Grouped by rule, because "restic was refused
     /// 412 times" is the sentence they need, not 412 lines.
     pub fn summary(&self) -> Vec<(String, usize)> {
-        let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-        for e in &self.entries {
-            *counts.entry(e.rule.clone()).or_default() += 1;
-        }
-        counts.into_iter().collect()
+        self.counts.iter().map(|(r, n)| (r.clone(), *n)).collect()
     }
 }
 

@@ -1380,21 +1380,37 @@ impl<F: Fetch + 'static> Worker<F> {
         (st.st_nlink == 0 && st.st_size == 0).then_some(Handled::Empty)
     }
 
-    /// Run until the deadline, answering everything that arrives.
+    /// Run until the deadline, collecting every [`Handled`] outcome for tests.
     pub fn run(&mut self, until: std::time::Instant) -> io::Result<Vec<Handled>> {
+        let mut seen = Vec::new();
+        self.run_loop(Some(until), |h| seen.push(h))?;
+        Ok(seen)
+    }
+
+    /// Production event loop: runs with no artificial deadline and retains no
+    /// per-event `Vec<Handled>` history in the long-lived `OOMScoreAdjust=-900`
+    /// worker process.
+    pub fn serve(&mut self) -> io::Result<()> {
+        self.run_loop(None, |_| {})
+    }
+
+    fn run_loop(
+        &mut self,
+        until: Option<std::time::Instant>,
+        mut on_handled: impl FnMut(Handled),
+    ) -> io::Result<()> {
         if std::env::var_os("HYDRATIOND_TRACE").is_some() {
             eprintln!("[worker] loop start, group fd={}", self.group.as_raw());
         }
-        let mut seen = Vec::new();
         let mut buf = vec![0u8; 64 * 1024];
 
-        while std::time::Instant::now() < until {
+        while until.is_none_or(|limit| std::time::Instant::now() < limit) {
             // §6c requires the denial log to be *visible*. A count kept in
             // memory and never shown is the same failure as everything else
             // here: something the user would want to know, known and not said.
             // Reported when it changes, so a quiet system stays quiet and a
             // backup sweep being refused announces itself.
-            let denials = self.log.entries().len();
+            let denials = self.log.total();
             if denials != self.reported_denials {
                 self.reported_denials = denials;
                 eprintln!(
@@ -1443,6 +1459,7 @@ impl<F: Fetch + 'static> Worker<F> {
                 events: libc::POLLIN,
                 revents: 0,
             };
+            // SAFETY: `pfd` is a valid single-element pollfd struct on the stack.
             let n = unsafe { libc::poll(&mut pfd, 1, 200) };
             if n <= 0 {
                 continue;
@@ -1452,10 +1469,10 @@ impl<F: Fetch + 'static> Worker<F> {
                 eprintln!("[worker] read {len} bytes of events");
             }
             for ev in fanotify::events(&buf, len) {
-                seen.push(self.handle(&ev));
+                on_handled(self.handle(&ev));
             }
         }
-        Ok(seen)
+        Ok(())
     }
 }
 
@@ -1490,7 +1507,7 @@ pub fn spawn_split<F: Fetch + 'static>(
         // Worker.
         let until = std::time::Instant::now() + worker_deadline;
         let mut w = Worker::new(group, fetch, policy, worker_view);
-        let _ = w.run(until);
+        let _ = w.run_loop(Some(until), |_| {});
         // Deliberately _exit: no destructors, no flushing a parent's buffers.
         unsafe { libc::_exit(0) };
     }
@@ -1559,10 +1576,13 @@ impl SplitHandle {
                 beat = now;
                 moved = std::time::Instant::now();
             }
-            // Only a worker that is *holding something* can be stalling. An idle
-            // worker makes no progress either, and treating that as a fault
-            // would tear the mount down every time nobody is reading.
-            if self.in_flight.current().is_some() && moved.elapsed() >= stall_after {
+            // Only a worker that is *holding something* can be stalling. Idle
+            // stretches do not accumulate stall debt: reset `moved` whenever no
+            // event is held so the first read after >90s of silence gets a full
+            // fresh `stall_after` window.
+            if self.in_flight.current().is_none() {
+                moved = std::time::Instant::now();
+            } else if moved.elapsed() >= stall_after {
                 stalled = true;
                 break;
             }
@@ -1574,7 +1594,7 @@ impl SplitHandle {
                     stalled: false,
                 });
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
 
         if stalled {

@@ -25,6 +25,9 @@ use std::sync::{Arc, Mutex};
 pub struct HelperConn {
     reader: BufReader<UnixStream>,
     writer: Arc<Mutex<UnixStream>>,
+    /// Reusable chunk buffer allocated lazily once on first streamed transfer,
+    /// avoiding a 1 MiB heap allocation + zero-fill on every small read event.
+    chunk_buf: Vec<u8>,
 }
 
 /// A send-only handle onto a [`HelperConn`], for threads that only report.
@@ -70,12 +73,43 @@ fn split(stream: UnixStream) -> io::Result<(BufReader<UnixStream>, UnixStream)> 
     Ok((BufReader::new(stream), writer))
 }
 
+/// Maximum length of a JSON control/header line sent from the unprivileged sync
+/// daemon to `hydrationd`. Binary body bytes travel as fixed-size raw chunks
+/// after `ToHelper::Chunk`, so legitimate `ToHelper` lines are under a few KiB;
+/// capping this prevents an unprivileged peer without a newline from OOM-killing
+/// the `CAP_SYS_ADMIN` root helper.
+const MAX_TO_HELPER_LINE: usize = 64 * 1024;
+
+/// Maximum length of a JSON line sent from `hydrationd` to the sync daemon
+/// (sized for a 16,384-inode `FromHelper::Changed` batch with generous headroom).
+const MAX_FROM_HELPER_LINE: usize = 4 * 1024 * 1024;
+
+fn read_bounded_line(reader: &mut impl BufRead, max_bytes: usize) -> io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    let n = reader
+        .take((max_bytes + 1) as u64)
+        .read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() > max_bytes && !buf.ends_with(b"\n") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("protocol JSON frame exceeded {max_bytes}-byte safety cap"),
+        ));
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 impl HelperConn {
     pub fn new(stream: UnixStream) -> io::Result<Self> {
         let (reader, writer) = split(stream)?;
         Ok(Self {
             reader,
             writer: Arc::new(Mutex::new(writer)),
+            chunk_buf: Vec::new(),
         })
     }
 
@@ -143,15 +177,15 @@ impl HelperConn {
             ));
         }
         let mut total = 0u64;
-        let mut buf = vec![0u8; crate::MAX_CHUNK as usize];
+        let mut ready_seen = false;
+        let mut ignored_control = 0u32;
         loop {
-            let mut line = String::new();
-            if self.reader.read_line(&mut line)? == 0 {
+            let Some(line) = read_bounded_line(&mut self.reader, MAX_TO_HELPER_LINE)? else {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "the sync daemon closed the connection mid-transfer",
                 ));
-            }
+            };
             let msg = decode::<ToHelper>(&line).map_err(io::Error::other)?;
             // Every frame must answer the request that is outstanding.
             //
@@ -177,6 +211,12 @@ impl HelperConn {
             }
             match msg {
                 ToHelper::Fetch(FetchResponse::Ready { len, .. }) => {
+                    if ready_seen {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("duplicate Ready frame for request {want_id}"),
+                        ));
+                    }
                     if len != expected {
                         // Refused on the declaration, before the body. The stream
                         // is now out of step, so the caller must drop the
@@ -186,8 +226,15 @@ impl HelperConn {
                             format!("daemon offered {len} bytes for a {expected}-byte placeholder"),
                         ));
                     }
+                    ready_seen = true;
                 }
                 ToHelper::Chunk { len, .. } => {
+                    if !ready_seen {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Chunk frame preceded Ready for request {want_id}"),
+                        ));
+                    }
                     // A zero-length chunk is not progress, and treating it as
                     // such let a daemon reset the worker's stall clock forever
                     // without delivering a byte. Refused at the frame, so the
@@ -202,12 +249,21 @@ impl HelperConn {
                         ));
                     }
                     let n = len as usize;
-                    self.reader.read_exact(&mut buf[..n])?;
-                    dest(&buf[..n], total)?;
+                    if self.chunk_buf.len() < n {
+                        self.chunk_buf.resize(crate::MAX_CHUNK as usize, 0);
+                    }
+                    self.reader.read_exact(&mut self.chunk_buf[..n])?;
+                    dest(&self.chunk_buf[..n], total)?;
                     total += len;
                     on_progress(total);
                 }
                 ToHelper::Done { .. } => {
+                    if !ready_seen {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Done frame preceded Ready for request {want_id}"),
+                        ));
+                    }
                     if total != expected {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -219,8 +275,25 @@ impl HelperConn {
                 ToHelper::Abort { errno, reason, .. } => {
                     return Ok(Streamed::Aborted { errno, reason });
                 }
-                ToHelper::Fetch(other) => return Ok(Streamed::Refused(other)),
-                ToHelper::Control(_) => continue,
+                ToHelper::Fetch(other) => {
+                    if ready_seen {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unexpected FetchResponse after Ready for request {want_id}"),
+                        ));
+                    }
+                    return Ok(Streamed::Refused(other));
+                }
+                ToHelper::Control(_) => {
+                    ignored_control += 1;
+                    if ignored_control > 64 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "excessive unsolicited Control frames during active transfer",
+                        ));
+                    }
+                    continue;
+                }
             }
         }
     }
@@ -232,13 +305,12 @@ impl HelperConn {
     /// refused before a single byte is read, so a daemon claiming a 4 GB body
     /// for a 12-byte file gets a rejection, not an allocation.
     pub fn recv(&mut self, expected: u64) -> io::Result<(FetchResponse, Vec<u8>)> {
-        let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
+        let Some(line) = read_bounded_line(&mut self.reader, MAX_TO_HELPER_LINE)? else {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "the sync daemon closed the connection",
             ));
-        }
+        };
         let msg: ToHelper = decode(&line).map_err(io::Error::other)?;
         let ToHelper::Fetch(resp) = msg else {
             return Err(io::Error::new(
@@ -417,10 +489,9 @@ impl DaemonConn {
 
     /// Wait for the next thing the helper wants. `None` means it went away.
     pub fn recv(&mut self) -> io::Result<Option<FromHelper>> {
-        let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
+        let Some(line) = read_bounded_line(&mut self.reader, MAX_FROM_HELPER_LINE)? else {
             return Ok(None);
-        }
+        };
         decode(&line).map(Some).map_err(io::Error::other)
     }
 
@@ -601,5 +672,48 @@ mod tests {
             .recv(10)
             .expect_err("a closed socket is not a success");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn an_unterminated_oversized_frame_is_rejected_without_unbounded_allocation() {
+        let (raw_helper, mut raw_daemon) = UnixStream::pair().expect("socketpair");
+        let mut helper = HelperConn::new(raw_helper).expect("helper conn");
+        std::thread::spawn(move || {
+            let chunk = vec![b'a'; 16 * 1024];
+            for _ in 0..8 {
+                if raw_daemon.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        let err = helper
+            .recv(10)
+            .expect_err("oversized line without newline must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn recv_streamed_rejects_done_or_chunk_before_ready_and_duplicate_ready() {
+        // 1. Done without Ready on a 0-byte span must fail closed.
+        let (raw_helper, mut raw_daemon) = UnixStream::pair().expect("socketpair");
+        let mut helper = HelperConn::new(raw_helper).expect("helper conn");
+        raw_daemon
+            .write_all(encode(&ToHelper::Done { id: 7 }).unwrap().as_bytes())
+            .unwrap();
+        let err = helper
+            .recv_streamed(7, 0, &mut |_, _| Ok(()), &mut |_| {})
+            .expect_err("Done before Ready must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // 2. Duplicate Ready must fail closed.
+        let (raw_helper2, mut raw_daemon2) = UnixStream::pair().expect("socketpair");
+        let mut helper2 = HelperConn::new(raw_helper2).expect("helper conn");
+        let ready = encode(&ToHelper::Fetch(FetchResponse::Ready { id: 9, len: 4 })).unwrap();
+        raw_daemon2.write_all(ready.as_bytes()).unwrap();
+        raw_daemon2.write_all(ready.as_bytes()).unwrap();
+        let err2 = helper2
+            .recv_streamed(9, 4, &mut |_, _| Ok(()), &mut |_| {})
+            .expect_err("duplicate Ready must fail");
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
     }
 }

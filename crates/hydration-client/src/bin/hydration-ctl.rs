@@ -44,15 +44,18 @@ fn usage() -> ! {
 
 fn main() -> std::io::Result<()> {
     let mut args = std::env::args().skip(1).peekable();
-    let mut socket = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("hydration-sync.ctl");
+    let mut socket = None;
 
     let mut words: Vec<String> = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--socket" => socket = args.next().map(Into::into).unwrap_or_else(|| usage()),
+            "--socket" => {
+                socket = Some(
+                    args.next()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| usage()),
+                )
+            }
             "-h" | "--help" => usage(),
             _ => words.push(a),
         }
@@ -60,6 +63,18 @@ fn main() -> std::io::Result<()> {
     if words.is_empty() {
         usage();
     }
+    let socket = match socket {
+        Some(s) => s,
+        None => match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+            Some(dir) => std::path::PathBuf::from(dir).join("hydration-sync.ctl"),
+            None => {
+                eprintln!(
+                    "hydration-ctl: XDG_RUNTIME_DIR is not set; pass --socket <path> explicitly"
+                );
+                std::process::exit(2);
+            }
+        },
+    };
 
     let mut conn = match UnixStream::connect(&socket) {
         Ok(c) => c,
@@ -75,12 +90,12 @@ fn main() -> std::io::Result<()> {
     writeln!(conn, "{}", words.join(" "))?;
     conn.flush()?;
 
-    // One command, one reply — but a reply may be several lines, and the daemon
-    // keeps the connection open for more, so read until it goes quiet rather
-    // than until EOF. `watch` is the exception in both halves: silence is its
-    // normal state and every future line is the point, so it has no timeout
-    // and reads until the daemon itself goes away.
+    // Close our write side for one-shot commands so the daemon's `reader.lines()`
+    // loop sees immediate EOF after answering and closes the reply stream instead
+    // of parking both processes on the 10-second idle read timeout. `watch` is the
+    // exception: keeping the socket open in both directions is the subscription.
     if words[0] != "watch" {
+        conn.shutdown(std::net::Shutdown::Write)?;
         conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     }
     let reader = BufReader::new(conn);

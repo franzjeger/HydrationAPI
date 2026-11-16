@@ -45,18 +45,67 @@ impl CredentialStore for FileCredentialStore {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl FileStamp {
+    fn from_meta(m: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            len: m.len(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct FileStateStore {
     dir: PathBuf,
+    cached_tree: Option<(FileStamp, TreeBlob)>,
 }
 impl FileStateStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            cached_tree: None,
+        }
     }
 }
 impl StateStore for FileStateStore {
     fn load(&mut self) -> io::Result<Option<PersistedState>> {
-        let tree = read_optional(self.dir.join("tree.json"))?.map(TreeBlob::from_bytes);
+        let tree_path = self.dir.join("tree.json");
+        let tree = match fs::metadata(&tree_path) {
+            Ok(meta) => {
+                let stamp = FileStamp::from_meta(&meta);
+                if let Some((cached_stamp, cached_blob)) = &self.cached_tree {
+                    if *cached_stamp == stamp {
+                        Some(cached_blob.clone())
+                    } else {
+                        let blob = TreeBlob::from_bytes(fs::read(&tree_path)?);
+                        self.cached_tree = Some((stamp, blob.clone()));
+                        Some(blob)
+                    }
+                } else {
+                    let blob = TreeBlob::from_bytes(fs::read(&tree_path)?);
+                    self.cached_tree = Some((stamp, blob.clone()));
+                    Some(blob)
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.cached_tree = None;
+                None
+            }
+            Err(e) => return Err(e),
+        };
         let token = read_optional(self.dir.join("token.json"))?
             .map(|b| TokenBlob::from_bytes(&b))
             .transpose()?;
@@ -67,7 +116,12 @@ impl StateStore for FileStateStore {
         }
     }
     fn save_tree(&mut self, tree: &TreeBlob) -> io::Result<()> {
-        atomic_private_write(&self.dir.join("tree.json"), tree.as_bytes())
+        let tree_path = self.dir.join("tree.json");
+        atomic_private_write(&tree_path, tree.as_bytes())?;
+        if let Ok(meta) = fs::metadata(&tree_path) {
+            self.cached_tree = Some((FileStamp::from_meta(&meta), tree.clone()));
+        }
+        Ok(())
     }
     fn save_token(&mut self, token: &TokenBlob) -> io::Result<()> {
         atomic_private_write(&self.dir.join("token.json"), &token.as_bytes())
@@ -123,6 +177,8 @@ impl Sleeper for SystemSleeper {
 }
 
 pub struct GraphProvider {
+    monitor: Option<Arc<hydration_client::transfers::Transfers>>,
+    path: String,
     http: GraphHttp<SharedTokenCache>,
     /// Windows of read-ahead on parallel connections; see [`Prefetcher`].
     prefetch: Prefetcher,
@@ -362,6 +418,9 @@ fn quickxor_for_version(
 }
 
 impl Provider for GraphProvider {
+    fn set_path(&mut self, path: &str) {
+        self.path = path.into();
+    }
     fn fetch(
         &mut self,
         cloud_id: &str,
@@ -370,6 +429,9 @@ impl Provider for GraphProvider {
         span: Span,
         out: &mut Body<'_>,
     ) -> io::Result<()> {
+        if let Some(monitor) = &self.monitor {
+            monitor.name(cloud_id, &self.path);
+        }
         let key = CloudId::parse(cloud_id)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid Graph cloud id"))?;
         // QuickXorHash is a hash of the *object*. A range cannot be checked
@@ -464,6 +526,7 @@ impl Provider for GraphProvider {
 }
 
 pub struct GraphAccess {
+    monitor: Option<Arc<hydration_client::transfers::Transfers>>,
     scope: DriveScope,
     root: PathBuf,
     state_dir: PathBuf,
@@ -502,6 +565,7 @@ impl GraphAccess {
         cache: SharedTokenCache,
     ) -> Self {
         Self {
+            monitor: None,
             scope,
             root: root.into(),
             state_dir: state_dir.into(),
@@ -558,7 +622,105 @@ impl GraphAccess {
         }
     }
 }
+fn list_folders_over<T: crate::Transport>(
+    scope: &DriveScope,
+    transport: &mut T,
+    path: &str,
+) -> io::Result<Vec<String>> {
+    let mut url = if path.is_empty() || path == "/" {
+        format!(
+            "{}/root/children?$select=name,folder",
+            crate::drive_base(scope.drive())
+        )
+    } else {
+        let clean_path = path.trim_matches('/');
+        let encoded_path = crate::encode_path(clean_path);
+        format!(
+            "{}/root:/{}:/children?$select=name,folder",
+            crate::drive_base(scope.drive()),
+            encoded_path
+        )
+    };
+
+    let mut folders = Vec::new();
+    let mut visited = std::collections::BTreeSet::new();
+    visited.insert(url.clone());
+
+    for _ in 0..crate::MAX_PAGES_PER_ROUND {
+        let reply = transport.send(&crate::Request::new(crate::Method::Get, &url))?;
+        if !(200..300).contains(&reply.status) {
+            return Err(io::Error::other(format!(
+                "cloud folder listing failed with HTTP {}",
+                reply.status
+            )));
+        }
+        let json: serde_json::Value = serde_json::from_slice(&reply.body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if let Some(arr) = json.get("value").and_then(|v| v.as_array()) {
+            for item in arr {
+                if item.get("folder").is_some() {
+                    if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                        folders.push(name.to_owned());
+                    }
+                }
+            }
+        }
+        match json.get("@odata.nextLink").and_then(|v| v.as_str()) {
+            None => return Ok(folders),
+            Some(next) => {
+                if !crate::on_the_graph_endpoint(next) {
+                    return Err(crate::foreign_link(next));
+                }
+                if !visited.insert(next.to_owned()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "cloud folder listing looped on @odata.nextLink",
+                    ));
+                }
+                url = next.to_owned();
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "cloud folder listing exceeded {} pages",
+            crate::MAX_PAGES_PER_ROUND
+        ),
+    ))
+}
+
 impl CloudAccess for GraphAccess {
+    fn conflicts(
+        &self,
+        desktop: Arc<hydration_client::desktop::Desktop>,
+    ) -> Option<Arc<dyn hydration_client::desktop::ConflictControl>> {
+        Some(Arc::new(crate::conflicts::Service::new(
+            self.root.clone(),
+            self.state_dir.clone(),
+            self.scope.clone(),
+            self.cache.clone(),
+            &desktop,
+        )))
+    }
+    fn observe(&mut self, desktop: Arc<hydration_client::desktop::Desktop>) {
+        self.monitor = Some(Arc::clone(&desktop.transfers));
+    }
+
+    fn list_cloud_folders(&self, path: &str) -> Option<Vec<String>> {
+        let mut http = crate::http::GraphHttp::new(Arc::clone(&self.cache));
+        list_folders_over(&self.scope, &mut http, path).ok()
+    }
+
+    fn cloud_folder_lister(&self) -> Option<Box<hydration_client::daemon_loop::CloudFolderLister>> {
+        let scope = self.scope.clone();
+        let cache = Arc::clone(&self.cache);
+        Some(Box::new(move |path: &str| {
+            let mut http = crate::http::GraphHttp::new(Arc::clone(&cache));
+            list_folders_over(&scope, &mut http, path)
+        }))
+    }
+
     type Fetch = GraphProvider;
     type Upload = GraphSink<GraphHttp<SharedTokenCache>, SystemSleeper>;
     type Changes = GraphDiscover<GraphHttp<SharedTokenCache>, FileStateStore, SystemSleeper>;
@@ -568,10 +730,13 @@ impl CloudAccess for GraphAccess {
         // the point — one stream's throughput ceiling is what it exists to
         // multiply — so nothing about a connection may be shared.
         let cache = Arc::clone(&self.cache);
+        let monitor = self.monitor.clone();
         Ok(GraphProvider {
-            http: GraphHttp::new(Arc::clone(&self.cache)),
+            monitor: self.monitor.clone(),
+            path: String::new(),
+            http: GraphHttp::new(Arc::clone(&self.cache)).with_monitor(self.monitor.clone()),
             prefetch: Prefetcher::new(PREFETCH_DEPTH, move || {
-                let mut http = GraphHttp::new(Arc::clone(&cache));
+                let mut http = GraphHttp::new(Arc::clone(&cache)).with_monitor(monitor.clone());
                 move |cloud_id: &str, span: Span, total: u64| {
                     let key = CloudId::parse(cloud_id).map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidInput, "invalid Graph cloud id")
@@ -589,9 +754,10 @@ impl CloudAccess for GraphAccess {
             self.scope.clone(),
             &self.root,
             self.tags_in_force(),
-            GraphHttp::new(Arc::clone(&self.cache)),
+            GraphHttp::new(Arc::clone(&self.cache)).with_monitor(self.monitor.clone()),
             SystemSleeper,
-        ))
+        )
+        .with_monitor(self.monitor.clone()))
     }
     fn discover(&self) -> io::Result<Self::Changes> {
         Ok(GraphDiscover::new(
@@ -630,7 +796,9 @@ mod tests {
         assert_eq!(next_window(Span::new(24, 8), 32), None);
     }
 
-    fn counting_prefetcher(workers: usize) -> (Prefetcher, Arc<Mutex<Vec<(String, Span)>>>) {
+    type FetchCalls = Arc<Mutex<Vec<(String, Span)>>>;
+
+    fn counting_prefetcher(workers: usize) -> (Prefetcher, FetchCalls) {
         let fetched = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&fetched);
         let prefetch = Prefetcher::new(workers, move || {
@@ -965,5 +1133,87 @@ mod tests {
         let err = writer.verify("AAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(!err.to_string().contains("AAAAAAAA"));
+    }
+
+    struct ScriptedTransport {
+        replies: std::collections::VecDeque<crate::Reply>,
+        seen_urls: Vec<String>,
+    }
+
+    impl crate::Transport for ScriptedTransport {
+        fn send(&mut self, request: &crate::Request) -> io::Result<crate::Reply> {
+            self.seen_urls.push(request.url.clone());
+            self.replies
+                .pop_front()
+                .ok_or_else(|| io::Error::other("unexpected request"))
+        }
+    }
+
+    #[test]
+    fn list_folders_follows_next_link_and_filters_non_folders() {
+        let scope = DriveScope::primary(crate::DriveId::parse("drv").unwrap());
+        let page1 = serde_json::to_vec(&serde_json::json!({
+            "value": [
+                {"name": "Alpha", "folder": {"childCount": 2}},
+                {"name": "readme.md", "file": {}}
+            ],
+            "@odata.nextLink": "https://graph.microsoft.com/v1.0/drives/drv/root/children?$skiptoken=p2"
+        }))
+        .unwrap();
+        let page2 = serde_json::to_vec(&serde_json::json!({
+            "value": [
+                {"name": "Beta", "folder": {"childCount": 0}}
+            ]
+        }))
+        .unwrap();
+        let mut transport = ScriptedTransport {
+            replies: std::collections::VecDeque::from([
+                crate::Reply {
+                    status: 200,
+                    retry_after: None,
+                    body: page1,
+                },
+                crate::Reply {
+                    status: 200,
+                    retry_after: None,
+                    body: page2,
+                },
+            ]),
+            seen_urls: Vec::new(),
+        };
+        let folders = list_folders_over(&scope, &mut transport, "/Projects/").unwrap();
+        assert_eq!(folders, vec!["Alpha".to_string(), "Beta".to_string()]);
+        assert_eq!(transport.seen_urls.len(), 2);
+        assert!(transport.seen_urls[0].contains("/root:/Projects:/children"));
+    }
+
+    #[test]
+    fn list_folders_rejects_foreign_next_link_and_http_errors() {
+        let scope = DriveScope::primary(crate::DriveId::parse("drv").unwrap());
+        let bad_next = serde_json::to_vec(&serde_json::json!({
+            "value": [{"name": "Alpha", "folder": {}}],
+            "@odata.nextLink": "https://evil.example/v1.0/drives/drv/root/children"
+        }))
+        .unwrap();
+        let mut transport = ScriptedTransport {
+            replies: std::collections::VecDeque::from([crate::Reply {
+                status: 200,
+                retry_after: None,
+                body: bad_next,
+            }]),
+            seen_urls: Vec::new(),
+        };
+        let err = list_folders_over(&scope, &mut transport, "/").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        let mut unauth = ScriptedTransport {
+            replies: std::collections::VecDeque::from([crate::Reply {
+                status: 401,
+                retry_after: None,
+                body: b"{}".to_vec(),
+            }]),
+            seen_urls: Vec::new(),
+        };
+        assert!(list_folders_over(&scope, &mut unauth, "/").is_err());
     }
 }

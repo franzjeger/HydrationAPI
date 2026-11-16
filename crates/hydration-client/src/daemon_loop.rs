@@ -45,6 +45,22 @@ use std::time::Duration;
 /// `Sync` and refresh it single-flight, because three instances *will* be alive
 /// at once.
 pub trait CloudAccess: Send + 'static {
+    fn observe(&mut self, _desktop: Arc<crate::desktop::Desktop>) {}
+    fn conflicts(
+        &self,
+        _desktop: Arc<crate::desktop::Desktop>,
+    ) -> Option<Arc<dyn crate::desktop::ConflictControl>> {
+        None
+    }
+    fn list_cloud_folders(&self, _path: &str) -> Option<Vec<String>> {
+        None
+    }
+    /// Return an independent, lock-free cloud folder lister so control-socket
+    /// `list_cloud` queries never hold the `CloudAccess` factory mutex across
+    /// network I/O and can surface real transport or auth errors.
+    fn cloud_folder_lister(&self) -> Option<Box<CloudFolderLister>> {
+        None
+    }
     type Fetch: Provider;
     type Upload: Sink;
     type Changes: Discover;
@@ -124,6 +140,7 @@ struct QueueChanges {
     queue: Arc<Mutex<Queue<SystemClock>>>,
     resync: Arc<AtomicBool>,
     exposures: Arc<Mutex<Vec<String>>>,
+    desktop: Arc<crate::desktop::Desktop>,
 }
 
 impl Changes for QueueChanges {
@@ -145,6 +162,11 @@ impl Changes for QueueChanges {
         // recovery: the dropped events are gone, and nothing else will mention
         // those files again.
         self.resync.store(true, Ordering::SeqCst);
+    }
+
+    fn fetched(&mut self, path: &str) {
+        self.desktop
+            .push_event_async(path, "downloaded", "File downloaded from cloud");
     }
 }
 
@@ -606,6 +628,9 @@ impl Watchers {
 ///   nothing is being sent). Keys stay in that order and new keys are only ever
 ///   appended, so a reader must ignore keys it does not recognise. An unchanged
 ///   tuple is never re-sent.
+pub type CloudFolderLister = dyn Fn(&str) -> io::Result<Vec<String>> + Send + Sync;
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn control(
     socket: &std::path::Path,
@@ -616,6 +641,35 @@ fn control(
     in_flight: Arc<AtomicU64>,
     active_uploads: Arc<Mutex<HashMap<FileId, String>>>,
     watchers: Arc<Watchers>,
+) -> io::Result<()> {
+    control_with_desktop(
+        socket,
+        mount,
+        queue,
+        exposures,
+        excluded,
+        in_flight,
+        active_uploads,
+        watchers,
+        Arc::new(crate::desktop::Desktop::default()),
+        None,
+        crate::store::new_shared_hints(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn control_with_desktop(
+    socket: &std::path::Path,
+    mount: PathBuf,
+    queue: Arc<Mutex<Queue<SystemClock>>>,
+    exposures: Arc<Mutex<Vec<String>>>,
+    excluded: Arc<AtomicU64>,
+    in_flight: Arc<AtomicU64>,
+    active_uploads: Arc<Mutex<HashMap<FileId, String>>>,
+    watchers: Arc<Watchers>,
+    desktop: Arc<crate::desktop::Desktop>,
+    list_cloud: Option<Box<CloudFolderLister>>,
+    hints: crate::store::SharedHints,
 ) -> io::Result<()> {
     use std::io::{BufRead, BufReader, Write};
 
@@ -639,110 +693,183 @@ fn control(
         let mut out = conn;
         for line in reader.lines().map_while(Result::ok) {
             let (verb, arg) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
-            let reply = match verb {
-                "evict" => {
-                    // The argument goes through unchanged. Trimming or joining
-                    // it here would mean two places decide what a path means,
-                    // and `reclaim` is the one that has to be right — it
-                    // resolves through `safe_join` and then through the
-                    // filesystem, so neither `..` nor a symlinked subdirectory
-                    // can lead it out of the sync directory.
-                    // Snapshotted, so the control socket never holds the queue
-                    // across a directory walk.
-                    let (waiting, sending) = {
-                        let q = queue.lock().unwrap();
-                        (q.waiting_set(), q.sending_set())
-                    };
-                    let mut store = Store::new();
-                    let _ = store.scan(&mount);
-                    match reclaim::reclaim(&mount, arg, &mut store, &waiting, &sending) {
-                        Ok(Ok(r)) => format!("reclaimed {} bytes", r.bytes),
-                        Ok(Err(why)) => format!("kept: {why:?}"),
-                        Err(e) => format!("error: {e}"),
-                    }
-                }
-                "pin" | "unpin" => {
-                    // The same shape as evict — an untrusted path, confined by
-                    // `reclaim::set_pin` through the same `safe_join` — but it
-                    // touches no content: a pin is a `setxattr`/`removexattr`,
-                    // which fires no pre-content event and needs no privilege, so
-                    // nothing here crosses to the helper (§6b never comes into
-                    // it). Unlike evict it accepts a directory, because a folder
-                    // pin protects its subtree. A path that will not resolve
-                    // inside the sync directory is an `error:` rather than a
-                    // `kept:` — a pin keeps nothing back, it is a rejected
-                    // request.
-                    match reclaim::set_pin(&mount, arg, verb == "pin") {
-                        Ok(Ok(())) => if verb == "pin" { "pinned" } else { "unpinned" }.to_string(),
-                        Ok(Err(why)) => format!("error: {why:?}"),
-                        Err(e) => format!("error: {e}"),
-                    }
-                }
-                "pending" => {
-                    // A content-free enumeration: the dehydrated files under a
-                    // directory, one relative path per line, for a caller about
-                    // to hydrate each in its own process — the reads must not
-                    // happen here (§6a-ter). An empty list is a valid answer;
-                    // `writeln!` below still sends a newline, so the client does
-                    // not read the reply as dropped.
-                    match reclaim::pending(&mount, arg) {
-                        Ok(Ok(paths)) => paths.join("\n"),
-                        Ok(Err(why)) => format!("error: {why:?}"),
-                        Err(e) => format!("error: {e}"),
-                    }
-                }
-                "status" => {
-                    let pending = queue.lock().unwrap().pending();
-                    let m = Manifest::build(&mount).unwrap_or_default();
-                    // A fresh count was just paid for; publishing it costs
-                    // nothing and spares watchers up to a whole status-thread
-                    // period of staleness after an eviction.
-                    excluded.store(m.len() as u64, Ordering::SeqCst);
-                    let seen = exposures.lock().unwrap();
-                    format!(
-                        "{pending} unsent\n{}\n{}",
-                        crate::manifest::status_line(BackupPolicy::Exclude, m.len()),
-                        if seen.is_empty() {
-                            "no other mount exposes these files".to_string()
-                        } else {
-                            format!(
-                                "WARNING: {} other mount(s) bypass hydration: {seen:?}",
-                                seen.len()
-                            )
+            let reply = if desktop.resolving.load(Ordering::SeqCst)
+                && matches!(verb, "evict" | "pin" | "unpin" | "selection")
+            {
+                "error: Finish the conflict resolution first".into()
+            } else {
+                match verb {
+                    "evict" => {
+                        // The argument goes through unchanged. Trimming or joining
+                        // it here would mean two places decide what a path means,
+                        // and `reclaim` is the one that has to be right — it
+                        // resolves through `safe_join` and then through the
+                        // filesystem, so neither `..` nor a symlinked subdirectory
+                        // can lead it out of the sync directory.
+                        // Snapshotted, so the control socket never holds the queue
+                        // across a directory walk.
+                        let (waiting, sending) = {
+                            let q = queue.lock().unwrap();
+                            (q.waiting_set(), q.sending_set())
+                        };
+                        // `reclaim` only touches `store` to forget the swapped-out
+                        // inode, so pass an empty `Store` rather than walking
+                        // 165,000+ inodes per eviction, and record the new
+                        // placeholder inode in `hints` so re-hydration resolves O(1).
+                        let mut store = Store::new();
+                        match reclaim::reclaim(&mount, arg, &mut store, &waiting, &sending) {
+                            Ok(Ok(r)) => {
+                                if let Some(joined) = crate::delta::safe_join(&mount, arg) {
+                                    crate::store::record_hint_for_path(&hints, &joined);
+                                }
+                                excluded.fetch_add(1, Ordering::AcqRel);
+                                format!("reclaimed {} bytes", r.bytes)
+                            }
+                            Ok(Err(why)) => format!("kept: {why:?}"),
+                            Err(e) => format!("error: {e}"),
                         }
-                    )
+                    }
+                    "list_cloud" => {
+                        if let Some(lister) = &list_cloud {
+                            match lister(arg) {
+                                Ok(folders) => match serde_json::to_string(&folders) {
+                                    Ok(json) => json,
+                                    Err(e) => format!("error: {e}"),
+                                },
+                                Err(e) => format!("error: {e}"),
+                            }
+                        } else {
+                            "error: no cloud access".into()
+                        }
+                    }
+                    "pin" | "unpin" => {
+                        // The same shape as evict — an untrusted path, confined by
+                        // `reclaim::set_pin` through the same `safe_join` — but it
+                        // touches no content: a pin is a `setxattr`/`removexattr`,
+                        // which fires no pre-content event and needs no privilege, so
+                        // nothing here crosses to the helper (§6b never comes into
+                        // it). Unlike evict it accepts a directory, because a folder
+                        // pin protects its subtree. A path that will not resolve
+                        // inside the sync directory is an `error:` rather than a
+                        // `kept:` — a pin keeps nothing back, it is a rejected
+                        // request.
+                        match reclaim::set_pin(&mount, arg, verb == "pin") {
+                            Ok(Ok(())) => {
+                                if verb == "pin" { "pinned" } else { "unpinned" }.to_string()
+                            }
+                            Ok(Err(why)) => format!("error: {why:?}"),
+                            Err(e) => format!("error: {e}"),
+                        }
+                    }
+                    "pending" => {
+                        // A content-free enumeration: the dehydrated files under a
+                        // directory, one relative path per line, for a caller about
+                        // to hydrate each in its own process — the reads must not
+                        // happen here (§6a-ter). An empty list is a valid answer;
+                        // `writeln!` below still sends a newline, so the client does
+                        // not read the reply as dropped.
+                        match reclaim::pending(&mount, arg) {
+                            Ok(Ok(paths)) => paths.join("\n"),
+                            Ok(Err(why)) => format!("error: {why:?}"),
+                            Err(e) => format!("error: {e}"),
+                        }
+                    }
+                    "review" | "resolve" => {
+                        let service = desktop.conflicts.lock().unwrap().clone();
+                        match service {
+                            None => "error: Conflict resolution is unavailable".into(),
+                            Some(service) => {
+                                let result = if verb == "review" {
+                                    service.inspect(arg)
+                                } else {
+                                    match arg.split_once(' ') {
+                                        Some((token, choice)) => service.start(token, choice),
+                                        None => Err(io::Error::other("Choose a reviewed version")),
+                                    }
+                                };
+                                result.unwrap_or_else(|e| format!("error: {e}"))
+                            }
+                        }
+                    }
+                    "selection" => match serde_json::from_str::<Vec<String>>(arg) {
+                        Ok(paths) => match desktop.select(&mount, &paths) {
+                            Ok(()) => "selection saved".into(),
+                            Err(e) => format!("error: {e}"),
+                        },
+                        Err(e) => format!("error: {e}"),
+                    },
+                    "desktop" => desktop.snapshot(&mount, &queue.lock().unwrap()),
+                    "pause" => match arg.parse::<u64>() {
+                        Ok(seconds) if seconds <= 86400 => {
+                            desktop.pause(seconds);
+                            "ok".into()
+                        }
+                        _ => "error: pause requires seconds between 0 and 86400".into(),
+                    },
+                    "retry" => {
+                        queue.lock().unwrap().flush_now();
+                        "ok".into()
+                    }
+                    "status" => {
+                        let pending = queue.lock().unwrap().pending();
+                        // Serve the already-maintained excluded count in O(1) once
+                        // the status thread has written `.hydration-manifest`, instead
+                        // of walking 165,000+ inodes synchronously on every CLI query.
+                        let cached = excluded.load(Ordering::Acquire) as usize;
+                        let count =
+                            if cached > 0 || mount.join(crate::manifest::MANIFEST_NAME).is_file() {
+                                cached
+                            } else {
+                                let m = Manifest::build(&mount).unwrap_or_default();
+                                excluded.store(m.len() as u64, Ordering::Release);
+                                m.len()
+                            };
+                        let seen = exposures.lock().unwrap();
+                        format!(
+                            "{pending} unsent\n{}\n{}",
+                            crate::manifest::status_line(BackupPolicy::Exclude, count),
+                            if seen.is_empty() {
+                                "no other mount exposes these files".to_string()
+                            } else {
+                                format!(
+                                    "WARNING: {} other mount(s) bypass hydration: {seen:?}",
+                                    seen.len()
+                                )
+                            }
+                        )
+                    }
+                    "watch" => {
+                        // From here this connection is written to and never read —
+                        // one state line now, another per change, nothing else —
+                        // so it leaves the accept thread before the next
+                        // `incoming()`. It joins a registry the status thread
+                        // already serves once a second, rather than getting a
+                        // thread of its own: a watcher is long-lived *by design*,
+                        // so serving it here would park the user's only status and
+                        // eviction channel for its whole lifetime — the exact
+                        // condition the read timeout above exists to prevent,
+                        // except that a watcher never times out on purpose — and
+                        // thread-per-watcher would let a reconnect loop grow the
+                        // daemon by one parked thread per attempt.
+                        // `false`: this is the one-shot state a new watcher gets on
+                        // connect, and control has no `delta_busy` in scope; the status
+                        // thread's next tick corrects it if a pass is in fact running.
+                        watchers.adopt(
+                            out,
+                            watch_state(
+                                &queue,
+                                &excluded,
+                                &exposures,
+                                &in_flight,
+                                false,
+                                &active_uploads,
+                            ),
+                        );
+                        break;
+                    }
+                    "" => continue,
+                    other => format!("unknown command: {other}"),
                 }
-                "watch" => {
-                    // From here this connection is written to and never read —
-                    // one state line now, another per change, nothing else —
-                    // so it leaves the accept thread before the next
-                    // `incoming()`. It joins a registry the status thread
-                    // already serves once a second, rather than getting a
-                    // thread of its own: a watcher is long-lived *by design*,
-                    // so serving it here would park the user's only status and
-                    // eviction channel for its whole lifetime — the exact
-                    // condition the read timeout above exists to prevent,
-                    // except that a watcher never times out on purpose — and
-                    // thread-per-watcher would let a reconnect loop grow the
-                    // daemon by one parked thread per attempt.
-                    // `false`: this is the one-shot state a new watcher gets on
-                    // connect, and control has no `delta_busy` in scope; the status
-                    // thread's next tick corrects it if a pass is in fact running.
-                    watchers.adopt(
-                        out,
-                        watch_state(
-                            &queue,
-                            &excluded,
-                            &exposures,
-                            &in_flight,
-                            false,
-                            &active_uploads,
-                        ),
-                    );
-                    break;
-                }
-                "" => continue,
-                other => format!("unknown command: {other}"),
             };
             if writeln!(out, "{reply}").is_err() {
                 break;
@@ -763,32 +890,86 @@ fn control(
 /// a file that raced into the queue after the snapshot is still refused by its
 /// live `UploadPending`/`ChangedSinceUpload` checks, which is why this loops
 /// `reclaim` rather than trusting the enumerator's pre-filter.
+static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_shutdown_signal(_: libc::c_int) {
+    // Relaxed suffices: single-flag async-signal-safe notification polled by
+    // the signal watcher thread before issuing Release shutdown stores.
+    SIGNAL_STOP.store(true, Ordering::Relaxed);
+}
+
+fn install_shutdown_signals() {
+    SIGNAL_STOP.store(false, Ordering::Relaxed);
+    // SAFETY: `sigaction` is initialized with `sigemptyset` and an async-signal-safe
+    // C handler (`on_shutdown_signal`) without `SA_RESTART` so blocking syscalls wake.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_shutdown_signal as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        let _ = libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        let _ = libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    }
+}
+
+struct DeltaBusyGuard<'a> {
+    busy: &'a AtomicBool,
+    folder_refresh: &'a AtomicBool,
+}
+
+impl<'a> DeltaBusyGuard<'a> {
+    fn enter(busy: &'a AtomicBool, folder_refresh: &'a AtomicBool) -> Self {
+        // Release ensures uploads/eviction observing `busy == true` see prior state.
+        busy.store(true, Ordering::Release);
+        Self {
+            busy,
+            folder_refresh,
+        }
+    }
+}
+
+impl Drop for DeltaBusyGuard<'_> {
+    fn drop(&mut self) {
+        // Always release `delta_busy` even if `apply_remembering` unwinds, so
+        // upload folder creation and auto-eviction can never wedge permanently.
+        self.folder_refresh.store(true, Ordering::Release);
+        self.busy.store(false, Ordering::Release);
+    }
+}
+
 fn plan_and_reclaim(
     mount: &std::path::Path,
     cfg: &EvictionConfig,
-    available: u64,
-    total: u64,
+    (available, total): (u64, u64),
     now: u64,
     waiting: &HashSet<FileId>,
     sending: &HashSet<FileId>,
+    hints: Option<&crate::store::SharedHints>,
 ) -> io::Result<u64> {
     let (low, _) = cfg.marks(total);
-    if available >= low {
-        return Ok(0); // common path: no pressure, no walk beyond this.
+    if cfg.quota_bytes.is_none() && available >= low {
+        return Ok(0); // common path when no quota is set: no pressure, no walk.
     }
     let candidates = reclaim::evictable_candidates(mount)?;
     let plan = crate::evict_policy::plan(candidates, available, total, cfg, now);
+    if plan.is_empty() {
+        return Ok(0);
+    }
 
-    // One scanned Store reused across the batch — reclaim only uses it to forget
-    // the swapped-out inode.
+    // `reclaim` only touches `store` to forget the swapped-out inode — do not
+    // scan the entire tree here (`evictable_candidates` already walked it).
     let mut store = Store::new();
-    let _ = store.scan(mount);
 
     let mut freed = 0u64;
     for rel in plan {
         // A refusal (raced upload, a fresh edit, a pin set mid-sweep) is a skip,
         // not a failure: the point of looping reclaim is that it re-checks.
         if let Ok(Ok(r)) = reclaim::reclaim(mount, &rel, &mut store, waiting, sending) {
+            if let Some(h) = hints {
+                if let Some(joined) = crate::delta::safe_join(mount, &rel) {
+                    crate::store::record_hint_for_path(h, &joined);
+                }
+            }
             freed = freed.saturating_add(r.bytes);
         }
     }
@@ -801,6 +982,18 @@ fn plan_and_reclaim(
 /// a cloud is beyond the three traits, which is the whole point: swapping
 /// `FolderCloud` for a real service changes this file not at all.
 pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
+    run_with_history(config, access, None)
+}
+
+/// Run with a bounded persistent desktop outcome history outside the sync root.
+pub fn run_with_history<C: CloudAccess>(
+    config: Config,
+    mut access: C,
+    history: Option<PathBuf>,
+) -> io::Result<()> {
+    let desktop = Arc::new(crate::desktop::Desktop::load(history));
+    access.observe(Arc::clone(&desktop));
+    *desktop.conflicts.lock().unwrap() = access.conflicts(Arc::clone(&desktop));
     // Before the credential, because this one costs nothing and the failure it
     // prevents is the worst one available.
     //
@@ -894,6 +1087,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     let active_uploads: Arc<Mutex<HashMap<FileId, String>>> = Arc::new(Mutex::new(HashMap::new()));
     // Everyone who asked to be told when the numbers above move.
     let watchers = Arc::new(Watchers::default());
+    let shared_hints = crate::store::new_shared_hints();
 
     let _ = std::fs::remove_file(&config.socket);
     let listener = UnixListener::bind(&config.socket)?;
@@ -908,6 +1102,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
         config.debounce.as_secs()
     );
 
+    let direct_lister = access.cloud_folder_lister();
     // Behind a lock only so three threads can each ask it for an instance. The
     // instances themselves never touch it again.
     let access = Arc::new(Mutex::new(access));
@@ -958,6 +1153,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             std::cmp::max(config.debounce, Duration::from_secs(1)),
             Arc::clone(&active_uploads),
         );
+        let desktop = Arc::clone(&desktop);
         std::thread::spawn(move || {
             // Same reasoning as the delta thread below: a queue that grows and
             // never drains is visible in the status line, but the reason is not,
@@ -1019,6 +1215,8 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             let mut renames_pending = Vec::new();
             let mut folders_gone_pending = Vec::new();
             let mut folders_seeded = false;
+            let mut selected = crate::selection::read(&mount).ok();
+            let mut resolution_generation = desktop.refresh.load(Ordering::SeqCst);
             let mut next_folder_retry = std::time::Instant::now();
             // Capture the generation *before* the walk. On the live 26k-folder
             // tree the helper replaced the mount while this walk was in flight;
@@ -1043,6 +1241,29 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 }
             };
             while !stop.load(Ordering::SeqCst) {
+                let Some(_pass) = desktop.begin_pass() else {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    continue;
+                };
+                let current = crate::selection::read(&mount).ok();
+                let changed = desktop.refresh.load(Ordering::SeqCst);
+                if changed != resolution_generation {
+                    resolution_generation = changed;
+                    match role(&access, C::sink) {
+                        Ok(fresh) => sink = fresh,
+                        Err(e) => {
+                            eprintln!("hydration-sync: could not refresh upload versions after resolution: {e}");
+                            continue;
+                        }
+                    }
+                    q.lock().unwrap().flush_now();
+                    resync.store(true, Ordering::SeqCst);
+                }
+                if current != selected {
+                    selected = current;
+                    resync.store(true, Ordering::SeqCst);
+                }
+
                 // Close the holes in the change channel by looking, rather than
                 // by trusting that nothing was missed.
                 //
@@ -1071,6 +1292,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                             // discard, and after the next read there is nothing
                             // left to notice. This line is the only moment
                             // anyone can act on them.
+                            desktop.reconcile_availability(&mount);
                             if !found.holding.is_empty() {
                                 eprintln!(
                                     "hydration-sync: WARNING — {} dehydrated file(s) hold \
@@ -1078,6 +1300,9 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                                     found.holding.len()
                                 );
                                 for p in &found.holding {
+                                    if let Some(relative) = crate::lineage::relative(&mount, p) {
+                                        desktop.issue(&relative, "availability", "An online-only file contains local data of uncertain origin. Opening or copying it can replace those bytes with a cloud download. Review this file before opening it.");
+                                    }
                                     eprintln!("hydration-sync:   {}", p.display());
                                 }
                                 // No advice to copy the bytes out, because
@@ -1127,8 +1352,12 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 let due = q.lock().unwrap().due();
                 if !due.is_empty() {
                     let _ = store.scan(&mount);
+                    desktop.index(&mount, &store, &q.lock().unwrap());
                 }
                 for file in due {
+                    if desktop.paused() {
+                        break;
+                    }
                     q.lock().unwrap().begin(file);
                     // Captured before the send, because afterwards the file may
                     // already be gone — which is precisely the case this is for.
@@ -1177,6 +1406,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                             queue.sent(file);
                         }
                     }
+                    desktop.record(file, sent_path.as_deref(), &outcome);
                     eprintln!("hydration-sync: upload {file:?} -> {outcome:?}");
                 }
 
@@ -1266,7 +1496,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         next_folder_retry = std::time::Instant::now() + folder_retry;
                     }
                 }
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(1500));
             }
         });
     }
@@ -1280,14 +1510,16 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // The privileged half is never sent a destination, which is what makes §6b
     // structural rather than a rule someone has to remember.
     {
-        let (q, stop, mount, access, delta_busy, folder_refresh) = (
+        let (q, stop, mount, access, delta_busy, folder_refresh, hints_for_delta) = (
             Arc::clone(&queue),
             Arc::clone(&stop),
             config.mount.clone(),
             Arc::clone(&access),
             Arc::clone(&delta_busy),
             Arc::clone(&folder_refresh),
+            Arc::clone(&shared_hints),
         );
+        let desktop = Arc::clone(&desktop);
         std::thread::spawn(move || {
             // Leaving quietly here is indistinguishable, from outside, from a
             // drive with nothing on it: the status thread keeps printing "0
@@ -1337,7 +1569,13 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // someone acts, and five seconds of the same line is a log nobody
             // reads any of.
             let mut complained = false;
+            let mut selection = crate::selection::applied(&mount).unwrap_or_default();
+            let mut resolution_generation = desktop.refresh.load(Ordering::SeqCst);
             while !stop.load(Ordering::SeqCst) {
+                let Some(_pass) = desktop.begin_pass() else {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    continue;
+                };
                 // Two questions, and they are not the same one.
                 //
                 // "Is there a mount here at all" is what `is_mount_point`
@@ -1353,6 +1591,31 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 // the unique mount id it captured at open time, and `apply` asks
                 // it per change. See `place.rs` for why that one cannot be
                 // carried by a path check.
+                let changed = desktop.refresh.load(Ordering::SeqCst);
+                if changed != resolution_generation {
+                    resolution_generation = changed;
+                    cloud.refresh();
+                    applied_to = None;
+                    cursor = Cursor::default();
+                }
+                match crate::selection::read(&mount) {
+                    Ok(current) if current != selection => {
+                        cloud.refresh();
+                        cursor = Cursor::default();
+                        applied_to = None;
+                        selection = current;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        desktop.issue(
+                            "",
+                            "selection",
+                            &format!("Could not read folder selection: {e}"),
+                        );
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                }
                 if placer.is_none() {
                     let opened = match crate::mount::is_mount_point(&mount) {
                         Ok(true) => TmpfilePlacer::new(&mount).map_err(|e| {
@@ -1405,17 +1668,17 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         // unprotected. The snapshot can go stale, which is what
                         // the stamp check inside `apply` is for.
                         let waiting = q.lock().unwrap().waiting_set();
-                        delta_busy.store(true, Ordering::SeqCst);
-                        let applied = delta::apply_remembering(
-                            &mount,
-                            &changes,
-                            &mut store,
-                            &waiting,
-                            placer_ref,
-                            &mut applied_to,
-                        );
-                        folder_refresh.store(true, Ordering::SeqCst);
-                        delta_busy.store(false, Ordering::SeqCst);
+                        let applied = {
+                            let _busy = DeltaBusyGuard::enter(&delta_busy, &folder_refresh);
+                            delta::apply_remembering(
+                                &mount,
+                                &changes,
+                                &mut store,
+                                &waiting,
+                                placer_ref,
+                                &mut applied_to,
+                            )
+                        };
                         // The cursor moves only past a pass that finished.
                         //
                         // A delta service does not replay a consumed change, so
@@ -1431,8 +1694,15 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                         // next round has to find a mount before it opens
                         // another. Cursor stays put: what was not applied has
                         // not been seen.
+                        if applied
+                            .as_ref()
+                            .is_ok_and(|a| a.created + a.updated + a.moved + a.removed > 0)
+                        {
+                            store.export_hints(&hints_for_delta);
+                        }
                         let lost_the_mount = matches!(&applied, Ok(a) if a.stopped.is_some());
                         if let Ok(a) = &applied {
+                            desktop.reconciled(&changes, a);
                             if let Some(why) = &a.stopped {
                                 eprintln!(
                                     "hydration-sync: delta pass stopped after {} of {} \
@@ -1459,6 +1729,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                             Ok(_) => {
                                 unfinished = false;
                                 cursor = next;
+                                let _ = crate::selection::mark_applied(&mount, &selection);
                             }
                             Err(_) => unfinished = true,
                         }
@@ -1482,6 +1753,11 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                                 // apply because local work would have been lost,
                                 // and they are what a conflict UI is for.
                                 for k in &a.kept_local {
+                                    desktop.issue(
+                                        &k.path,
+                                        "conflict",
+                                        &format!("Local copy preserved: {}", k.why),
+                                    );
                                     eprintln!(
                                         "hydration-sync:   kept local copy of {}: {}",
                                         k.path, k.why
@@ -1494,6 +1770,11 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                                 // the same sentence, and the difference had to
                                 // be found by bisecting the daemon.
                                 for f in &a.failed {
+                                    desktop.issue(
+                                        &f.path,
+                                        "error",
+                                        &format!("Could not apply cloud update: {}", f.why),
+                                    );
                                     eprintln!(
                                         "hydration-sync:   could not apply {}: {}",
                                         f.path, f.why
@@ -1507,7 +1788,10 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     // Nothing new. Only meaningful if the last pass finished:
                     // silence must not be read as permission to move past work
                     // that was deliberately deferred.
-                    Ok((_, next)) if !unfinished => cursor = next,
+                    Ok((_, next)) if !unfinished => {
+                        cursor = next;
+                        let _ = crate::selection::mark_applied(&mount, &selection);
+                    }
                     Ok(_) => {}
                     Err(e) => eprintln!("hydration-sync: could not list the cloud: {e}"),
                 }
@@ -1523,9 +1807,12 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 if walked.elapsed() >= WALK_EVERY {
                     if let Err(e) = store.scan(&mount) {
                         eprintln!("hydration-sync: could not walk the sync root: {e}");
+                    } else {
+                        store.export_hints(&hints_for_delta);
                     }
                     walked = std::time::Instant::now();
                 }
+                drop(_pass);
                 std::thread::sleep(POLL_EVERY);
             }
         });
@@ -1535,7 +1822,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // asked for.
     {
         let ctl = config.socket.with_extension("ctl");
-        let (mount, q, ex, exc, inf, au, ws) = (
+        let (mount, q, ex, exc, inf, au, ws, hints_for_ctl) = (
             config.mount.clone(),
             Arc::clone(&queue),
             Arc::clone(&exposures),
@@ -1543,10 +1830,41 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             Arc::clone(&in_flight),
             Arc::clone(&active_uploads),
             Arc::clone(&watchers),
+            Arc::clone(&shared_hints),
         );
         eprintln!("hydration-sync: control socket at {}", ctl.display());
+        let desktop = Arc::clone(&desktop);
+        let list_cloud: Box<CloudFolderLister> = match direct_lister {
+            Some(lister) => lister,
+            None => {
+                let access_for_ctl = Arc::clone(&access);
+                Box::new(move |arg: &str| {
+                    let guard = access_for_ctl
+                        .lock()
+                        .map_err(|_| io::Error::other("the cloud access is poisoned"))?;
+                    guard.list_cloud_folders(arg).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "list_cloud_folders not supported",
+                        )
+                    })
+                })
+            }
+        };
         std::thread::spawn(move || {
-            if let Err(e) = control(&ctl, mount, q, ex, exc, inf, au, ws) {
+            if let Err(e) = control_with_desktop(
+                &ctl,
+                mount,
+                q,
+                ex,
+                exc,
+                inf,
+                au,
+                ws,
+                desktop,
+                Some(list_cloud),
+                hints_for_ctl,
+            ) {
                 eprintln!("hydration-sync: control socket unavailable: {e}");
             }
         });
@@ -1556,12 +1874,14 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
     // exist while the policy is off, so an "off" daemon never wakes to sample a
     // disk it will never act on — "off" is off, not merely idle.
     if let Some(evict_cfg) = config.eviction {
-        let (mount, stop, delta_busy, queue) = (
+        let (mount, stop, delta_busy, queue, hints_for_evict) = (
             config.mount.clone(),
             Arc::clone(&stop),
             Arc::clone(&delta_busy),
             Arc::clone(&queue),
+            Arc::clone(&shared_hints),
         );
+        let desktop = Arc::clone(&desktop);
         std::thread::spawn(move || {
             let free = StatvfsSpace {
                 mount: mount.clone(),
@@ -1581,6 +1901,9 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 if delta_busy.load(Ordering::SeqCst) {
                     continue;
                 }
+                let Some(_pass) = desktop.begin_pass() else {
+                    continue;
+                };
                 // Cheap unless something is happening: one `statvfs`, and only
                 // below the low mark do we walk and evict. P1 measured `f_bavail`
                 // coarse and lagging a delete until the commit, so the sweep sizes
@@ -1590,7 +1913,7 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     continue;
                 };
                 let (low, _) = evict_cfg.marks(total);
-                if available >= low {
+                if evict_cfg.quota_bytes.is_none() && available >= low {
                     continue;
                 }
                 // Snapshot the queue as the evict verb does — lock only long
@@ -1602,11 +1925,11 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                 match plan_and_reclaim(
                     &mount,
                     &evict_cfg,
-                    available,
-                    total,
+                    (available, total),
                     clock.now_secs(),
                     &waiting,
                     &sending,
+                    Some(&hints_for_evict),
                 ) {
                     Ok(freed) if freed > 0 => {
                         eprintln!("hydration-sync: auto-eviction freed {freed} bytes")
@@ -1666,10 +1989,11 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
             // machine getting warm.
             const TICKS_PER_MANIFEST: u32 = 300;
             let mut tick = 0;
+            let mut last_manifest_sig: Option<(usize, u64)> = None;
             while !stop.load(Ordering::SeqCst) {
                 if tick == 0 {
                     if let Ok(m) = Manifest::build(&mount) {
-                        let _ = m.write(&mount);
+                        let _ = m.write_if_changed(&mount, &mut last_manifest_sig);
                         // The count `watch` hands out, from the walk that was
                         // happening regardless.
                         excluded.store(m.len() as u64, Ordering::SeqCst);
@@ -1711,8 +2035,44 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
         });
     }
 
-    for conn in listener.incoming() {
-        let conn = conn?;
+    install_shutdown_signals();
+    let active_helper: Arc<Mutex<Option<std::os::unix::net::UnixStream>>> =
+        Arc::new(Mutex::new(None));
+    {
+        let stop = Arc::clone(&stop);
+        let active_helper = Arc::clone(&active_helper);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if SIGNAL_STOP.swap(false, Ordering::Relaxed) {
+                    stop.store(true, Ordering::Release);
+                    if let Some(peer) = active_helper.lock().unwrap().take() {
+                        let _ = peer.shutdown(std::net::Shutdown::Both);
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+    }
+
+    listener.set_nonblocking(true)?;
+    while !stop.load(Ordering::Acquire) {
+        let conn = match listener.accept() {
+            Ok((conn, _)) => {
+                conn.set_nonblocking(false)?;
+                conn
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         // One helper at a time. A second connection means something unexpected
         // is talking to us, and serving both would be worse than serving
         // neither.
@@ -1734,20 +2094,32 @@ pub fn run<C: CloudAccess>(config: Config, access: C) -> io::Result<()> {
                     queue: Arc::clone(&queue),
                     resync: Arc::clone(&resync),
                     exposures: Arc::clone(&exposures),
+                    desktop: Arc::clone(&desktop),
                 }));
                 // Bump the shared counter, so this connection's fetches show up
                 // in the same "downloading" number the status thread broadcasts.
                 daemon.track_fetches(Arc::clone(&in_flight));
+                daemon.with_hints(Arc::clone(&shared_hints));
+                if let Ok(clone) = conn.try_clone() {
+                    *active_helper.lock().unwrap() = Some(clone);
+                }
                 let mut c = DaemonConn::new(conn)?;
                 if let Err(e) = daemon.serve(&mut c) {
-                    eprintln!("hydration-sync: helper connection ended: {e}");
+                    if !stop.load(Ordering::Acquire) {
+                        eprintln!("hydration-sync: helper connection ended: {e}");
+                    }
                 } else {
                     eprintln!("hydration-sync: helper disconnected");
                 }
+                *active_helper.lock().unwrap() = None;
             }
             Err(_) => eprintln!("hydration-sync: could not open the cloud directory"),
         }
     }
+    eprintln!("hydration-sync: shutting down cleanly...");
+    let _ = desktop.wait_for_passes();
+    let _ = std::fs::remove_file(&config.socket);
+    let _ = std::fs::remove_file(config.socket.with_extension("ctl"));
     Ok(())
 }
 
@@ -3007,9 +3379,10 @@ mod tests {
 
     #[test]
     fn folder_deletes_are_versioned_and_deepest_first() {
+        let root = scratch("folder-deletes-existing-root");
         let mut sink = DeleteSink::default();
         apply_folder_removals(
-            std::path::Path::new("/no/such/root"),
+            &root,
             &[
                 crate::removals::FolderGone {
                     path: "Work".into(),
@@ -3427,17 +3800,19 @@ mod tests {
             grace_secs: 0,
             sweep_cap: 1_000_000,
             min_interval_secs: 0,
+            quota_bytes: None,
+            quota_target_bytes: None,
         };
         let sending: HashSet<FileId> = std::iter::once(b_id).collect();
         // available 0 < low 100 -> under pressure; total huge so high = high_abs.
         let freed = plan_and_reclaim(
             &mount,
             &cfg,
-            0,
-            10_000_000,
+            (0, 10_000_000),
             10_000,
             &HashSet::new(),
             &sending,
+            None,
         )
         .unwrap();
 
@@ -3469,11 +3844,11 @@ mod tests {
         let freed = plan_and_reclaim(
             &mount,
             &cfg,
-            500,
-            1000,
+            (500, 1000),
             10_000,
             &HashSet::new(),
             &HashSet::new(),
+            None,
         )
         .unwrap();
 
@@ -3483,6 +3858,47 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a file was evicted without pressure"
+        );
+    }
+
+    #[test]
+    fn a_sweep_with_quota_evicts_even_when_disk_has_ample_free_space() {
+        let dir = ctl_scratch("quota-pressure");
+        let mount = dir.join("m");
+        std::fs::create_dir_all(&mount).unwrap();
+        let p = mount.join("resident.bin");
+        std::fs::write(&p, vec![b'r'; 64 * 1024]).unwrap();
+        crate::store::set_xattr(&p, crate::store::XATTR_ID, b"cloud-quota-1").unwrap();
+        hydration_protocol::stamp::write(&p).unwrap();
+
+        let mut cfg = crate::evict_policy::EvictionConfig::default_pressure();
+        cfg.grace_secs = 0;
+        cfg.quota_bytes = Some(1024);
+        cfg.quota_target_bytes = Some(0);
+
+        // Ample disk free space (500 GiB free out of 1 TiB), so `available >= low`,
+        // yet `quota_bytes` is exceeded and must still trigger eviction!
+        let gib = 1024 * 1024 * 1024;
+        let freed = plan_and_reclaim(
+            &mount,
+            &cfg,
+            (500 * gib, 1024 * gib),
+            u64::MAX / 2,
+            &HashSet::new(),
+            &HashSet::new(),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            freed > 0,
+            "quota-exceeded sweep must reclaim resident blocks"
+        );
+        assert!(
+            crate::store::get_xattr(&p, hydration_protocol::xattr::DEHYDRATED)
+                .unwrap()
+                .is_some(),
+            "file exceeding quota_bytes was not dehydrated when available >= low"
         );
     }
 

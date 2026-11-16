@@ -77,15 +77,7 @@ pub mod flags {
     /// no write access, only ownership.
     pub fn set_nodump(path: &Path, on: bool) -> io::Result<()> {
         let f = std::fs::File::open(path)?;
-        let mut cur: libc::c_long = 0;
-        if unsafe { libc::ioctl(f.as_raw_fd(), GETFLAGS, &mut cur) } < 0 {
-            return Err(unsupported_or(io::Error::last_os_error()));
-        }
-        let want = if on { cur | NODUMP } else { cur & !NODUMP };
-        if want != cur && unsafe { libc::ioctl(f.as_raw_fd(), SETFLAGS, &want) } < 0 {
-            return Err(unsupported_or(io::Error::last_os_error()));
-        }
-        Ok(())
+        set_nodump_fd(std::os::fd::AsFd::as_fd(&f), on)
     }
 
     /// As [`set_nodump`], on a descriptor that is already open.
@@ -95,10 +87,12 @@ pub mod flags {
     /// door.
     pub fn set_nodump_fd(fd: std::os::fd::BorrowedFd<'_>, on: bool) -> io::Result<()> {
         let mut cur: libc::c_long = 0;
+        // SAFETY: `fd` is an open file descriptor and `GETFLAGS` writes a `c_long`.
         if unsafe { libc::ioctl(fd.as_raw_fd(), GETFLAGS, &mut cur) } < 0 {
             return Err(unsupported_or(io::Error::last_os_error()));
         }
         let want = if on { cur | NODUMP } else { cur & !NODUMP };
+        // SAFETY: `fd` is open and `SETFLAGS` reads a `c_long` pointer.
         if want != cur && unsafe { libc::ioctl(fd.as_raw_fd(), SETFLAGS, &want) } < 0 {
             return Err(unsupported_or(io::Error::last_os_error()));
         }
@@ -108,6 +102,7 @@ pub mod flags {
     pub fn has_nodump(path: &Path) -> io::Result<bool> {
         let f = std::fs::File::open(path)?;
         let mut cur: libc::c_long = 0;
+        // SAFETY: `f` is an open file descriptor and `GETFLAGS` writes a `c_long`.
         if unsafe { libc::ioctl(f.as_raw_fd(), GETFLAGS, &mut cur) } < 0 {
             return Err(unsupported_or(io::Error::last_os_error()));
         }
@@ -142,13 +137,15 @@ pub mod flags {
 pub fn holds_data(path: &std::path::Path) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd;
     let f = std::fs::File::open(path)?;
+    // SAFETY: `f` is an open file descriptor; `SEEK_DATA` queries extent allocation.
     let r = unsafe { libc::lseek(f.as_raw_fd(), 0, libc::SEEK_DATA) };
     if r >= 0 {
         return Ok(true);
     }
-    match std::io::Error::last_os_error().raw_os_error() {
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
         Some(libc::ENXIO) => Ok(false),
-        _ => Err(std::io::Error::last_os_error()),
+        _ => Err(err),
     }
 }
 
@@ -226,6 +223,7 @@ pub mod stamp {
     use std::path::Path;
 
     pub const XATTR: &str = "user.hydration.stamp";
+    const XATTR_C: &std::ffi::CStr = c"user.hydration.stamp";
 
     /// `<mtime_sec>.<mtime_nsec>:<size>`. Readable on purpose — someone
     /// debugging a sync loop at 2am should be able to `getfattr` it.
@@ -259,16 +257,18 @@ pub mod stamp {
     /// invalidate the stamp it just took.
     pub fn write_fd(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
         use std::os::fd::AsRawFd;
+        // SAFETY: `libc::stat` is a POD C struct safe to zero-initialize.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is an open descriptor and `st` is writable `libc::stat` storage.
         if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
             return Err(io::Error::last_os_error());
         }
         let v = format!("{}.{}:{}", st.st_mtime, st.st_mtime_nsec, st.st_size);
-        let n = std::ffi::CString::new(XATTR).unwrap();
+        // SAFETY: `fd` is open, `XATTR_C` is a static C string, and `v` has `v.len()` readable bytes.
         let rc = unsafe {
             libc::fsetxattr(
                 fd.as_raw_fd(),
-                n.as_ptr(),
+                XATTR_C.as_ptr(),
                 v.as_ptr() as *const libc::c_void,
                 v.len(),
                 0,
@@ -308,11 +308,11 @@ pub mod stamp {
     fn set(path: &Path, v: &[u8]) -> io::Result<()> {
         let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has an interior nul"))?;
-        let n = std::ffi::CString::new(XATTR).unwrap();
+        // SAFETY: `c` and `XATTR_C` are valid C strings and `v` has `v.len()` readable bytes.
         let rc = unsafe {
             libc::setxattr(
                 c.as_ptr(),
-                n.as_ptr(),
+                XATTR_C.as_ptr(),
                 v.as_ptr() as *const libc::c_void,
                 v.len(),
                 0,
@@ -324,22 +324,30 @@ pub mod stamp {
     fn get(path: &Path) -> io::Result<Option<String>> {
         let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has an interior nul"))?;
-        let n = std::ffi::CString::new(XATTR).unwrap();
         let mut buf = [0u8; 96];
+        // SAFETY: `c` and `XATTR_C` are valid C strings and `buf` has `buf.len()` writable bytes.
         let rc = unsafe {
             libc::getxattr(
                 c.as_ptr(),
-                n.as_ptr(),
+                XATTR_C.as_ptr(),
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len(),
             )
         };
         if rc >= 0 {
-            return Ok(String::from_utf8(buf[..rc as usize].to_vec()).ok());
+            // An existing stamp with non-UTF-8 bytes was corrupted/forged and
+            // must evaluate as `Dirty` (never matching `of(&md)`), not `Unstamped`.
+            return Ok(Some(
+                String::from_utf8(buf[..rc as usize].to_vec()).unwrap_or_default(),
+            ));
         }
-        match io::Error::last_os_error().raw_os_error() {
-            Some(libc::ENODATA) | Some(libc::ENOTSUP) | Some(libc::ERANGE) => Ok(None),
-            _ => Err(io::Error::last_os_error()),
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(None),
+            // An oversized stamp xattr (>96 bytes) exists on disk and cannot match `of(&md)`,
+            // so return an empty sentinel `Some("")` -> `State::Dirty` rather than `Unstamped`.
+            Some(libc::ERANGE) => Ok(Some(String::new())),
+            _ => Err(err),
         }
     }
 }
@@ -368,6 +376,7 @@ pub mod hydrated {
     use std::path::Path;
 
     pub const XATTR: &str = "user.hydration.hydrated_at";
+    const XATTR_C: &std::ffi::CStr = c"user.hydration.hydrated_at";
 
     fn now_secs() -> u64 {
         std::time::SystemTime::now()
@@ -386,11 +395,11 @@ pub mod hydrated {
     pub fn write_fd(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         let v = now_secs().to_string();
-        let n = std::ffi::CString::new(XATTR).unwrap();
+        // SAFETY: `fd` is open, `XATTR_C` is a static C string, and `v` has `v.len()` readable bytes.
         let rc = unsafe {
             libc::fsetxattr(
                 fd.as_raw_fd(),
-                n.as_ptr(),
+                XATTR_C.as_ptr(),
                 v.as_ptr() as *const libc::c_void,
                 v.len(),
                 0,
@@ -406,12 +415,12 @@ pub mod hydrated {
     pub fn at(path: &Path) -> io::Result<Option<u64>> {
         let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has an interior nul"))?;
-        let n = std::ffi::CString::new(XATTR).unwrap();
         let mut buf = [0u8; 32];
+        // SAFETY: `c` and `XATTR_C` are valid C strings and `buf` has `buf.len()` writable bytes.
         let rc = unsafe {
             libc::getxattr(
                 c.as_ptr(),
-                n.as_ptr(),
+                XATTR_C.as_ptr(),
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len(),
             )
@@ -421,9 +430,10 @@ pub mod hydrated {
                 .ok()
                 .and_then(|s| s.parse().ok()));
         }
-        match io::Error::last_os_error().raw_os_error() {
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
             Some(libc::ENODATA) | Some(libc::ENOTSUP) | Some(libc::ERANGE) => Ok(None),
-            _ => Err(io::Error::last_os_error()),
+            _ => Err(err),
         }
     }
 }
@@ -526,6 +536,7 @@ pub mod ignore {
     /// that never loads a file still ignores `.git`.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct IgnoreSet {
+        all: bool,
         /// Matched against any single path component, at any depth: `node_modules`
         /// matches `a/node_modules/b`. `.git` is always here.
         component: Vec<String>,
@@ -586,7 +597,11 @@ pub mod ignore {
                     component.push(line.to_string());
                 }
             }
-            IgnoreSet { component, prefix }
+            IgnoreSet {
+                component,
+                prefix,
+                all: false,
+            }
         }
 
         /// True iff `rel` (root-relative, no leading `/`) is under an ignore rule:
@@ -594,7 +609,20 @@ pub mod ignore {
         /// under an anchored prefix rule. Byte-exact and case-sensitive — `.git`
         /// and `.GIT` are different directories on a Linux fs, and a
         /// case-insensitive match could silence a user's real `.GIT` data.
+        pub fn with_prefixes(mut self, paths: Vec<String>) -> Self {
+            self.prefix.extend(paths);
+            self
+        }
+        pub fn all() -> Self {
+            Self {
+                all: true,
+                ..Self::default()
+            }
+        }
         pub fn is_ignored(&self, rel: &Path) -> bool {
+            if self.all {
+                return true;
+            }
             for c in rel.components() {
                 if let Component::Normal(os) = c {
                     if os
